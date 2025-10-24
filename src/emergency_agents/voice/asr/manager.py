@@ -175,41 +175,43 @@ class ASRManager:
             )
 
             # 3. 自动降级
-            if provider.name != self._ENV_FALLBACK:
-                fallback_provider = self._get_fallback_provider()
-                if fallback_provider:
-                    logger.warning(
-                        "asr_fallback",
-                        from_provider=provider.name,
-                        to_provider=fallback_provider.name,
-                        从=provider.name,
-                        切换到=fallback_provider.name,
+            # 尝试获取备用Provider（优先级次高的或配置的fallback）
+            fallback_provider = self._get_fallback_provider()
+            
+            # 确保fallback不是刚刚失败的provider
+            if fallback_provider and fallback_provider.name != provider.name:
+                logger.warning(
+                    "asr_fallback",
+                    from_provider=provider.name,
+                    to_provider=fallback_provider.name,
+                    从=provider.name,
+                    切换到=fallback_provider.name,
+                )
+
+                try:
+                    fallback_start_ts = time.time()
+                    result = await fallback_provider.recognize(audio_data, config)
+                    fallback_latency_ms = int((time.time() - fallback_start_ts) * 1000)
+
+                    logger.info(
+                        "asr_fallback_success",
+                        provider=result.provider,
+                        fallback_latency_ms=fallback_latency_ms,
+                        total_latency_ms=int((time.time() - start_ts) * 1000),
                     )
+                    return result
 
-                    try:
-                        fallback_start_ts = time.time()
-                        result = await fallback_provider.recognize(audio_data, config)
-                        fallback_latency_ms = int((time.time() - fallback_start_ts) * 1000)
+                except Exception as fallback_error:
+                    logger.error(
+                        "asr_fallback_failed",
+                        fallback_provider=fallback_provider.name,
+                        error=str(fallback_error),
+                    )
+                    raise RuntimeError(
+                        f"All ASR providers failed: primary={provider.name}, fallback={fallback_provider.name}"
+                    ) from fallback_error
 
-                        logger.info(
-                            "asr_fallback_success",
-                            provider=result.provider,
-                            fallback_latency_ms=fallback_latency_ms,
-                            total_latency_ms=int((time.time() - start_ts) * 1000),
-                        )
-                        return result
-
-                    except Exception as fallback_error:
-                        logger.error(
-                            "asr_fallback_failed",
-                            fallback_provider=fallback_provider.name,
-                            error=str(fallback_error),
-                        )
-                        raise RuntimeError(
-                            f"All ASR providers failed: primary={provider.name}, fallback={fallback_provider.name}"
-                        ) from fallback_error
-
-            # 如果当前已经是备用Provider，或者没有备用Provider，直接抛出异常
+            # 没有可用的备用Provider，或者备用Provider就是当前失败的Provider
             raise RuntimeError(f"ASR provider failed: {provider.name}") from e
 
     def _select_provider(self) -> ASRProvider:
@@ -282,8 +284,18 @@ class ASRManager:
         Returns:
             Optional[ASRProvider]: 备用Provider，不存在时返回None。
         """
+        # 1. 首先尝试配置的备用Provider
         if self._ENV_FALLBACK in self._providers:
             return self._providers[self._ENV_FALLBACK]
+        
+        # 2. 如果没有配置的备用Provider，选择优先级次高的Provider
+        sorted_providers = sorted(
+            self._providers.values(), key=lambda p: p.priority, reverse=True
+        )
+        # 返回第二优先级的Provider（如果存在且不止一个Provider）
+        if len(sorted_providers) > 1:
+            return sorted_providers[1]
+        
         return None
 
     async def start_health_check(self) -> None:

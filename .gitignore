@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.cursor/
+.serena/
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Temp files
+temp/
+*.log
+*.pid
+*.sqlite3
+
+# Binary files
+*.mmdb
+geoip.dat
+geosite.dat
+mihomo-linux-amd64
+
+# Environment
+.env
+*.local.env
+
+# OS
+.DS_Store
+Thumbs.db
