@@ -1,0 +1,26 @@
+groups:
+  - name: slo_rules
+    rules:
+      - record: slo:assist:latency:p95
+        expr: |
+          histogram_quantile(0.95, sum(rate(assist_answer_seconds_bucket[5m])) by (le))
+      - record: slo:assist:error_rate
+        expr: |
+          rate(assist_answer_failures_total[5m]) / clamp_min(rate(assist_answer_total[5m]), 1)
+  - name: alerts
+    rules:
+      - alert: AssistHighLatency
+        expr: slo:assist:latency:p95 > 5
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "/assist/answer p95 latency > 5s"
+      - alert: AssistHighErrorRate
+        expr: slo:assist:error_rate > 0.01
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "/assist/answer error rate > 1%"
+

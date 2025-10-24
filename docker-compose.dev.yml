@@ -1,0 +1,42 @@
+version: '3.8'
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: rescue_system
+      POSTGRES_USER: rescue
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "5432:5432"
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"
+  neo4j:
+    image: neo4j:5
+    environment:
+      NEO4J_AUTH: ${NEO4J_AUTH}
+    ports:
+      - "7687:7687"
+      - "7474:7474"
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+  # vLLM services are often GPU-bound; include placeholders
+  vllm-chat:
+    image: vllm/vllm-openai:latest
+    command: --model Qwen/Qwen2.5-7B-Instruct
+    ports:
+      - "8000:8000"
+  vllm-embed:
+    image: vllm/vllm-openai:latest
+    command: --model BAAI/bge-large-zh-v1.5 --task embed
+    ports:
+      - "8001:8000"
