@@ -46,11 +46,11 @@ _assist_latency = Histogram('assist_answer_seconds', 'Latency of /assist/answer'
 # memory facade singleton
 _mem = MemoryFacade(
     Mem0Config(
-        qdrant_url=_cfg.qdrant_url or "http://localhost:6333",
+        qdrant_url=_cfg.qdrant_url or "http://192.168.1.40:6333",
         qdrant_collection="mem0_collection",
         embedding_model=_cfg.embedding_model,
         embedding_dim=_cfg.embedding_dim,
-        neo4j_uri=_cfg.neo4j_uri or "bolt://localhost:7687",
+        neo4j_uri=_cfg.neo4j_uri or "bolt://192.168.1.40:7687",
         neo4j_user=_cfg.neo4j_user or "neo4j",
         # pragma: allowlist secret - placeholder credential for development
         neo4j_password=_cfg.neo4j_password or "example-neo4j",
@@ -63,7 +63,7 @@ _mem = MemoryFacade(
 
 # rag pipeline singleton
 _rag = RagPipeline(
-    qdrant_url=_cfg.qdrant_url or "http://localhost:6333",
+    qdrant_url=_cfg.qdrant_url or "http://192.168.1.40:6333",
     embedding_model=_cfg.embedding_model,
     embedding_dim=_cfg.embedding_dim,
     openai_base_url=_cfg.openai_base_url,
@@ -74,15 +74,24 @@ _rag = RagPipeline(
 # kg service singleton
 _kg = KGService(
     KGConfig(
-        uri=_cfg.neo4j_uri or "bolt://localhost:7687",
+        uri=_cfg.neo4j_uri or "bolt://192.168.1.40:7687",
         user=_cfg.neo4j_user or "neo4j",
         # pragma: allowlist secret - placeholder credential for development
         password=_cfg.neo4j_password or "example-neo4j",
     )
 )
 
-# asr service singleton (no fallback, provider decided by env ASR_PROVIDER)
 _asr = ASRService()
+
+
+@app.on_event("startup")
+async def startup_event():
+    await _asr.start_health_check()
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    await _asr.stop_health_check()
 
 
 class RagDoc(BaseModel):
@@ -225,7 +234,7 @@ async def rag_query(req: RagQueryRequest):
 async def asr_recognize(file: UploadFile = File(...), sample_rate: int = 16000, fmt: str = "pcm"):
     """上传单段音频并返回识别文本。
 
-    要求：严格使用环境变量选择的单一 ASR 提供方，不做自动降级。
+    ASR 使用自动故障转移机制:Aliyun(主)→ Local FunASR(备),后台健康检查每 30 秒执行一次。
     支持 PCM/WAV（若为 WAV，应由调用方传入裸音频数据或确保服务端获取到 PCM 数据）。
     """
 
