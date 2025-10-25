@@ -17,3 +17,6 @@ dashscope>=1.23.1
 websockets>=12.0
 structlog>=24.1.0
 python-multipart>=0.0.20
+opuslib>=3.0.1
+numpy>=1.24.0
+torch>=2.0.0
