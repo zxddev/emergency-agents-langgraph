@@ -6,7 +6,7 @@ import uuid
 from enum import Enum
 from typing import Optional, Any, Dict, List
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, WebSocket
 from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel, Field
 from prometheus_client import Counter, Histogram
@@ -312,3 +312,9 @@ async def assist_answer(req: AssistAnswerRequest):
         except Exception:
             _assist_failures.inc()
             raise
+
+# WebSocket 语音对话路由
+@app.websocket("/ws/voice/chat")
+async def voice_chat_endpoint(websocket: WebSocket) -> None:
+    from emergency_agents.api.voice_chat import handle_voice_chat
+    await handle_voice_chat(websocket)
