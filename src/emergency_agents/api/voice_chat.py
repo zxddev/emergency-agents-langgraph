@@ -5,9 +5,10 @@ import base64
 import json
 from typing import Any
 
-from fastapi import WebSocket, WebSocketDisconnect
 import structlog
+from fastapi import WebSocket, WebSocketDisconnect
 
+from emergency_agents.config import AppConfig
 from emergency_agents.voice.asr.service import ASRService
 from emergency_agents.voice.health.checker import HealthChecker
 from emergency_agents.voice.intent_handler import IntentHandler
@@ -41,13 +42,25 @@ class VoiceChatSession:
 
 
 class VoiceChatHandler:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        config: AppConfig | None = None,
+        asr_service: ASRService | None = None,
+        tts_client: TTSClient | None = None,
+        intent_handler: IntentHandler | None = None,
+    ) -> None:
+        self._config = config or AppConfig.load_from_env()
         self.sessions: dict[str, VoiceChatSession] = {}
         self.health_checker = HealthChecker(check_interval=30)
-        self.asr_service = ASRService()
-        self.tts_client = TTSClient()
-        self.intent_handler = IntentHandler()
+        self.asr_service = asr_service or ASRService()
+        self.tts_client = tts_client or TTSClient(
+            tts_url=self._config.tts_api_url,
+            voice=self._config.tts_voice,
+        )
+        self.intent_handler = intent_handler or IntentHandler(self._config)
         self.vad_detector = VADDetector()
+        self.health_checker.register_service("voice_asr", self._check_asr_health)
+        self.health_checker.register_service("voice_tts", self.tts_client.health_check)
 
         logger.info(
             "voice_chat_handler_initialized",
@@ -55,10 +68,13 @@ class VoiceChatHandler:
         )
 
     async def start_background_tasks(self) -> None:
+        await self.asr_service.start_health_check()
         await self.health_checker.start()
         logger.info("voice_chat_background_tasks_started")
 
     async def stop_background_tasks(self) -> None:
+        await self.asr_service.stop_health_check()
+        await self.tts_client.close()
         await self.health_checker.stop()
         logger.info("voice_chat_background_tasks_stopped")
 
@@ -190,7 +206,17 @@ class VoiceChatHandler:
             await session.send_json({"type": "error", "message": f"处理音频失败: {e}"})
 
 
-voice_chat_handler = VoiceChatHandler()
+    async def _check_asr_health(self) -> bool:
+        try:
+            status = self.asr_service.provider_status
+            return bool(status) and any(status.values())
+        except Exception as e:
+            logger.warning("asr_health_check_failed", error=str(e))
+            return False
+
+
+_voice_config = AppConfig.load_from_env()
+voice_chat_handler = VoiceChatHandler(config=_voice_config)
 
 
 async def handle_voice_chat(websocket: WebSocket) -> None:

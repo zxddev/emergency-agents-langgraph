@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import structlog
-from openai import OpenAI
+from openai import AsyncOpenAI
 
-from emergency_agents.llm.client import get_openai_client
+from emergency_agents.config import AppConfig
+from emergency_agents.llm.client import get_async_openai_client
 
 
 logger = structlog.get_logger(__name__)
@@ -12,8 +13,9 @@ logger = structlog.get_logger(__name__)
 class IntentHandler:
     """意图理解与回复生成（使用现有 OpenAI 客户端）。"""
 
-    def __init__(self, client: OpenAI | None = None) -> None:
-        self.client = client or get_openai_client()
+    def __init__(self, config: AppConfig | None = None, client: AsyncOpenAI | None = None) -> None:
+        self._config = config or AppConfig.load_from_env()
+        self.client = client or get_async_openai_client(self._config)
 
     async def understand_and_respond(self, user_text: str) -> tuple[str, str]:
         try:
@@ -42,7 +44,7 @@ class IntentHandler:
         try:
             # 使用官方 OpenAI Python SDK 的异步接口
             response = await self.client.chat.completions.create(
-                model="gpt-4o-mini",
+                model=self._config.llm_model,
                 messages=[
                     {"role": "system", "content": "你是应急救援智能助手，请用简洁、专业中文回复。"},
                     {"role": "user", "content": user_text},

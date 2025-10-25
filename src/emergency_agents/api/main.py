@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 from prometheus_client import Counter, Histogram
 
 from emergency_agents.config import AppConfig
+from emergency_agents.api.voice_chat import handle_voice_chat, voice_chat_handler
 from emergency_agents.graph.app import build_app
 from emergency_agents.memory.mem0_facade import Mem0Config, MemoryFacade
 from emergency_agents.llm.client import get_openai_client
@@ -87,11 +88,13 @@ _asr = ASRService()
 @app.on_event("startup")
 async def startup_event():
     await _asr.start_health_check()
+    await voice_chat_handler.start_background_tasks()
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
     await _asr.stop_health_check()
+    await voice_chat_handler.stop_background_tasks()
 
 
 class RagDoc(BaseModel):
@@ -316,5 +319,4 @@ async def assist_answer(req: AssistAnswerRequest):
 # WebSocket 语音对话路由
 @app.websocket("/ws/voice/chat")
 async def voice_chat_endpoint(websocket: WebSocket) -> None:
-    from emergency_agents.api.voice_chat import handle_voice_chat
     await handle_voice_chat(websocket)

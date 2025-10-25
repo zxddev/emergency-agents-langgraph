@@ -10,9 +10,15 @@ logger = structlog.get_logger(__name__)
 class TTSClient:
     """远程 TTS 服务客户端（默认 Edge TTS 网关）。"""
 
-    def __init__(self, tts_url: str = "http://192.168.31.40:18002/api/tts") -> None:
+    def __init__(
+        self,
+        tts_url: str = "http://192.168.31.40:18002/api/tts",
+        voice: str = "zh-CN-XiaoxiaoNeural",
+        timeout: float = 30.0,
+    ) -> None:
         self.tts_url = tts_url
-        self.client = httpx.AsyncClient(timeout=30.0)
+        self.voice = voice
+        self.client = httpx.AsyncClient(timeout=timeout, trust_env=False)
 
     async def synthesize(self, text: str) -> bytes:
         try:
@@ -20,7 +26,7 @@ class TTSClient:
                 self.tts_url,
                 json={
                     "text": text,
-                    "voice": "zh-CN-XiaoxiaoNeural",
+                    "voice": self.voice,
                     "format": "pcm",
                     "sample_rate": 16000,
                 },
@@ -34,6 +40,14 @@ class TTSClient:
         except Exception as e:
             logger.error("tts_call_failed", error=str(e))
             return b""
+
+    async def health_check(self) -> bool:
+        try:
+            resp = await self.client.head(self.tts_url)
+            return resp.status_code in {200, 204, 405}
+        except Exception as e:
+            logger.warning("tts_health_failed", error=str(e))
+            return False
 
     async def close(self) -> None:
         await self.client.aclose()
