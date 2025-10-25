@@ -66,7 +66,6 @@ class ASRManager:
         self._ENV_FALLBACK = os.getenv("ASR_FALLBACK_PROVIDER", "local")
         self._ENV_HEALTH_CHECK_INTERVAL = int(os.getenv("HEALTH_CHECK_INTERVAL", "30"))
 
-        # 健康状态字典：{name: ProviderStatus}
         self._provider_status: dict[str, ProviderStatus] = {
             name: ProviderStatus() for name in self._providers
         }
@@ -81,6 +80,7 @@ class ASRManager:
             primary=self._ENV_PRIMARY,
             fallback=self._ENV_FALLBACK,
             health_check_interval=self._ENV_HEALTH_CHECK_INTERVAL,
+            provider_status=self._snapshot_status(),
         )
 
     def _create_default_providers(self) -> list[ASRProvider]:
@@ -147,6 +147,7 @@ class ASRManager:
             provider=provider.name,
             audio_size=len(audio_data),
             当前使用=f"{provider.name} (优先级={provider.priority})",
+            status=self._snapshot_status(),
         )
 
         start_ts = time.time()
@@ -180,13 +181,14 @@ class ASRManager:
             
             # 确保fallback不是刚刚失败的provider
             if fallback_provider and fallback_provider.name != provider.name:
-                logger.warning(
-                    "asr_fallback",
-                    from_provider=provider.name,
-                    to_provider=fallback_provider.name,
-                    从=provider.name,
-                    切换到=fallback_provider.name,
-                )
+                    logger.warning(
+                        "asr_fallback",
+                        from_provider=provider.name,
+                        to_provider=fallback_provider.name,
+                        从=provider.name,
+                        切换到=fallback_provider.name,
+                        status=self._snapshot_status(),
+                    )
 
                 try:
                     fallback_start_ts = time.time()
@@ -206,6 +208,7 @@ class ASRManager:
                         "asr_fallback_failed",
                         fallback_provider=fallback_provider.name,
                         error=str(fallback_error),
+                        status=self._snapshot_status(),
                     )
                     raise RuntimeError(
                         f"All ASR providers failed: primary={provider.name}, fallback={fallback_provider.name}"
@@ -272,6 +275,7 @@ class ASRManager:
                 provider=selected.name,
                 reason="priority",
                 priority=selected.priority,
+                status=self._snapshot_status(),
             )
             return selected
 
@@ -446,3 +450,5 @@ class ASRManager:
         """
         return {name: status.available for name, status in self._provider_status.items()}
 
+    def _snapshot_status(self) -> dict[str, bool]:
+        return {name: status.available for name, status in self._provider_status.items()}

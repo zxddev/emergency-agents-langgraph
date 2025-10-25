@@ -21,10 +21,11 @@ logger = structlog.get_logger(__name__)
 class _AliyunASRCallback:  # 轻量内部回调桥接，避免直接依赖SDK类型暴露
     """回调桥接：以事件完成机制等待最终文本。"""
 
-    def __init__(self) -> None:
+    def __init__(self, timeout_seconds: float) -> None:
         self.final_text: str = ""
         self.error: Optional[Exception] = None
-        self._done = asyncio.Event()
+        self._done: asyncio.Event = asyncio.Event()
+        self._timeout_seconds = timeout_seconds
 
     # DashScope RecognitionCallback 约定的方法名
     def on_open(self) -> None:  # noqa: D401
@@ -57,8 +58,8 @@ class _AliyunASRCallback:  # 轻量内部回调桥接，避免直接依赖SDK类
                 self.final_text = text
             logger.debug("aliyun_asr_text", text=text)
 
-    async def wait(self, timeout: float = 30.0) -> None:
-        await asyncio.wait_for(self._done.wait(), timeout=timeout)
+    async def wait(self) -> None:
+        await asyncio.wait_for(self._done.wait(), timeout=self._timeout_seconds)
         if self.error:
             raise self.error
 
@@ -71,13 +72,22 @@ class AliyunASRProvider(ASRProvider):
         if not self._api_key:
             raise ValueError("DASHSCOPE_API_KEY is required")
         self._model = model
+        timeout_raw = os.getenv("ALIYUN_ASR_TIMEOUT_SECONDS", "60")
+        try:
+            self._timeout_seconds = max(30.0, float(timeout_raw))
+        except ValueError:
+            self._timeout_seconds = 60.0
 
         # 延迟导入，避免在未使用时引入依赖
         import dashscope  # type: ignore
 
         dashscope.api_key = self._api_key
         self._dashscope = dashscope
-        logger.info("aliyun_asr_initialized", model=model)
+        logger.info(
+            "aliyun_asr_initialized",
+            model=model,
+            timeout_seconds=self._timeout_seconds,
+        )
 
     @property
     def name(self) -> str:  # noqa: D401
@@ -103,7 +113,7 @@ class AliyunASRProvider(ASRProvider):
 
         from dashscope.audio.asr import Recognition  # type: ignore
 
-        callback = _AliyunASRCallback()
+        callback = _AliyunASRCallback(timeout_seconds=self._timeout_seconds)
         recognition = Recognition(
             model=self._model,
             format=cfg.format,
@@ -125,7 +135,7 @@ class AliyunASRProvider(ASRProvider):
 
             # SDK 的 stop 同步阻塞，放到线程池执行
             await asyncio.get_event_loop().run_in_executor(None, recognition.stop)
-            await callback.wait(timeout=30.0)
+            await callback.wait()
         except Exception:
             # 确保连接关闭
             try:
@@ -153,10 +163,10 @@ class AliyunASRProvider(ASRProvider):
 
         try:
             silent = b"\x00" * (16000 * 2)  # 1s @ 16k/16bit/mono
-            _ = await asyncio.wait_for(self.recognize(silent, ASRConfig()), timeout=10.0)
+            health_timeout = self._timeout_seconds + 10.0
+            _ = await asyncio.wait_for(self.recognize(silent, ASRConfig()), timeout=health_timeout)
             return True
         except Exception as e:
             logger.warning("aliyun_asr_unhealthy", error=str(e))
             return False
-
 

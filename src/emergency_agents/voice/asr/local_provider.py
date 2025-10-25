@@ -29,6 +29,8 @@ class LocalFunASRProvider(ASRProvider):
         self._hotwords_json = os.getenv("FUNASR_HOTWORDS_JSON", "{}")
         self._chunk_cfg = self._parse_chunk_size(os.getenv("FUNASR_CHUNK_SIZE", "5,10,5"))
         logger.info("local_funasr_initialized", url=self._url, chunk=self._chunk_cfg)
+        if not self._url:
+            logger.error("local_funasr_url_missing", env_var="VOICE_ASR_WS_URL")
 
     @staticmethod
     def _parse_chunk_size(csv: str) -> list[int]:
@@ -138,5 +140,4 @@ class LocalFunASRProvider(ASRProvider):
         except Exception as e:
             logger.warning("local_asr_unhealthy", error=str(e))
             return False
-
 

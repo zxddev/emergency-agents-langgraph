@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 from typing import Any
 
 import structlog
@@ -180,7 +181,17 @@ class VoiceChatHandler:
             else:
                 return
 
-            asr_result = await self.asr_service.recognize(audio_data)
+            try:
+                asr_result = await self.asr_service.recognize(audio_data)
+            except Exception as asr_error:
+                logger.error(
+                    "asr_call_failed",
+                    session_id=session.session_id,
+                    error=str(asr_error),
+                    provider_status=self.asr_service.provider_status,
+                    voice_asr_url=os.getenv("VOICE_ASR_WS_URL", ""),
+                )
+                raise
             text = asr_result.text
 
             await session.send_json({

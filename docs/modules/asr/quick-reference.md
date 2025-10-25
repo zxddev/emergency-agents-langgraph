@@ -7,6 +7,8 @@
 ```bash
 # 阿里云百炼API Key
 DASHSCOPE_API_KEY=your_api_key_here
+# 阿里云 ASR 超时时间（秒，默认60，最低30）
+ALIYUN_ASR_TIMEOUT_SECONDS=60
 
 # 本地FunASR WebSocket URL
 VOICE_ASR_WS_URL=wss://127.0.0.1:10097
@@ -119,4 +121,3 @@ logger.info("provider_status", status=asr.provider_status)
 ## 联系支持
 
 如有问题，请查看日志文件并参考上述文档。
-
