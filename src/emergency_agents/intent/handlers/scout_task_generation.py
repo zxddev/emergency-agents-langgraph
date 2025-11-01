@@ -31,7 +31,10 @@ class ScoutTaskGenerationHandler(IntentHandler[ScoutTaskGenerationSlots]):
             "thread_id": str(state.get("thread_id")),
             "slots": slots,
         }
-        result = await self.graph.invoke(tactical_state)
+        result = await self.graph.invoke(
+            tactical_state,
+            config={"durability": "sync"},  # 长流程（侦察任务生成），同步保存checkpoint确保高可靠性
+        )
         plan = result.get("scout_plan", {})
         response_text = result.get("response_text", "已生成侦察建议。")
         ui_actions = self._compose_ui_actions(plan, incident_id)

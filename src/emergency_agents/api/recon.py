@@ -54,7 +54,10 @@ async def create_recon_plan(payload: ReconPlanRequest, request: Request) -> Reco
             "event_id": str(payload.event_id),
             "command_text": payload.command_text,
         }
-        return graph.invoke(init_state)
+        return graph.invoke(
+            init_state,
+            config={"durability": "sync"},  # 长流程（侦察规划），同步保存checkpoint确保高可靠性
+        )
 
     state = await to_thread.run_sync(_invoke)
     plan = state.get("plan")

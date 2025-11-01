@@ -101,7 +101,10 @@ def create_voice_control_command(request: Request, payload: VoiceControlRequest)
     if payload.device_type is not None:
         init_state["device_type"] = payload.device_type.value
 
-    result: VoiceControlState = graph.invoke(init_state)
+    result: VoiceControlState = graph.invoke(
+        init_state,
+        config={"durability": "exit"},  # 短流程（语音控制），使用默认高性能模式
+    )
 
     response = VoiceControlResponse(
         request_id=result.get("request_id", ""),

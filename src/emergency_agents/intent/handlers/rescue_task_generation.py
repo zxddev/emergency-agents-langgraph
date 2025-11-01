@@ -872,7 +872,10 @@ class RescueTaskGenerationHandler(IntentHandler[RescueTaskGenerationSlots]):
             "conversation_context": conversation_context,
         }
 
-        result = await graph.invoke(tactical_state)
+        result = await graph.invoke(
+            tactical_state,
+            config={"durability": "sync"},  # 长流程（救援任务生成），同步保存checkpoint确保高可靠性
+        )
         if result.get("status") == "error":
             error_text = result.get("error", "任务生成失败。")
             logger.error(
@@ -1108,7 +1111,10 @@ class RescueSimulationHandler(IntentHandler[RescueTaskGenerationSlots]):
             "simulation_mode": True,
             "conversation_context": conversation_context,
         }
-        result = await graph.invoke(tactical_state)
+        result = await graph.invoke(
+            tactical_state,
+            config={"durability": "sync"},  # 长流程（救援任务生成），同步保存checkpoint确保高可靠性
+        )
         response_text = result.get("response_text", "已生成模拟救援方案。")
         summary = cast(AnalysisSummary, result.get("analysis_summary") or AnalysisSummary())
         return {

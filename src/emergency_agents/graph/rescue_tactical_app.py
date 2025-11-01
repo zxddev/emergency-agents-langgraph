@@ -11,7 +11,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, TypedDict
 
 import structlog
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-from langgraph.graph import StateGraph
+from langgraph.graph import StateGraph, task
 from psycopg_pool import AsyncConnectionPool
 
 from emergency_agents.constants import RESCUE_DEMO_INCIDENT_ID
@@ -112,6 +112,151 @@ class RescueTacticalState(TypedDict, total=False):
     incident_response: Optional[Dict[str, Any]]
     persisted_task: Dict[str, Any]
     persisted_routes: List[Dict[str, Any]]
+
+
+# ========== @task包装函数：确保副作用操作的幂等性 ==========
+# 参考：docs/新业务逻辑md/langgraph资料/references/concept-durable-execution.md:26
+# "wrap any operations with side effects inside @tasks"
+
+@task
+async def geocode_location_task(location_name: str, amap_client: AmapClient) -> Optional[Dict[str, Any]]:
+    """
+    高德地图地理编码任务
+    幂等性保证：相同输入返回相同结果（高德API本身是幂等的）
+    """
+    result = await amap_client.geocode(location_name)
+    logger.info("geocode_task_completed", location=location_name, success=result is not None)
+    return result
+
+
+@task
+async def plan_route_task(
+    origin: Coordinate,
+    destination: Coordinate,
+    mode: str,
+    amap_client: AmapClient
+) -> Optional[RoutePlan]:
+    """
+    高德地图路径规划任务
+    幂等性保证：相同起终点返回相同路径
+    """
+    result = await amap_client.direction(origin=origin, destination=destination, mode=mode)
+    logger.info("route_plan_task_completed",
+                origin_lng=origin.lng, origin_lat=origin.lat,
+                dest_lng=destination.lng, dest_lat=destination.lat,
+                success=result is not None)
+    return result
+
+
+@task
+async def create_task_record_task(
+    task_input: TaskCreateInput,
+    task_repository: RescueTaskRepository
+) -> Any:
+    """
+    创建救援任务记录
+    幂等性保证：使用unique constraint或在调用前检查是否已存在
+    """
+    record = await task_repository.create_task(task_input)
+    logger.info("task_record_created", task_id=record.id, task_type=record.task_type)
+    return record
+
+
+@task
+async def create_route_plan_record_task(
+    route_input: TaskRoutePlanCreateInput,
+    task_repository: RescueTaskRepository
+) -> Any:
+    """
+    创建路线规划记录
+    幂等性保证：task_id关联的路线记录
+    """
+    record = await task_repository.create_route_plan(route_input)
+    logger.info("route_plan_record_created", route_id=record.id, task_id=route_input.task_id)
+    return record
+
+
+@task
+def publish_scenario_task(
+    scenario_payload: RescueScenarioPayload,
+    orchestrator: OrchestratorClient
+) -> Dict[str, Any]:
+    """
+    发布救援场景到Orchestrator
+    幂等性保证：Orchestrator需要支持幂等性（使用scenario_id去重）
+    """
+    response = orchestrator.publish_rescue_scenario(scenario_payload)
+    logger.info("scenario_published", scenario_id=scenario_payload.get("scenarioId"))
+    return response
+
+
+@task
+async def query_rag_cases_task(
+    question: str,
+    domain: str,
+    top_k: int,
+    rag_pipeline: RagPipeline,
+    timeout: float
+) -> List[RagChunk]:
+    """
+    RAG案例检索任务
+    幂等性保证：相同问题返回相同案例
+    """
+    rag_future = asyncio.to_thread(
+        rag_pipeline.query,
+        question=question,
+        domain=domain,
+        top_k=top_k,
+    )
+    chunks = await asyncio.wait_for(rag_future, timeout=timeout)
+    logger.info("rag_query_completed", question=question, count=len(chunks))
+    return chunks
+
+
+@task
+async def extract_equipment_task(
+    rag_chunks: List[RagChunk],
+    llm_client: Any,
+    llm_model: str,
+    timeout: float
+) -> List[ExtractedEquipment]:
+    """
+    从案例中提取装备信息（LLM调用）
+    幂等性保证：temperature=0确保确定性输出
+    """
+    extraction_future = asyncio.to_thread(
+        extract_equipment_from_cases,
+        rag_chunks,
+        llm_client,
+        llm_model,
+    )
+    extracted = await asyncio.wait_for(extraction_future, timeout=timeout)
+    logger.info("equipment_extracted", count=len(extracted))
+    return extracted
+
+
+@task
+async def build_recommendations_task(
+    kg_requirements: List[Dict[str, Any]],
+    rag_chunks: List[RagChunk],
+    extracted: List[ExtractedEquipment],
+    disaster_types: List[str],
+    timeout: float
+) -> List[EquipmentRecommendation]:
+    """
+    构建装备推荐
+    幂等性保证：相同输入返回相同推荐
+    """
+    recommendation_future = asyncio.to_thread(
+        build_equipment_recommendations,
+        kg_requirements,
+        rag_chunks,
+        extracted,
+        disaster_types,
+    )
+    recommendations = await asyncio.wait_for(recommendation_future, timeout=timeout)
+    logger.info("recommendations_built", count=len(recommendations))
+    return recommendations
 
 
 class RescueTacticalGraph:
@@ -225,7 +370,7 @@ class RescueTacticalGraph:
                 return {"status": "ok", "resolved_location": resolved}
 
             if slots.location_name:
-                geocode = await self._amap_client.geocode(slots.location_name)
+                geocode = await geocode_location_task(slots.location_name, self._amap_client)
                 if geocode:
                     resolved = {
                         "name": geocode["name"],
@@ -295,13 +440,13 @@ class RescueTacticalGraph:
                 query = f"{mission} {disaster_type} 历史案例 最佳实践"
 
             try:
-                rag_future = asyncio.to_thread(
-                    self._rag_pipeline.query,
+                rag_chunks: List[RagChunk] = await query_rag_cases_task(
                     question=query,
                     domain="案例",
                     top_k=5,
+                    rag_pipeline=self._rag_pipeline,
+                    timeout=self._rag_timeout
                 )
-                rag_chunks: List[RagChunk] = await asyncio.wait_for(rag_future, timeout=self._rag_timeout)
             except Exception as exc:  # pragma: no cover
                 logger.exception("rag_query_failed")
                 return {"status": "error", "error": f"历史案例检索失败：{exc}"}
@@ -324,13 +469,12 @@ class RescueTacticalGraph:
                 }
 
             try:
-                extraction_future = asyncio.to_thread(
-                    extract_equipment_from_cases,
+                extracted: List[ExtractedEquipment] = await extract_equipment_task(
                     rag_chunks,
                     self._llm_client,
                     self._llm_model,
+                    self._rag_timeout
                 )
-                extracted: List[ExtractedEquipment] = await asyncio.wait_for(extraction_future, timeout=self._rag_timeout)
             except Exception as exc:  # pragma: no cover
                 logger.exception("rag_equipment_extraction_failed")
                 extracted = []
@@ -338,14 +482,13 @@ class RescueTacticalGraph:
             recommendations: List[EquipmentRecommendation] = []
             if extracted:
                 try:
-                    recommendation_future = asyncio.to_thread(
-                        build_equipment_recommendations,
+                    recommendations = await build_recommendations_task(
                         kg_requirements,
                         rag_chunks,
                         extracted,
                         [disaster_type],
+                        self._rag_timeout
                     )
-                    recommendations = await asyncio.wait_for(recommendation_future, timeout=self._rag_timeout)
                 except Exception as exc:  # pragma: no cover
                     logger.exception("equipment_recommendation_failed")
                     recommendations = []
@@ -452,7 +595,7 @@ class RescueTacticalGraph:
                     continue
                 origin = Coordinate(lng=resource["lng"], lat=resource["lat"])
                 try:
-                    plan = await self._amap_client.direction(origin=origin, destination=dest_coord, mode="driving")
+                    plan = await plan_route_task(origin, dest_coord, "driving", self._amap_client)
                 except Exception as exc:
                     reason = f"路径规划失败: {exc}"
                     logger.warning("amap_direction_failed", resource_id=item["resource_id"], error=str(exc))
@@ -547,7 +690,7 @@ class RescueTacticalGraph:
                 code=state.get("task_id"),
             )
             try:
-                task_record = await self._task_repository.create_task(task_input)
+                task_record = await create_task_record_task(task_input, self._task_repository)
             except Exception as exc:  # pragma: no cover
                 logger.error("rescue_task_persist_failed", error=str(exc))
                 return {"status": "error", "error": f"任务写入失败：{exc}"}
@@ -581,7 +724,7 @@ class RescueTacticalGraph:
                     avoid_polygons=None,
                 )
                 try:
-                    route_record = await self._task_repository.create_route_plan(route_input)
+                    route_record = await create_route_plan_record_task(route_input, self._task_repository)
                     persisted_routes.append(serialize_dataclass(route_record))
                 except Exception as exc:  # pragma: no cover
                     logger.warning("rescue_route_persist_failed", error=str(exc), task_id=task_record.id)
@@ -684,7 +827,7 @@ class RescueTacticalGraph:
                 scenario_payload = _build_rescue_scenario_payload(state, incident_id, context)
                 if scenario_payload is not None:
                     try:
-                        scenario_response = self._orchestrator.publish_rescue_scenario(scenario_payload)
+                        scenario_response = publish_scenario_task(scenario_payload, self._orchestrator)
                         logger.info("rescue_scenario_publish_success", incident_id=incident_id, response=scenario_response)
                     except OrchestratorClientError as exc:
                         logger.warning("rescue_scenario_publish_failed", incident_id=incident_id, error=str(exc))
@@ -721,11 +864,19 @@ class RescueTacticalGraph:
         return graph
 
     async def invoke(self, state: RescueTacticalState) -> RescueTacticalState:
+        """
+        执行战术救援图
+        durability="sync": 长流程，每步完成后同步保存checkpoint
+        参考：docs/新业务逻辑md/langgraph资料/references/concept-durable-execution.md:88-90
+        """
         if self._compiled is None:
             raise RuntimeError("RescueTacticalGraph 尚未初始化完成")
         return await self._compiled.ainvoke(
             state,
-            config={"configurable": {"thread_id": state["thread_id"]}},
+            config={
+                "configurable": {"thread_id": state["thread_id"]},
+                "durability": "sync",
+            },
         )
 
 

@@ -11,7 +11,8 @@ from enum import Enum
 from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Literal
 
 import structlog
-from fastapi import FastAPI, UploadFile, File, HTTPException, WebSocket
+from fastapi import FastAPI, UploadFile, File, HTTPException, WebSocket, Request
+from starlette.middleware.base import BaseHTTPMiddleware
 from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel, Field
 from prometheus_client import Counter, Histogram
@@ -19,6 +20,7 @@ from psycopg.rows import DictRow
 from psycopg_pool import AsyncConnectionPool, ConnectionPool
 
 from emergency_agents.config import AppConfig
+from emergency_agents.logging import configure_logging, set_trace_id, clear_trace_id  # 统一日志配置
 from emergency_agents.api.voice_chat import handle_voice_chat, voice_chat_handler
 from emergency_agents.api import rescue as rescue_api
 from emergency_agents.external.adapter_client import AdapterHubClient
@@ -78,6 +80,37 @@ _graph_app: Any | None = None
 _intent_graph: Any | None = None
 _voice_control_graph: Any | None = None
 _graph_closers: list[Callable[[], Awaitable[None]]] = []
+
+
+# ========== Trace-ID中间件：自动注入请求追踪ID ==========
+class TraceIDMiddleware(BaseHTTPMiddleware):
+    """
+    为每个HTTP请求注入trace-id到日志上下文
+
+    支持：
+    1. 客户端传入 X-Trace-Id 请求头（复用trace-id）
+    2. 自动生成 UUID trace-id（新请求）
+    3. 响应头返回 X-Trace-Id（便于客户端日志关联）
+
+    参考：emergency_agents.logging 模块文档
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        # 提取或生成trace-id
+        trace_id = request.headers.get("X-Trace-Id") or str(uuid.uuid4())
+        set_trace_id(trace_id)
+
+        try:
+            response = await call_next(request)
+            response.headers["X-Trace-Id"] = trace_id
+            return response
+        finally:
+            # 清理上下文，防止泄漏
+            clear_trace_id()
+
+
+app.add_middleware(TraceIDMiddleware)
+
 
 # metrics
 Instrumentator().instrument(app).expose(app)
@@ -316,6 +349,12 @@ def _register_graph_close(resource: Any) -> None:
 
 @app.on_event("startup")
 async def startup_event():
+    # 🔧 统一日志配置（生产环境使用JSON格式，开发环境使用控制台）
+    import os
+    json_logs = os.getenv("LOG_JSON", "false").lower() == "true"
+    log_level = os.getenv("LOG_LEVEL", "INFO")
+    configure_logging(json_logs=json_logs, log_level=log_level)
+
     global _graph_app
     global _intent_graph
     global _voice_control_graph
@@ -514,7 +553,8 @@ async def start_thread(rescue_id: str, req: StartThreadRequest):
             "configurable": {
                 "thread_id": f"rescue-{rescue_id}",
                 "checkpoint_ns": f"tenant-{init_state['user_id']}",
-            }
+            },
+            "durability": "sync",  # 长流程（救援线程），同步保存checkpoint确保高可靠性
         },
     )
     return {"rescue_id": rescue_id, "state": result}
@@ -540,7 +580,10 @@ async def approve_thread(rescue_id: str, user_id: str, req: ApproveRequest):
     # 动态中断恢复：使用 Command(resume=[...]) 将批准的ID注入 await 节点
     result = _require_rescue_graph().invoke(
         Command(resume=req.approved_ids),
-        config={"configurable": {"thread_id": f"rescue-{rescue_id}"}}
+        config={
+            "configurable": {"thread_id": f"rescue-{rescue_id}"},
+            "durability": "sync",  # 长流程（救援线程），同步保存checkpoint确保高可靠性
+        },
     )
     return {"rescue_id": rescue_id, "approved": True, "state": result}
 
@@ -550,7 +593,10 @@ async def resume_thread(rescue_id: str):
     """继续执行指定救援线程。"""
     result = _require_rescue_graph().invoke(
         None,
-        config={"configurable": {"thread_id": f"rescue-{rescue_id}"}},
+        config={
+            "configurable": {"thread_id": f"rescue-{rescue_id}"},
+            "durability": "sync",  # 长流程（救援线程），同步保存checkpoint确保高可靠性
+        },
     )
     return {"rescue_id": rescue_id, "state": result}
 

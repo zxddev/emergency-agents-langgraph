@@ -143,7 +143,10 @@ async def _handle_robotdog_control(
     try:
         voice_state = await voice_control_graph.ainvoke(
             voice_state_input,
-            config={"configurable": {"thread_id": f"robotdog-{thread_id}"}},
+            config={
+                "configurable": {"thread_id": f"robotdog-{thread_id}"},
+                "durability": "exit",  # 短流程（设备控制），使用默认高性能模式
+            },
         )
     except Exception as exc:  # noqa: BLE001
         logger.error(
@@ -329,7 +332,10 @@ async def process_intent_core(
 
     graph_state: IntentOrchestratorState = await orchestrator_graph.ainvoke(
         initial_state,
-        config={"configurable": {"thread_id": thread_id}},
+        config={
+            "configurable": {"thread_id": thread_id},
+            "durability": "async",  # 中流程（意图编排），异步保存checkpoint平衡性能
+        },
     )
 
     intent = graph_state.get("intent") or {}
