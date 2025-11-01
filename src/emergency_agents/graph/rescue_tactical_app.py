@@ -11,7 +11,8 @@ from typing import Any, Callable, Dict, List, Optional, Required, NotRequired, T
 
 import structlog
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-from langgraph.graph import StateGraph, task
+from langgraph.func import task
+from langgraph.graph import StateGraph
 from psycopg_pool import AsyncConnectionPool
 
 from emergency_agents.constants import RESCUE_DEMO_INCIDENT_ID

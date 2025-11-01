@@ -15,3 +15,12 @@ class RiskDataRepository:
     async def list_active_zones(self) -> list[RiskZoneRecord]:
         zones: Sequence[RiskZoneRecord] = await self._incident_dao.list_active_risk_zones()
         return list(zones)
+
+    async def find_zones_near(self, *, lng: float, lat: float, radius_meters: float) -> list[RiskZoneRecord]:
+        """查询指定坐标附近的活跃风险区域（用于risk_overlay_task）"""
+        zones: list[RiskZoneRecord] = await self._incident_dao.find_zones_near(
+            lng=lng,
+            lat=lat,
+            radius_meters=radius_meters,
+        )
+        return zones

@@ -15,11 +15,14 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Dict, List, Optional
+from unittest.mock import Mock
 
 import pytest
 from emergency_agents.external.device_directory import DeviceDirectory, PostgresDeviceDirectory
 from emergency_agents.external.amap_client import AmapClient
+from emergency_agents.external.orchestrator_client import OrchestratorClient
 from emergency_agents.graph.scout_tactical_app import (
     ScoutTacticalGraph,
     ScoutTacticalState,
@@ -27,8 +30,8 @@ from emergency_agents.graph.scout_tactical_app import (
     ReconRoute,
     ReconWaypoint,
     SensorAssignment,
-    build_scout_tactical_graph,
 )
+from emergency_agents.db.dao import RescueTaskRepository
 from psycopg_pool import ConnectionPool
 
 logger = logging.getLogger(__name__)
@@ -85,11 +88,20 @@ async def test_device_selection_with_real_db(
     # 准备测试数据
     _prepare_test_devices(postgres_pool)
 
-    # 构建 Scout 战术图(只启用 device_directory)
-    graph = build_scout_tactical_graph(
+    # 创建测试所需的依赖（Mock 未测试的组件）
+    mock_amap_client = Mock(spec=AmapClient)  # 不测试路线规划，使用 Mock
+    mock_orchestrator = Mock(spec=OrchestratorClient)  # 不测试后端通知，使用 Mock
+    task_repository = RescueTaskRepository.create(postgres_pool)
+    postgres_dsn = os.getenv("POSTGRES_DSN", "postgresql://rescue:rescue_password@localhost:5432/rescue_system")
+
+    # 构建 Scout 战术图（使用新的异步 build() 方法）
+    graph = await ScoutTacticalGraph.build(
         risk_repository=empty_risk_repository,
         device_directory=device_directory,
-        amap_client=None,  # 不测试路线规划
+        amap_client=mock_amap_client,
+        orchestrator_client=mock_orchestrator,
+        task_repository=task_repository,
+        postgres_dsn=postgres_dsn,
     )
 
     # 准备输入状态
@@ -149,11 +161,19 @@ async def test_route_planning_with_real_amap(
     # 准备测试数据
     _prepare_test_devices(postgres_pool)
 
-    # 构建 Scout 战术图(启用 device_directory 和 amap_client)
-    graph = build_scout_tactical_graph(
+    # 创建测试所需的依赖（Mock 未测试的组件）
+    mock_orchestrator = Mock(spec=OrchestratorClient)  # 不测试后端通知，使用 Mock
+    task_repository = RescueTaskRepository.create(postgres_pool)
+    postgres_dsn = os.getenv("POSTGRES_DSN", "postgresql://rescue:rescue_password@localhost:5432/rescue_system")
+
+    # 构建 Scout 战术图（使用新的异步 build() 方法，启用真实 amap_client）
+    graph = await ScoutTacticalGraph.build(
         risk_repository=empty_risk_repository,
         device_directory=device_directory,
         amap_client=amap_client,
+        orchestrator_client=mock_orchestrator,
+        task_repository=task_repository,
+        postgres_dsn=postgres_dsn,
     )
 
     # 准备输入状态(从 empty_risk_repository 获取风险区域,中心点为杭州西湖)

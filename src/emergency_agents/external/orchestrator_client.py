@@ -82,6 +82,13 @@ class OrchestratorClient:
         logger.info("rescue_scenario_published", response=response)
         return response
 
+    def publish_scout_scenario(self, payload: "ScoutScenarioPayload") -> Dict[str, Any]:
+        """推送侦察场景消息，通知前端侦察任务生成（用于notify_backend_task）"""
+        body = payload.to_dict()
+        response = self._post("/api/v1/scout/scenario", body)
+        logger.info("scout_scenario_published", response=response)
+        return response
+
     def _post(self, path: str, json_body: Dict[str, Any]) -> Dict[str, Any]:
         """发送 POST 请求并做统一错误处理。"""
         url = path if path.startswith("/") else f"/{path}"
@@ -177,4 +184,40 @@ class RescueScenarioPayload:
             data["promptLevel"] = self.prompt_level
         if self.required_capabilities:
             data["requiredCapabilities"] = self.required_capabilities
+        return data
+
+
+@dataclass(slots=True)
+class ScoutScenarioPayload:
+    """侦察场景推送请求（用于notify_backend_task通知前端）"""
+
+    event_id: str
+    task_id: str
+    location: RescueScenarioLocation
+    title: Optional[str] = None
+    content: Optional[str] = None
+    targets: Optional[List[Dict[str, Any]]] = None
+    sensors: Optional[List[str]] = None
+    route: Optional[List[Dict[str, Any]]] = None
+    estimated_duration_minutes: Optional[int] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        """转换为 JSON 字典（camelCase），自动剔除空值"""
+        data: Dict[str, Any] = {
+            "eventId": self.event_id,
+            "taskId": self.task_id,
+            "location": self.location.to_dict(),
+        }
+        if self.title:
+            data["title"] = self.title
+        if self.content:
+            data["content"] = self.content
+        if self.targets:
+            data["targets"] = self.targets
+        if self.sensors:
+            data["sensors"] = self.sensors
+        if self.route:
+            data["route"] = self.route
+        if self.estimated_duration_minutes is not None:
+            data["estimatedDurationMinutes"] = self.estimated_duration_minutes
         return data

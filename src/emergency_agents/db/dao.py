@@ -653,6 +653,89 @@ class IncidentDAO:
         )
         return results
 
+    async def find_zones_near(
+        self,
+        *,
+        lng: float,
+        lat: float,
+        radius_meters: float,
+        reference_time: Optional[datetime] = None,
+    ) -> list[RiskZoneRecord]:
+        """查询指定坐标附近的活跃风险区域（PostGIS空间查询，用于risk_overlay_task）"""
+        now = reference_time or datetime.now(timezone.utc)
+
+        query = (
+            "SELECT zone_id::text AS zone_id, "
+            "       zone_name, "
+            "       hazard_type, "
+            "       severity, "
+            "       description, "
+            "       ST_AsGeoJSON(area::geometry)::json AS geometry_geojson, "
+            "       properties, "
+            "       valid_from, "
+            "       valid_until, "
+            "       created_at, "
+            "       updated_at "
+            "  FROM operational.hazard_zones "
+            " WHERE deleted_at IS NULL "
+            "   AND (valid_until IS NULL OR valid_until >= %(now)s) "
+            "   AND ST_DWithin("
+            "       area::geography, "
+            "       ST_SetSRID(ST_MakePoint(%(lng)s, %(lat)s), 4326)::geography, "
+            "       %(radius)s"
+            "   ) "
+            " ORDER BY severity DESC, "
+            "          ST_Distance(area::geography, ST_SetSRID(ST_MakePoint(%(lng)s, %(lat)s), 4326)::geography) ASC"
+        )
+
+        params = {
+            "now": now,
+            "lng": lng,
+            "lat": lat,
+            "radius": radius_meters,
+        }
+
+        start = time.perf_counter()
+        async with self._pool.connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(query, params)
+                rows = await cur.fetchall()
+
+        duration = time.perf_counter() - start
+        DAO_CALL_LATENCY.labels("incident", "find_zones_near").observe(duration)
+        DAO_CALL_TOTAL.labels("incident", "find_zones_near", "success").inc()
+
+        results: list[RiskZoneRecord] = []
+        for row in rows:
+            geometry_mapping = _ensure_mapping(row["geometry_geojson"])
+            properties_mapping = _ensure_mapping(row["properties"])
+            results.append(
+                RiskZoneRecord(
+                    zone_id=row["zone_id"],
+                    zone_name=row["zone_name"],
+                    hazard_type=row["hazard_type"],
+                    severity=int(row["severity"]),
+                    description=row["description"],
+                    geometry_geojson=geometry_mapping,
+                    properties=properties_mapping,
+                    valid_from=row["valid_from"],
+                    valid_until=row["valid_until"],
+                    created_at=row["created_at"],
+                    updated_at=row["updated_at"],
+                )
+            )
+
+        logger.info(
+            "dao_incident_find_zones_near",
+            duration_ms=duration * 1000,
+            lng=lng,
+            lat=lat,
+            radius_meters=radius_meters,
+            count=len(results),
+        )
+
+        return results
+
 
 class IncidentRepository:
     """事件实体与关联写入接口。"""
@@ -1039,6 +1122,45 @@ class RescueTaskRepository:
             task_id=record.id,
             event_id=record.event_id,
         )
+        return record
+
+    async def find_by_code(self, code: str) -> Optional[TaskRecord]:
+        """通过code字段查询任务（用于persist_scout_task幂等性检查）"""
+        query = (
+            "SELECT id::text AS id, "
+            "       type::text AS task_type, "
+            "       status::text AS status, "
+            "       priority, "
+            "       description, "
+            "       deadline, "
+            "       progress, "
+            "       event_id::text AS event_id, "
+            "       code, "
+            "       created_at, "
+            "       updated_at "
+            "  FROM operational.tasks "
+            " WHERE code = %(code)s "
+            "   AND deleted_at IS NULL "
+            " LIMIT 1"
+        )
+
+        start = time.perf_counter()
+        async with self._pool.connection() as conn:
+            async with conn.cursor(row_factory=class_row(TaskRecord)) as cur:
+                await cur.execute(query, {"code": code})
+                record = await cur.fetchone()
+
+        duration = time.perf_counter() - start
+        DAO_CALL_LATENCY.labels("rescue", "find_by_code").observe(duration)
+        DAO_CALL_TOTAL.labels("rescue", "find_by_code", "found" if record else "not_found").inc()
+
+        logger.info(
+            "dao_rescue_find_by_code",
+            duration_ms=duration * 1000,
+            code=code,
+            found=record is not None,
+        )
+
         return record
 
     async def create_route_plan(self, payload: TaskRoutePlanCreateInput) -> TaskRoutePlanRecord:
