@@ -4,28 +4,30 @@ from __future__ import annotations
 from enum import Enum
 from typing import TypedDict, Literal
 
+import structlog
+
 from langgraph.graph import StateGraph
-from langgraph.checkpoint.sqlite import SqliteSaver
-from langgraph.checkpoint.postgres import PostgresSaver
-from psycopg_pool import ConnectionPool
 
 from emergency_agents.agents.situation import situation_agent
 from emergency_agents.agents.risk_predictor import risk_predictor_agent
 from emergency_agents.agents.plan_generator import plan_generator_agent
 from emergency_agents.agents.memory_commit import commit_memory_node
+from emergency_agents.agents.report_intake import report_intake_agent
+from emergency_agents.agents.annotation_lifecycle import annotation_lifecycle_agent
+from emergency_agents.agents.rescue_task_generate import rescue_task_generate_agent
 from emergency_agents.llm.client import get_openai_client
 from emergency_agents.config import AppConfig
 from emergency_agents.graph.kg_service import KGService, KGConfig
+from emergency_agents.graph.checkpoint_utils import create_async_postgres_checkpointer
 from emergency_agents.rag.pipe import RagPipeline
 from emergency_agents.memory.mem0_facade import Mem0Config, MemoryFacade
+from emergency_agents.external.orchestrator_client import OrchestratorClient
 from langgraph.types import interrupt, Command
 from typing import Dict, Any, List, Tuple
 
-from emergency_agents.intent.classifier import intent_classifier_node
-from emergency_agents.intent.validator import validate_and_prompt_node
-from emergency_agents.intent.prompt_missing import prompt_missing_slots_node
-from emergency_agents.intent.router import intent_router_node, route_from_router
 from emergency_agents.policy.evidence import evidence_gate_ok
+
+logger = structlog.get_logger(__name__)
 
 
 class Status(str, Enum):
@@ -71,20 +73,17 @@ class RescueState(TypedDict, total=False):
     pending_memories: list
     committed_memories: list
     
-    intent: dict
     uav_tracks: list
     fleet_position: dict
     integration_logs: list
-    router_next: str
-    validation_status: str
-    validation_attempt: int
-    prompt: str
-    missing_fields: list
-    kg_hits_count: int
-    rag_case_refs_count: int
+    pending_entities: list
+    pending_events: list
+    pending_annotations: list
+    annotations: list
+    tasks: list
 
 
-def build_app(sqlite_path: str = "./checkpoints.sqlite3", postgres_dsn: str | None = None):
+async def build_app(sqlite_path: str = "./checkpoints.sqlite3", postgres_dsn: str | None = None):
     """构建 LangGraph 应用。
 
     节点职责：
@@ -100,16 +99,19 @@ def build_app(sqlite_path: str = "./checkpoints.sqlite3", postgres_dsn: str | No
     
     cfg = AppConfig.load_from_env()
     llm_client = get_openai_client(cfg)
+    if not cfg.qdrant_url:
+        raise RuntimeError("QDRANT_URL must be configured")
     
     kg_service = KGService(KGConfig(
-        uri=cfg.neo4j_uri or "bolt://localhost:7687",
+        uri=cfg.neo4j_uri or "bolt://192.168.1.40:7687",
         user=cfg.neo4j_user or "neo4j",
         # pragma: allowlist secret - placeholder credential for development
         password=cfg.neo4j_password or "example-neo4j"
     ))
     
     rag_pipeline = RagPipeline(
-        qdrant_url=cfg.qdrant_url or "http://localhost:6333",
+        qdrant_url=cfg.qdrant_url,
+        qdrant_api_key=cfg.qdrant_api_key,
         embedding_model=cfg.embedding_model,
         embedding_dim=cfg.embedding_dim,
         openai_base_url=cfg.openai_base_url,
@@ -118,11 +120,12 @@ def build_app(sqlite_path: str = "./checkpoints.sqlite3", postgres_dsn: str | No
     )
     
     mem0_facade = MemoryFacade(Mem0Config(
-        qdrant_url=cfg.qdrant_url or "http://localhost:6333",
+        qdrant_url=cfg.qdrant_url,
+        qdrant_api_key=cfg.qdrant_api_key,
         qdrant_collection="mem0_collection",
         embedding_model=cfg.embedding_model,
         embedding_dim=cfg.embedding_dim,
-        neo4j_uri=cfg.neo4j_uri or "bolt://localhost:7687",
+        neo4j_uri=cfg.neo4j_uri or "bolt://192.168.1.40:7687",
         neo4j_user=cfg.neo4j_user or "neo4j",
         # pragma: allowlist secret - placeholder credential for development
         neo4j_password=cfg.neo4j_password or "example-neo4j",
@@ -131,6 +134,7 @@ def build_app(sqlite_path: str = "./checkpoints.sqlite3", postgres_dsn: str | No
         openai_api_key=cfg.openai_api_key,
         graph_llm_model=cfg.llm_model
     ))
+    orchestrator_client = OrchestratorClient()
 
     def situation_node(state: RescueState) -> dict:
         return situation_agent(state, llm_client, cfg.llm_model)
@@ -139,7 +143,22 @@ def build_app(sqlite_path: str = "./checkpoints.sqlite3", postgres_dsn: str | No
         return risk_predictor_agent(state, kg_service, rag_pipeline, llm_client, cfg.llm_model)
 
     def plan_node(state: RescueState) -> dict:
-        return plan_generator_agent(state, kg_service, llm_client, cfg.llm_model)
+        return plan_generator_agent(
+            state,
+            kg_service,
+            llm_client,
+            cfg.llm_model,
+            orchestrator_client=orchestrator_client,
+        )
+    
+    def report_intake_node(state: RescueState) -> dict:
+        return report_intake_agent(state)
+    
+    def annotation_lifecycle_node(state: RescueState) -> dict:
+        return annotation_lifecycle_agent(state)
+    
+    def rescue_task_generate_node(state: RescueState) -> dict:
+        return rescue_task_generate_agent(state, kg_service, rag_pipeline, llm_client, cfg.llm_model)
 
     def approve_node(state: RescueState) -> dict:
         if state.get("status") == Status.COMPLETED.value:
@@ -230,25 +249,7 @@ def build_app(sqlite_path: str = "./checkpoints.sqlite3", postgres_dsn: str | No
             return "fail"
         return "start"
 
-    def route_validation(state: RescueState) -> str:
-        status = state.get("validation_status", "valid")
-        if status not in ("valid", "invalid", "failed"):
-            return "valid"
-        return status
-
     # 新增：意图分类、校验与路由
-    graph.add_node("intent", lambda s: intent_classifier_node(s, llm_client, cfg.llm_model))
-    graph.add_node("validator", lambda s: validate_and_prompt_node(s, llm_client, cfg.llm_model))
-    graph.add_node("prompt_slots", lambda s: prompt_missing_slots_node(s, llm_client, cfg.llm_model))
-    graph.add_node("intent_router", intent_router_node)
-    
-    graph.add_conditional_edges("validator", route_validation, {
-        "valid": "intent_router",
-        "invalid": "prompt_slots",
-        "failed": "fail"
-    })
-    graph.add_conditional_edges("intent_router", route_from_router, {"analysis": "situation", "done": "commit_memories"})
-
     graph.add_node("situation", situation_node)
     graph.add_node("risk_prediction", risk_prediction_node)
     graph.add_node("plan", plan_node)
@@ -259,9 +260,7 @@ def build_app(sqlite_path: str = "./checkpoints.sqlite3", postgres_dsn: str | No
     graph.add_node("error_handler", error_handler)
     graph.add_node("fail", fail_node)
 
-    graph.set_entry_point("intent")
-    graph.add_edge("intent", "validator")
-    graph.add_edge("prompt_slots", "validator")
+    graph.set_entry_point("situation")
     graph.add_edge("situation", "risk_prediction")
     graph.add_edge("risk_prediction", "plan")
     graph.add_edge("plan", "await")
@@ -269,25 +268,21 @@ def build_app(sqlite_path: str = "./checkpoints.sqlite3", postgres_dsn: str | No
     graph.add_edge("execute", "commit_memories")
     graph.add_conditional_edges("error_handler", route_after_error, {"start": "situation", "fail": "fail"})
 
-    checkpointer = None
-    if postgres_dsn:
-        try:
-            pool = ConnectionPool(conninfo=postgres_dsn, max_size=5, open=False, kwargs={"options": "-c search_path=langgraph_checkpoint"})
-            pool.open()
-            with pool.connection() as conn:
-                conn.autocommit = True
-                conn.execute("CREATE SCHEMA IF NOT EXISTS langgraph_checkpoint")
-                conn.execute("SET search_path TO langgraph_checkpoint")
-                saver = PostgresSaver(conn)
-                saver.setup()
-            checkpointer = PostgresSaver(pool)
-        except Exception:
-            checkpointer = None
-    if checkpointer is None:
-        checkpointer = SqliteSaver.from_conn_string(sqlite_path)
+    if not postgres_dsn:
+        raise RuntimeError("POSTGRES_DSN 未配置，无法构建救援编排子图。")
+    logger.info("rescue_graph_create_checkpointer", schema="rescue_app_checkpoint")
+    checkpointer, checkpoint_close = await create_async_postgres_checkpointer(
+        dsn=postgres_dsn,
+        schema="rescue_app_checkpoint",
+        min_size=1,
+        max_size=5,
+    )
 
     app = graph.compile(
         checkpointer=checkpointer,
         interrupt_before=["await"]  # 在审批节点前中断，HITL
     )
+    if checkpoint_close is not None:
+        setattr(app, "_checkpoint_close", checkpoint_close)
+    logger.info("rescue_graph_ready")
     return app

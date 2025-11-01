@@ -27,12 +27,16 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = AppConfig.load_from_env()
+    if cfg.qdrant_url is None:
+        raise RuntimeError("QDRANT_URL must be configured before indexing documents")
     rag = RagPipeline(
-        qdrant_url=cfg.qdrant_url or "http://localhost:6333",
+        qdrant_url=cfg.qdrant_url,
+        qdrant_api_key=cfg.qdrant_api_key,
         embedding_model=cfg.embedding_model,
         embedding_dim=cfg.embedding_dim,
         openai_base_url=cfg.openai_base_url,
         openai_api_key=cfg.openai_api_key,
+        llm_model=cfg.llm_model,
     )
 
     all_docs = load_jsonl(args.input)
@@ -50,5 +54,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 

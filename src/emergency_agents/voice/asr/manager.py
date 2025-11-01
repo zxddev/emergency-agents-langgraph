@@ -22,13 +22,15 @@ logger = structlog.get_logger(__name__)
 @dataclass
 class ProviderStatus:
     """Provider健康状态。
-    
+
     Args:
         available: 是否可用。
         consecutive_successes: 连续成功次数。
         consecutive_failures: 连续失败次数。
         last_check_time: 最后检查时间戳。
         last_check_latency_ms: 最后一次检查延迟（毫秒）。
+        half_open: 是否处于半开试探阶段。
+        recovery_at: 允许再次尝试的时间戳。
     """
 
     available: bool = False
@@ -36,6 +38,8 @@ class ProviderStatus:
     consecutive_failures: int = 0
     last_check_time: float = 0.0
     last_check_latency_ms: int = 0
+    half_open: bool = False
+    recovery_at: float = 0.0
 
 
 class ASRManager:
@@ -65,6 +69,8 @@ class ASRManager:
         self._ENV_PRIMARY = os.getenv("ASR_PRIMARY_PROVIDER", "aliyun")
         self._ENV_FALLBACK = os.getenv("ASR_FALLBACK_PROVIDER", "local")
         self._ENV_HEALTH_CHECK_INTERVAL = int(os.getenv("HEALTH_CHECK_INTERVAL", "30"))
+        self._failure_threshold = max(1, int(os.getenv("ASR_FAILURE_THRESHOLD", "2")))
+        self._recovery_seconds = max(10, int(os.getenv("ASR_RECOVERY_SECONDS", "60")))
 
         self._provider_status: dict[str, ProviderStatus] = {
             name: ProviderStatus() for name in self._providers
@@ -80,8 +86,30 @@ class ASRManager:
             primary=self._ENV_PRIMARY,
             fallback=self._ENV_FALLBACK,
             health_check_interval=self._ENV_HEALTH_CHECK_INTERVAL,
+            failure_threshold=self._failure_threshold,
+            recovery_seconds=self._recovery_seconds,
             provider_status=self._snapshot_status(),
         )
+
+    def _mark_success(self, name: str) -> None:
+        """标记Provider成功，重置失败计数。"""
+
+        status = self._provider_status[name]
+        status.consecutive_successes += 1
+        status.consecutive_failures = 0
+        status.available = True
+        status.half_open = False
+
+    def _mark_failure(self, name: str) -> None:
+        """标记Provider失败，超过阈值后进入熔断，等待恢复窗口。"""
+
+        status = self._provider_status[name]
+        status.consecutive_failures += 1
+        status.consecutive_successes = 0
+        if status.consecutive_failures >= self._failure_threshold:
+            status.available = False
+            status.half_open = False
+            status.recovery_at = time.time() + self._recovery_seconds
 
     def _create_default_providers(self) -> list[ASRProvider]:
         """创建默认的Provider列表（阿里云+本地）。
@@ -164,6 +192,7 @@ class ASRManager:
                 latency_ms=latency_ms,
                 使用的ASR=result.provider,
             )
+            self._mark_success(provider.name)
             return result
 
         except Exception as e:
@@ -174,6 +203,7 @@ class ASRManager:
                 error=str(e),
                 latency_ms=latency_ms,
             )
+            self._mark_failure(provider.name)
 
             # 3. 自动降级
             # 尝试获取备用Provider（优先级次高的或配置的fallback）
@@ -181,14 +211,14 @@ class ASRManager:
             
             # 确保fallback不是刚刚失败的provider
             if fallback_provider and fallback_provider.name != provider.name:
-                    logger.warning(
-                        "asr_fallback",
-                        from_provider=provider.name,
-                        to_provider=fallback_provider.name,
-                        从=provider.name,
-                        切换到=fallback_provider.name,
-                        status=self._snapshot_status(),
-                    )
+                logger.warning(
+                    "asr_fallback",
+                    from_provider=provider.name,
+                    to_provider=fallback_provider.name,
+                    从=provider.name,
+                    切换到=fallback_provider.name,
+                    status=self._snapshot_status(),
+                )
 
                 try:
                     fallback_start_ts = time.time()
@@ -201,6 +231,7 @@ class ASRManager:
                         fallback_latency_ms=fallback_latency_ms,
                         total_latency_ms=int((time.time() - start_ts) * 1000),
                     )
+                    self._mark_success(fallback_provider.name)
                     return result
 
                 except Exception as fallback_error:
@@ -210,6 +241,7 @@ class ASRManager:
                         error=str(fallback_error),
                         status=self._snapshot_status(),
                     )
+                    self._mark_failure(fallback_provider.name)
                     raise RuntimeError(
                         f"All ASR providers failed: primary={provider.name}, fallback={fallback_provider.name}"
                     ) from fallback_error
@@ -237,6 +269,11 @@ class ASRManager:
             primary = self._providers[self._ENV_PRIMARY]
             primary_status = self._provider_status.get(primary.name, ProviderStatus())
 
+            if not primary_status.available and time.time() >= primary_status.recovery_at:
+                # 恢复时间到达后，允许主Provider再次尝试
+                primary_status.available = True
+                primary_status.half_open = True
+
             if primary_status.available or not self._health_check_running:
                 # 健康检查未启动时，默认信任主Provider
                 logger.info(
@@ -256,6 +293,10 @@ class ASRManager:
         # 2. 使用备用Provider
         if self._ENV_FALLBACK in self._providers:
             fallback = self._providers[self._ENV_FALLBACK]
+            fallback_status = self._provider_status.get(fallback.name, ProviderStatus())
+            if not fallback_status.available and time.time() >= fallback_status.recovery_at:
+                fallback_status.available = True
+                fallback_status.half_open = True
             logger.info(
                 "provider_selected",
                 provider=fallback.name,
@@ -385,6 +426,8 @@ class ASRManager:
                     if status.consecutive_successes >= 2:
                         was_unavailable = not status.available
                         status.available = True
+                        status.half_open = False
+                        status.recovery_at = 0.0
 
                         if was_unavailable:
                             logger.info(
@@ -400,6 +443,8 @@ class ASRManager:
                     if status.consecutive_failures >= 3:
                         was_available = status.available
                         status.available = False
+                        status.half_open = False
+                        status.recovery_at = time.time() + self._recovery_seconds
 
                         if was_available:
                             logger.warning(
@@ -434,6 +479,8 @@ class ASRManager:
 
                 if status.consecutive_failures >= 3:
                     status.available = False
+                    status.half_open = False
+                    status.recovery_at = time.time() + self._recovery_seconds
 
         # 输出汇总信息
         summary = {

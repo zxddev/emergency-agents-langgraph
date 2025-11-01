@@ -2,26 +2,64 @@
 # Copyright 2025 msq
 from __future__ import annotations
 
+import inspect
 import uuid
+import asyncio
+from contextlib import suppress
+from datetime import datetime
 from enum import Enum
-from typing import Optional, Any, Dict, List
+from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Literal
 
+import structlog
 from fastapi import FastAPI, UploadFile, File, HTTPException, WebSocket
 from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel, Field
 from prometheus_client import Counter, Histogram
+from psycopg.rows import DictRow
+from psycopg_pool import AsyncConnectionPool, ConnectionPool
 
 from emergency_agents.config import AppConfig
 from emergency_agents.api.voice_chat import handle_voice_chat, voice_chat_handler
+from emergency_agents.api import rescue as rescue_api
+from emergency_agents.external.adapter_client import AdapterHubClient
+from emergency_agents.external.amap_client import AmapClient
+from emergency_agents.external.orchestrator_client import OrchestratorClient
 from emergency_agents.graph.app import build_app
+from emergency_agents.graph.intent_orchestrator_app import build_intent_orchestrator_graph
+from emergency_agents.graph.voice_control_app import build_voice_control_graph
+from emergency_agents.memory.conversation_manager import (
+    ConversationManager,
+    ConversationNotFoundError,
+    MessageRecord,
+)
 from emergency_agents.memory.mem0_facade import Mem0Config, MemoryFacade
 from emergency_agents.llm.client import get_openai_client
+from emergency_agents.llm.factory import LLMClientFactory
 from emergency_agents.rag.pipe import RagPipeline, RagChunk
 from emergency_agents.graph.kg_service import KGService, KGConfig
+from emergency_agents.db.dao import (
+    IncidentDAO,
+    IncidentRepository,
+    IncidentSnapshotRepository,
+    RescueTaskRepository,
+)
 from emergency_agents.audit.logger import get_audit_logger, log_human_approval
 from langgraph.types import Command
 from emergency_agents.voice.asr.service import ASRService
 from emergency_agents.voice.asr.base import ASRConfig as ASRConfigModel
+from emergency_agents.intent.classifier import intent_classifier_node
+from emergency_agents.intent.prompt_missing import prompt_missing_slots_node
+from emergency_agents.intent.registry import IntentHandlerRegistry
+from emergency_agents.intent.validator import validate_and_prompt_node
+from emergency_agents.api.intent_processor import (
+    IntentProcessResult,
+    Mem0Metrics,
+    process_intent_core,
+)
+from emergency_agents.control import VoiceControlPipeline
+from emergency_agents.external.device_directory import PostgresDeviceDirectory
+from emergency_agents.risk import RiskCacheManager, RiskDataRepository, RiskPredictor
+from emergency_agents.services import RescueDraftService
 
 
 class Domain(str, Enum):
@@ -34,7 +72,12 @@ class Domain(str, Enum):
 
 app = FastAPI(title="AI Emergency Brain API")
 _cfg = AppConfig.load_from_env()
-_graph_app = build_app(_cfg.checkpoint_sqlite_path, _cfg.postgres_dsn)
+if not _cfg.postgres_dsn:
+    raise RuntimeError("POSTGRES_DSN 未配置，无法启动服务。")
+_graph_app: Any | None = None
+_intent_graph: Any | None = None
+_voice_control_graph: Any | None = None
+_graph_closers: list[Callable[[], Awaitable[None]]] = []
 
 # metrics
 Instrumentator().instrument(app).expose(app)
@@ -44,10 +87,29 @@ _assist_counter = Counter('assist_answer_total', 'Total /assist/answer requests'
 _assist_failures = Counter('assist_answer_failures_total', 'Total /assist/answer failures')
 _assist_latency = Histogram('assist_answer_seconds', 'Latency of /assist/answer')
 
+_mem0_search_success = Counter("mem0_search_success_total", "mem0检索成功次数")
+_mem0_search_failure = Counter(
+    "mem0_search_failure_total",
+    "mem0检索失败次数",
+    ["reason"],
+)
+_mem0_search_duration = Histogram(
+    "mem0_search_duration_seconds",
+    "mem0检索耗时（秒）",
+    buckets=(0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0),
+)
+_mem0_add_success = Counter("mem0_add_success_total", "mem0写入成功次数")
+_mem0_add_failure = Counter(
+    "mem0_add_failure_total",
+    "mem0写入失败次数",
+    ["reason"],
+)
+
 # memory facade singleton
 _mem = MemoryFacade(
     Mem0Config(
         qdrant_url=_cfg.qdrant_url or "http://192.168.1.40:6333",
+        qdrant_api_key=_cfg.qdrant_api_key,
         qdrant_collection="mem0_collection",
         embedding_model=_cfg.embedding_model,
         embedding_dim=_cfg.embedding_dim,
@@ -65,6 +127,7 @@ _mem = MemoryFacade(
 # rag pipeline singleton
 _rag = RagPipeline(
     qdrant_url=_cfg.qdrant_url or "http://192.168.1.40:6333",
+    qdrant_api_key=_cfg.qdrant_api_key,
     embedding_model=_cfg.embedding_model,
     embedding_dim=_cfg.embedding_dim,
     openai_base_url=_cfg.openai_base_url,
@@ -82,19 +145,292 @@ _kg = KGService(
     )
 )
 
+if not _cfg.postgres_dsn:
+    raise RuntimeError("必须配置POSTGRES_DSN以启用会话服务")
+
+_pg_pool: AsyncConnectionPool[DictRow] = AsyncConnectionPool(
+    conninfo=_cfg.postgres_dsn,
+    min_size=1,
+    max_size=10,
+    open=False,
+)
+_conversation_manager = ConversationManager(_pg_pool)
+
+_incident_repository = IncidentRepository.create(_pg_pool)
+_incident_snapshot_repository = IncidentSnapshotRepository.create(_pg_pool)
+_rescue_task_repository = RescueTaskRepository.create(_pg_pool)
+_rescue_draft_service = RescueDraftService(
+    incident_repository=_incident_repository,
+    snapshot_repository=_incident_snapshot_repository,
+    task_repository=_rescue_task_repository,
+)
+
+_llm_factory = LLMClientFactory(_cfg)
+_llm_clients = {
+    "default": _llm_factory.get_sync("default"),
+    "rescue": _llm_factory.get_sync("rescue"),
+    "intent": _llm_factory.get_sync("intent"),
+    "strategic": _llm_factory.get_sync("strategic"),
+}
+app.state.llm_clients = _llm_clients
+app.state.rescue_draft_service = _rescue_draft_service
+_llm_client_default = _llm_clients["default"]
+_llm_client_rescue = _llm_clients["rescue"]
+_intent_llm_client = _llm_clients["intent"]
+_llm_client_strategic = _llm_clients["strategic"]
+
+_adapter_client = AdapterHubClient(
+    base_url=_cfg.adapter_base_url,
+    timeout=_cfg.adapter_timeout,
+)
+
+_device_directory_pool: ConnectionPool | None = (
+    ConnectionPool(conninfo=_cfg.postgres_dsn, open=True) if _cfg.postgres_dsn else None
+)
+_device_directory = PostgresDeviceDirectory(_device_directory_pool) if _device_directory_pool else None
+
+_voice_control_pipeline = VoiceControlPipeline(
+    default_robotdog_id=_cfg.default_robotdog_id,
+    device_directory=_device_directory,
+)
+
+_amap_client = AmapClient(
+    api_key=_cfg.amap_api_key or "",
+    backup_key=_cfg.amap_backup_key,
+    base_url=_cfg.amap_base_url or "https://restapi.amap.com",
+    connect_timeout=_cfg.amap_connect_timeout,
+    read_timeout=_cfg.amap_read_timeout,
+)
+
+_orchestrator_client = OrchestratorClient()
+
+_intent_registry = IntentHandlerRegistry.build(
+    pool=_pg_pool,
+    amap_client=_amap_client,
+    video_stream_map=_cfg.video_stream_map,
+    kg_service=_kg,
+    rag_pipeline=_rag,
+    llm_client=_llm_client_rescue,
+    llm_model=_cfg.llm_model,
+    adapter_client=_adapter_client,
+    default_robotdog_id=_cfg.default_robotdog_id,
+    orchestrator_client=_orchestrator_client,
+    rag_timeout=_cfg.rag_analysis_timeout,
+    postgres_dsn=_cfg.postgres_dsn,
+)
+
+_intent_registry.attach_rescue_draft_service(_rescue_draft_service)
+
+_risk_cache_manager: RiskCacheManager | None = None
+_risk_refresh_task: asyncio.Task[None] | None = None
+_risk_predictor: RiskPredictor | None = None
+_risk_predict_task: asyncio.Task[None] | None = None
+
+app.include_router(rescue_api.router)
+
+
+def _classifier_wrapper(state: Dict[str, Any]) -> Dict[str, Any]:
+    return intent_classifier_node(
+        state,
+        llm_client=_intent_llm_client,
+        llm_model=_cfg.intent_llm_model or _cfg.llm_model,
+    )
+
+
+def _validator_wrapper(state: Dict[str, Any], llm_client: Any, llm_model: str) -> Dict[str, Any]:
+    return validate_and_prompt_node(state, llm_client, llm_model)
+
+
+def _prompt_wrapper(state: Dict[str, Any], llm_client: Any, llm_model: str) -> Dict[str, Any]:
+    return prompt_missing_slots_node(state, llm_client, llm_model)
+
+
 _asr = ASRService()
+logger = structlog.get_logger(__name__)
+
+
+def _require_conversation_manager() -> ConversationManager:
+    if _conversation_manager is None:
+        raise RuntimeError("ConversationManager 未初始化")
+    return _conversation_manager
+
+
+def _require_intent_registry() -> IntentHandlerRegistry:
+    if _intent_registry is None:
+        raise RuntimeError("IntentHandlerRegistry 未初始化")
+    return _intent_registry
+
+def _require_rescue_graph() -> Any:
+    if _graph_app is None:
+        raise RuntimeError("救援编排子图未初始化")
+    return _graph_app
+
+
+def _require_intent_graph() -> Any:
+    if _intent_graph is None:
+        raise RuntimeError("意图编排子图未构建")
+    return _intent_graph
+
+
+def _require_voice_control_graph() -> Any:
+    graph = getattr(app.state, "voice_control_graph", None)
+    if graph is None:
+        if _voice_control_graph is None:
+            raise RuntimeError("语音控制子图未初始化")
+        app.state.voice_control_graph = _voice_control_graph
+        return _voice_control_graph
+    return graph
+
+
+def _build_history(records: List[MessageRecord]) -> List[Dict[str, Any]]:
+    history: List[Dict[str, Any]] = []
+    for record in records:
+        history.append(
+            {
+                "id": record.id,
+                "role": record.role,
+                "content": record.content,
+                "intent_type": record.intent_type,
+                "event_time": record.event_time.isoformat(),
+            }
+        )
+    return history
+
+
+def _mem0_metrics_factory() -> Mem0Metrics:
+    return Mem0Metrics(
+        inc_search_success=_mem0_search_success.inc,
+        inc_search_failure=lambda reason: _mem0_search_failure.labels(reason=reason).inc(),
+        observe_search_duration=_mem0_search_duration.observe,
+        inc_add_success=_mem0_add_success.inc,
+        inc_add_failure=lambda reason: _mem0_add_failure.labels(reason=reason).inc(),
+    )
+
+
+def _register_graph_close(resource: Any) -> None:
+    """记录需要在shutdown阶段关闭的图资源。"""
+    close_cb = getattr(resource, "_checkpoint_close", None)
+    if callable(close_cb):
+        _graph_closers.append(close_cb)
 
 
 @app.on_event("startup")
 async def startup_event():
+    global _graph_app
+    global _intent_graph
+    global _voice_control_graph
+    global _graph_closers
+    global _risk_cache_manager
+    global _risk_refresh_task
+    global _risk_predictor
+    global _risk_predict_task
+    await _pg_pool.open()
+    logger.info("api_startup_pg_pool_opened")
     await _asr.start_health_check()
     await voice_chat_handler.start_background_tasks()
+    _graph_closers = []
+
+    _graph_app = await build_app(_cfg.checkpoint_sqlite_path, _cfg.postgres_dsn)
+    _register_graph_close(_graph_app)
+    logger.info("api_graph_ready", graph="rescue_app")
+
+    _intent_graph = await build_intent_orchestrator_graph(
+        cfg=_cfg,
+        llm_client=_intent_llm_client,
+        llm_model=_cfg.intent_llm_model or _cfg.llm_model,
+        classifier_node=_classifier_wrapper,
+        validator_node=_validator_wrapper,
+        prompt_node=_prompt_wrapper,
+    )
+    _register_graph_close(_intent_graph)
+    logger.info("api_graph_ready", graph="intent_orchestrator")
+
+    _voice_control_graph = await build_voice_control_graph(
+        pipeline=_voice_control_pipeline,
+        adapter_client=_adapter_client,
+        postgres_dsn=_cfg.postgres_dsn,
+    )
+    _register_graph_close(_voice_control_graph)
+    app.state.voice_control_graph = _voice_control_graph
+    logger.info("api_graph_ready", graph="voice_control")
+
+    incident_dao = IncidentDAO.create(_pg_pool)
+    _risk_cache_manager = RiskCacheManager(
+        incident_dao=incident_dao,
+        ttl_seconds=_cfg.risk_cache_ttl_seconds,
+    )
+    await _risk_cache_manager.prefetch()
+    app.state.risk_cache = _risk_cache_manager
+    refresh_interval = _cfg.risk_refresh_interval_seconds
+    _risk_refresh_task = asyncio.create_task(
+        _risk_cache_manager.periodic_refresh(refresh_interval)
+    )
+    repository = RiskDataRepository(incident_dao)
+    _risk_predictor = RiskPredictor(repository, _risk_cache_manager)
+    await _risk_predictor.analyze()
+    app.state.risk_predictor = _risk_predictor
+    _risk_predict_task = asyncio.create_task(
+        _risk_predictor.run_periodic(refresh_interval)
+    )
+    if _intent_registry is not None:
+        _intent_registry.attach_risk_cache(_risk_cache_manager)
+    logger.info(
+        "risk_cache_startup_initialized",
+        ttl_seconds=_cfg.risk_cache_ttl_seconds,
+        refresh_interval_seconds=refresh_interval,
+    )
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    await _asr.stop_health_check()
+    global _graph_app
+    global _intent_graph
+    global _voice_control_graph
+    global _graph_closers
+    global _risk_cache_manager
+    global _risk_refresh_task
+    global _risk_predictor
+    global _risk_predict_task
     await voice_chat_handler.stop_background_tasks()
+    await _asr.stop_health_check()
+    await _adapter_client.aclose()
+    await _amap_client.close()
+    _orchestrator_client.close()
+    logger.info("api_shutdown_services_stopped")
+    for close_cb in _graph_closers:
+        await close_cb()
+    _graph_closers.clear()
+    _graph_app_attr = _graph_app if _graph_app is not None else None
+    for resource in (_graph_app_attr, _intent_graph, _voice_control_graph):
+        if resource is not None and hasattr(resource, "_checkpoint_close"):
+            setattr(resource, "_checkpoint_close", None)
+    logger.info("api_shutdown_graphs_closed")
+    _graph_app = None
+    _intent_graph = None
+    _voice_control_graph = None
+
+    if hasattr(_intent_registry, "close"):
+        close_result = _intent_registry.close()
+        if inspect.isawaitable(close_result):
+            await close_result
+    await _pg_pool.close()
+    if _device_directory_pool is not None:
+        _device_directory_pool.close()
+    for task in (_risk_refresh_task, _risk_predict_task):
+        if task is not None:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+    _risk_refresh_task = None
+    _risk_predict_task = None
+    if _intent_registry is not None:
+        _intent_registry.attach_risk_cache(None)
+    _risk_cache_manager = None
+    if hasattr(app.state, "risk_cache"):
+        delattr(app.state, "risk_cache")
+    if hasattr(app.state, "risk_predictor"):
+        delattr(app.state, "risk_predictor")
+    _risk_predictor = None
 
 
 class RagDoc(BaseModel):
@@ -130,6 +466,25 @@ class KGCaseSearchRequest(BaseModel):
     top_k: int = Field(5, ge=1, le=20)
 
 
+class IntentProcessRequest(BaseModel):
+    """意图处理请求体。"""
+
+    user_id: str
+    thread_id: str
+    message: str
+    metadata: Dict[str, Any] | None = None
+    incident_id: Optional[str] = None
+    channel: Literal["voice", "text", "system"] = "text"
+
+
+class ConversationHistoryRequest(BaseModel):
+    """会话历史查询请求。"""
+
+    user_id: str
+    thread_id: str
+    limit: int = Field(20, ge=1, le=100)
+
+
 class AssistAnswerRequest(BaseModel):
     """智能回答请求。"""
     user_id: str
@@ -153,7 +508,15 @@ async def start_thread(rescue_id: str, req: StartThreadRequest):
         "user_id": req.user_id or "unknown",
         "raw_report": req.raw_report
     }
-    result = _graph_app.invoke(init_state, config={"configurable": {"thread_id": f"rescue-{rescue_id}", "checkpoint_ns": f"tenant-{init_state['user_id']}"}})
+    result = _require_rescue_graph().invoke(
+        init_state,
+        config={
+            "configurable": {
+                "thread_id": f"rescue-{rescue_id}",
+                "checkpoint_ns": f"tenant-{init_state['user_id']}",
+            }
+        },
+    )
     return {"rescue_id": rescue_id, "state": result}
 
 
@@ -175,7 +538,7 @@ async def approve_thread(rescue_id: str, user_id: str, req: ApproveRequest):
     )
     
     # 动态中断恢复：使用 Command(resume=[...]) 将批准的ID注入 await 节点
-    result = _graph_app.invoke(
+    result = _require_rescue_graph().invoke(
         Command(resume=req.approved_ids),
         config={"configurable": {"thread_id": f"rescue-{rescue_id}"}}
     )
@@ -185,7 +548,10 @@ async def approve_thread(rescue_id: str, user_id: str, req: ApproveRequest):
 @app.post("/threads/resume")
 async def resume_thread(rescue_id: str):
     """继续执行指定救援线程。"""
-    result = _graph_app.invoke(None, config={"configurable": {"thread_id": f"rescue-{rescue_id}"}})
+    result = _require_rescue_graph().invoke(
+        None,
+        config={"configurable": {"thread_id": f"rescue-{rescue_id}"}},
+    )
     return {"rescue_id": rescue_id, "state": result}
 
 
@@ -315,6 +681,64 @@ async def assist_answer(req: AssistAnswerRequest):
         except Exception:
             _assist_failures.inc()
             raise
+
+
+@app.post("/intent/process")
+async def intent_process(req: IntentProcessRequest):
+    """统一意图处理入口（语音与文本复用）。"""
+    manager = _require_conversation_manager()
+    registry = _require_intent_registry()
+    metadata = dict(req.metadata or {})
+    if req.incident_id:
+        metadata.setdefault("incident_id", req.incident_id)
+
+    result: IntentProcessResult = await process_intent_core(
+        user_id=req.user_id,
+        thread_id=req.thread_id,
+        message=req.message,
+        metadata=metadata,
+        manager=manager,
+        registry=registry,
+        orchestrator_graph=_require_intent_graph(),
+        voice_control_graph=_require_voice_control_graph(),
+        mem=_mem,
+        build_history=_build_history,
+        mem0_metrics=_mem0_metrics_factory(),
+        channel=req.channel,
+    )
+    return {
+        "status": result.status,
+        "intent": result.intent,
+        "result": result.result,
+        "history": result.history,
+        "memory_hits": result.memory_hits,
+        "audit_log": result.audit_log,
+        "ui_actions": result.ui_actions,
+    }
+
+
+@app.post("/conversations/history")
+async def conversation_history(req: ConversationHistoryRequest):
+    """查询指定会话历史记录。"""
+    manager = _require_conversation_manager()
+    conversation = await manager.fetch_conversation(req.thread_id)
+    if conversation is None:
+        return {
+            "history": [],
+            "total": 0,
+            "user_id": req.user_id,
+            "thread_id": req.thread_id,
+        }
+    if conversation.user_id != req.user_id:
+        raise HTTPException(status_code=403, detail="thread owner mismatch")
+    records = await manager.get_history(req.thread_id, limit=req.limit)
+    history_payload = _build_history(records)
+    return {
+        "history": history_payload,
+        "total": len(history_payload),
+        "user_id": req.user_id,
+        "thread_id": req.thread_id,
+    }
 
 # WebSocket 语音对话路由
 @app.websocket("/ws/voice/chat")

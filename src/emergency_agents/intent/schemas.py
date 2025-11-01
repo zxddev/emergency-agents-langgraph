@@ -1,0 +1,366 @@
+# Copyright 2025 msq
+"""意图槽位JSON Schema定义。
+
+使用dataclass定义各意图的槽位结构，自动生成JSON Schema用于验证。
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Dict, Any, Optional, List
+
+
+@dataclass
+class BaseSlots:
+    """所有槽位 dataclass 的基类。"""
+
+
+@dataclass
+class ReconMinimalSlots(BaseSlots):
+    """侦察最小化槽位。"""
+    lng: float
+    lat: float
+    alt_m: int = 80
+    steps: int = 20
+
+
+@dataclass
+class DeviceControlRobotdogSlots(BaseSlots):
+    """机器人狗控制槽位。
+
+    注意：action改为可选，以处理LLM提取不完整的情况。
+    """
+    action: Optional[str] = None
+    device_id: Optional[str] = None
+    distance_m: Optional[float] = None
+    angle_deg: Optional[float] = None
+    speed: Optional[float] = None
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+
+
+@dataclass
+class TrappedReportSlots(BaseSlots):
+    """被困报告槽位。
+
+    注意：count改为可选，以处理LLM提取不完整的情况。
+    """
+    count: Optional[int] = None
+    location_text: Optional[str] = None
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    time_reported: Optional[str] = None
+    description: Optional[str] = None
+
+
+@dataclass
+class HazardReportSlots(BaseSlots):
+    """灾情报告槽位。
+
+    注意：event_type改为可选，以处理LLM提取不完整的情况。
+    """
+    event_type: Optional[str] = None
+    location_text: Optional[str] = None
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    severity: Optional[str] = None
+    time_reported: Optional[str] = None
+    description: Optional[str] = None
+    parent_event_id: Optional[str] = None
+
+
+@dataclass
+class RouteSafePointQuerySlots(BaseSlots):
+    """路线与安全点查询槽位。"""
+    lat: float
+    lng: float
+    policy: str = "best"
+
+
+@dataclass
+class DeviceStatusQuerySlots(BaseSlots):
+    """设备状态查询槽位。
+
+    注意：device_type和metric改为可选，以处理LLM提取不完整的情况。
+    """
+    device_type: Optional[str] = None
+    metric: Optional[str] = None
+    device_id: Optional[str] = None
+
+
+@dataclass
+class GeoAnnotateSlots(BaseSlots):
+    """地图标注槽位。
+
+    注意：label和geometry_type改为可选，以处理LLM提取不完整的情况。
+    """
+    label: Optional[str] = None
+    geometry_type: Optional[str] = None
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    coordinates: Optional[List[List[float]]] = None
+    confidence: Optional[float] = None
+    description: Optional[str] = None
+
+
+@dataclass
+class AnnotationSignSlots(BaseSlots):
+    """标注签收槽位。"""
+    annotation_id: str
+    decision: str
+
+
+@dataclass
+class PlanTaskApprovalSlots(BaseSlots):
+    """方案/任务审批槽位。"""
+    target_type: str
+    target_id: str
+    decision: str
+    reason: Optional[str] = None
+
+
+@dataclass
+class RfaRequestSlots(BaseSlots):
+    """资源/增援请求槽位。"""
+    unit_type: str
+    count: int
+    priority: str = "NORMAL"
+    equipment: Optional[List[str]] = None
+    window: Optional[str] = None
+
+
+@dataclass
+class EventUpdateSlots(BaseSlots):
+    """事件更新槽位。
+
+    注意：event_type和title原本是必填字段，但为了处理LLM误判或不完整输入，
+    现改为可选字段。Handler应检查这些字段是否存在。
+    """
+    event_type: Optional[str] = None
+    title: Optional[str] = None
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    severity: Optional[str] = None
+    description: Optional[str] = None
+    parent_event_id: Optional[str] = None
+
+
+@dataclass
+class VideoAnalyzeSlots(BaseSlots):
+    """视频/报告分析槽位（报告驱动）。"""
+    report_text: str
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    discovered_type: Optional[str] = None
+
+
+@dataclass
+class RescueTaskGenerationSlots(BaseSlots):
+    """救援任务生成槽位。"""
+    mission_type: str
+    location_name: Optional[str] = None
+    coordinates: Optional[Dict[str, float]] = None
+    situation_summary: Optional[str] = None
+    disaster_type: Optional[str] = None
+    impact_scope: Optional[int] = None
+    simulation_only: bool = False
+    task_id: Optional[str] = None
+    event_type: Optional[str] = None
+
+
+@dataclass
+class ScoutTaskGenerationSlots(BaseSlots):
+    """侦察任务生成槽位。"""
+    target_type: Optional[str] = None
+    location_name: Optional[str] = None
+    coordinates: Optional[Dict[str, float]] = None
+    priority: Optional[str] = None
+    objective_summary: Optional[str] = None
+    incident_stage: Optional[str] = None
+
+
+@dataclass
+class EvidenceBookmarkPlaybackSlots(BaseSlots):
+    """证据书签/回放槽位。"""
+    target_type: str
+    target_id: str
+    action: str
+    duration_sec: Optional[int] = None
+    uri: Optional[str] = None
+
+
+@dataclass
+class ConversationControlSlots(BaseSlots):
+    """对话管控槽位。"""
+    command: str
+
+
+@dataclass
+class TaskProgressQuerySlots(BaseSlots):
+    """任务进度查询槽位。"""
+    task_id: Optional[str] = None
+    task_code: Optional[str] = None
+    need_route: bool = False
+
+
+@dataclass
+class LocationPositioningSlots(BaseSlots):
+    """定位能力槽位。"""
+    target_type: str
+    event_id: Optional[str] = None
+    event_code: Optional[str] = None
+    team_id: Optional[str] = None
+    team_name: Optional[str] = None
+    poi_name: Optional[str] = None
+
+
+@dataclass
+class DeviceControlSlots(BaseSlots):
+    """设备控制槽位（基础控制）。"""
+    action: str
+    device_type: str
+    device_id: str
+    action_params: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class VideoAnalysisSlots(BaseSlots):
+    """视频流分析槽位（TODO 占位）。"""
+    device_id: str
+    device_type: str
+    analysis_goal: str
+    analysis_params: Optional[Dict[str, Any]] = None
+
+
+# ===== UI 控制最小槽位 =====
+
+@dataclass
+class UICameraFlytoSlots(BaseSlots):
+    """UI 镜头飞行槽位。"""
+    lng: float
+    lat: float
+    zoom: Optional[float] = None
+
+
+@dataclass
+class UIToggleLayerSlots(BaseSlots):
+    """UI 图层显隐槽位。"""
+    layer_name: Optional[str] = None
+    layerCode: Optional[str] = None
+    on: bool = True
+
+
+def _dataclass_to_jsonschema(dc_class) -> Dict[str, Any]:
+    """将dataclass转为JSON Schema。
+    
+    Args:
+        dc_class: dataclass类型。
+    
+    Returns:
+        JSON Schema字典。
+    """
+    schema = {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": False
+    }
+    
+    for f in dc_class.__dataclass_fields__.values():
+        field_type = f.type
+        field_type_str = str(field_type)
+        
+        if "Dict" in field_type_str and f.name == "coordinates":
+            schema["properties"][f.name] = {
+                "type": "object",
+                "properties": {
+                    "lat": {"type": "number"},
+                    "lng": {"type": "number"},
+                },
+                "required": ["lat", "lng"],
+                "additionalProperties": False,
+            }
+        elif "List[List[float]]" in field_type_str:
+            schema["properties"][f.name] = {"type": "array", "items": {"type": "array", "items": {"type": "number"}}}
+        elif "List[str]" in field_type_str:
+            schema["properties"][f.name] = {"type": "array", "items": {"type": "string"}}
+        elif "int" in field_type_str:
+            schema["properties"][f.name] = {"type": "integer"}
+        elif "float" in field_type_str:
+            schema["properties"][f.name] = {"type": "number"}
+        elif "bool" in field_type_str:
+            schema["properties"][f.name] = {"type": "boolean"}
+        elif "str" in field_type_str:
+            schema["properties"][f.name] = {"type": "string"}
+        else:
+            schema["properties"][f.name] = {}
+        
+        from dataclasses import MISSING
+        if f.default is MISSING and f.default_factory is MISSING:
+            schema["required"].append(f.name)
+    
+    return schema
+
+
+INTENT_SCHEMAS: Dict[str, Dict[str, Any]] = {
+    "recon_minimal": _dataclass_to_jsonschema(ReconMinimalSlots),
+    "device_control_robotdog": _dataclass_to_jsonschema(DeviceControlRobotdogSlots),
+    "trapped_report": _dataclass_to_jsonschema(TrappedReportSlots),
+    "hazard_report": _dataclass_to_jsonschema(HazardReportSlots),
+    "route_safe_point_query": _dataclass_to_jsonschema(RouteSafePointQuerySlots),
+    "device_status_query": _dataclass_to_jsonschema(DeviceStatusQuerySlots),
+    "geo_annotate": _dataclass_to_jsonschema(GeoAnnotateSlots),
+    "annotation_sign": _dataclass_to_jsonschema(AnnotationSignSlots),
+    "plan_task_approval": _dataclass_to_jsonschema(PlanTaskApprovalSlots),
+    "rfa_request": _dataclass_to_jsonschema(RfaRequestSlots),
+    "event_update": _dataclass_to_jsonschema(EventUpdateSlots),
+    "video_analyze": _dataclass_to_jsonschema(VideoAnalyzeSlots),
+    "rescue_task_generate": _dataclass_to_jsonschema(RescueTaskGenerationSlots),
+    "rescue_simulation": _dataclass_to_jsonschema(RescueTaskGenerationSlots),
+    "rescue-task-generate": _dataclass_to_jsonschema(RescueTaskGenerationSlots),
+    "rescue-simulation": _dataclass_to_jsonschema(RescueTaskGenerationSlots),
+    "evidence_bookmark_playback": _dataclass_to_jsonschema(EvidenceBookmarkPlaybackSlots),
+    "conversation_control": _dataclass_to_jsonschema(ConversationControlSlots),
+    "task-progress-query": _dataclass_to_jsonschema(TaskProgressQuerySlots),
+    "location-positioning": _dataclass_to_jsonschema(LocationPositioningSlots),
+    "device-control": _dataclass_to_jsonschema(DeviceControlSlots),
+    "video-analysis": _dataclass_to_jsonschema(VideoAnalysisSlots),
+    # UI 控制
+    "ui_camera_flyto": _dataclass_to_jsonschema(UICameraFlytoSlots),
+    "ui_toggle_layer": _dataclass_to_jsonschema(UIToggleLayerSlots),
+}
+
+
+HIGH_RISK_INTENTS = {
+    "device_control_robotdog",
+    "plan_task_approval",
+    "rescue_task_generate",
+}
+
+
+INTENT_SLOT_TYPES: Dict[str, type[BaseSlots]] = {
+    "task-progress-query": TaskProgressQuerySlots,
+    "location-positioning": LocationPositioningSlots,
+    "device-control": DeviceControlSlots,
+    "video-analysis": VideoAnalysisSlots,
+    "recon_minimal": ReconMinimalSlots,
+    "device_control_robotdog": DeviceControlRobotdogSlots,
+    "trapped_report": TrappedReportSlots,
+    "hazard_report": HazardReportSlots,
+    "route_safe_point_query": RouteSafePointQuerySlots,
+    "device_status_query": DeviceStatusQuerySlots,
+    "geo_annotate": GeoAnnotateSlots,
+    "annotation_sign": AnnotationSignSlots,
+    "plan_task_approval": PlanTaskApprovalSlots,
+    "rfa_request": RfaRequestSlots,
+    "event_update": EventUpdateSlots,
+    "video_analyze": VideoAnalyzeSlots,
+    "rescue_task_generate": RescueTaskGenerationSlots,
+    "rescue_simulation": RescueTaskGenerationSlots,
+    "rescue-task-generate": RescueTaskGenerationSlots,
+    "rescue-simulation": RescueTaskGenerationSlots,
+    "evidence_bookmark_playback": EvidenceBookmarkPlaybackSlots,
+    "conversation_control": ConversationControlSlots,
+    # UI 控制
+    "ui_camera_flyto": UICameraFlytoSlots,
+    "ui_toggle_layer": UIToggleLayerSlots,
+}

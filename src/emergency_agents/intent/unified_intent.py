@@ -32,6 +32,10 @@ PLACEHOLDER_MISSING_FIELDS: set[str] = {
     "missing_field",
     "未知槽位",
 }
+PLACEHOLDER_LOCATION_MARKERS: tuple[str, ...] = ("XX", "示例", "样例", "测试")
+PLACEHOLDER_COORDINATE_PAIRS: tuple[tuple[float, float], ...] = (
+    (31.2038, 103.9276),
+)
 
 ALLOWED_EVENT_TYPES: List[str] = [
     "people_trapped",
@@ -93,9 +97,21 @@ for canonical_name, display_name in INTENT_DISPLAY_MAP.items():
     # 允许模型直接返回小写原始值
     DISPLAY_TO_CANONICAL.setdefault(canonical_name, canonical_name)
 
+# 规范化救援类意图的主命名，统一使用短横线形式
+DISPLAY_TO_CANONICAL["RESCUE_TASK_GENERATION"] = "rescue-task-generate"
+DISPLAY_TO_CANONICAL["rescue_task_generate"] = "rescue-task-generate"
+DISPLAY_TO_CANONICAL["rescue-task-generate"] = "rescue-task-generate"
+DISPLAY_TO_CANONICAL["RESCUE_SIMULATION"] = "rescue-simulation"
+DISPLAY_TO_CANONICAL["rescue_simulation"] = "rescue-simulation"
+DISPLAY_TO_CANONICAL["rescue-simulation"] = "rescue-simulation"
+
 
 def _has_non_empty_text(value: Any) -> bool:
     return isinstance(value, str) and bool(value.strip())
+
+
+def _has_detail_text(value: Any, min_len: int = 15) -> bool:
+    return isinstance(value, str) and len(value.strip()) >= min_len
 
 
 def _has_coordinates(slots: Dict[str, Any]) -> bool:
@@ -104,19 +120,37 @@ def _has_coordinates(slots: Dict[str, Any]) -> bool:
         lat = coordinates.get("lat")
         lng = coordinates.get("lng")
         if isinstance(lat, (int, float)) and isinstance(lng, (int, float)):
+            if _is_placeholder_coordinates(lat, lng):
+                return False
             return True
     lat = slots.get("lat")
     lng = slots.get("lng")
     if isinstance(lat, (int, float)) and isinstance(lng, (int, float)):
+        if _is_placeholder_coordinates(lat, lng):
+            return False
         return True
     return False
 
 
 def _has_location(slots: Dict[str, Any]) -> bool:
     location_keys = ["location_name", "location_text", "location"]
-    if any(_has_non_empty_text(slots.get(key)) for key in location_keys):
-        return True
+    for key in location_keys:
+        value = slots.get(key)
+        if _has_non_empty_text(value) and not _is_placeholder_location_text(str(value)):
+            return True
     return _has_coordinates(slots)
+
+
+def _is_placeholder_location_text(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    return any(marker in stripped for marker in PLACEHOLDER_LOCATION_MARKERS)
+
+
+def _is_placeholder_coordinates(lat: float, lng: float) -> bool:
+    pair = (round(lat, 4), round(lng, 4))
+    return pair in {(round(item[0], 4), round(item[1], 4)) for item in PLACEHOLDER_COORDINATE_PAIRS}
 
 
 def _apply_required_field_validation(
@@ -156,6 +190,14 @@ def _apply_required_field_validation(
         if not _has_non_empty_text(mission_type):
             mark_missing("mission_type")
 
+        if not _has_coordinates(slots):
+            mark_missing("coordinates")
+
+        summary_value = slots.get("situation_summary")
+        # 当模型给出态势摘要时才校验长度，未提供时视为可后续补充
+        if summary_value is not None and not _has_detail_text(summary_value, min_len=15):
+            mark_missing("situation_summary")
+
         if not _has_location(slots):
             mark_missing("location")
 
@@ -163,6 +205,10 @@ def _apply_required_field_validation(
             prompt_items: List[str] = []
             if "mission_type" in missing_fields:
                 prompt_items.append("任务类型")
+            if "coordinates" in missing_fields:
+                prompt_items.append("经纬度")
+            if "situation_summary" in missing_fields:
+                prompt_items.append("现场详细情况")
             if "location" in missing_fields:
                 prompt_items.append("精确位置（地点名称或经纬度）")
             result.prompt = f"请补充{'和'.join(prompt_items)}，以便生成救援任务。"
@@ -314,13 +360,19 @@ def unified_intent_node(
 
     # 构建JSON Schema示例（帮助LLM理解输出格式）
     schema_example = {
-        "intent_type": "意图类型（从可用列表中选择，或'UNKNOWN'）",
-        "slots": {"slot_name": "value", "another_slot": "value"},
+        "intent_type": "RESCUE_TASK_GENERATION",
+        "slots": {
+            "location_name": "XX县XX镇南新村",
+            "coordinates": {"lat": 31.2038, "lng": 103.9276},
+            "mission_type": "rescue",
+            "situation_summary": "南新村教学楼局部倒塌，东侧12名工人被困，需要破拆并转运至安全区域。",
+            "disaster_type": "earthquake",
+            "event_type": "people_trapped"
+        },
         "confidence": 0.95,
-        "validation_status": "valid 或 invalid 或 unknown",
-        "missing_fields": ["缺失字段1", "缺失字段2"],
-        "prompt": "如果validation_status=invalid，生成友好的补充信息提示",
-        "slots.event_type": "事件类型（只可取: " + ", ".join(ALLOWED_EVENT_TYPES) + ")",
+        "validation_status": "valid",
+        "missing_fields": [],
+        "prompt": None
     }
 
     prompt = f"""你是应急救援指挥系统的意图识别专家。请分析用户输入并返回JSON格式的结果。
@@ -334,8 +386,8 @@ def unified_intent_node(
 合法事件类型：{ALLOWED_EVENT_TYPES}
 
 意图判定要点：
-- **RESCUE_TASK_GENERATION**：用户明确请求“制定/生成/安排救援或侦察行动”，通常包含“需要去”“安排任务”“生成方案”等措辞，并且围绕执行动作；优先判为救援任务生成而不是灾情汇报。
-- **HAZARD_REPORT**：用户仅汇报已发生的灾情、二次灾害或现场状态，不涉及让系统生成行动方案。
+- **RESCUE_TASK_GENERATION**：用户明确请求“制定/生成/安排救援或侦察行动”，描述具体被困、需求或操作，必须同时提供精准坐标和详细态势。若仅汇报灾情而无行动请求，应优先判为灾情报告。
+- **HAZARD_REPORT**：用户仅汇报灾情、风险或现场状态，不涉及生成行动方案。
 - 其他意图按照名称匹配业务含义；无法归类时返回 `UNKNOWN`。
 
 用户输入：{input_text}
@@ -355,8 +407,8 @@ def unified_intent_node(
 3. 槽位验证：根据意图类型的必填字段检查
    - 所有必填字段都有值 → validation_status="valid"
    - 缺少必填字段 → validation_status="invalid"，列出missing_fields，生成友好的prompt询问缺失信息
-   - **RESCUE_TASK_GENERATION**：必须提供 `mission_type`，并且至少包含地点信息（`location`/`location_name` 或 `coordinates.lat` + `coordinates.lng`），缺失任何一项均判定为 invalid。
-   - **HAZARD_REPORT**：必须包含 `event_type` 与地点信息（`location_text` 或 `coordinates.lat` + `coordinates.lng`），缺失时判定为 invalid。
+   - **RESCUE_TASK_GENERATION**：必须提供 `mission_type`、`coordinates.lat`、`coordinates.lng`，并给出不少于15个汉字的 `situation_summary`。缺失任何一项均判定为 invalid 并提示补充。
+   - **HAZARD_REPORT**：必须包含 `event_type` 与地点信息（`coordinates` 或 `location_text`）。如缺少坐标，应提示用户补充经纬度或精确地址。
 4. confidence范围：0.0-1.0，评估识别的确定性
 5. 若判定为救援任务相关意图（如 RESCUE_TASK_GENERATION），请在 slots 中补充 event_type 字段，取值必须来自合法事件类型列表；无法确定时返回 null 并设置 validation_status="invalid"，给出补充提示。
 

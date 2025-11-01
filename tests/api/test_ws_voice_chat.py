@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import pytest
 from fastapi.testclient import TestClient
+
+pytest.importorskip("prometheus_fastapi_instrumentator")
 
 from emergency_agents.api.main import app
 

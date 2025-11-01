@@ -16,6 +16,7 @@ mkdir -p temp
 
 # 加载环境变量（与 SOP 约定：配置集中于 config/dev.env）
 set -a
+source config/llm_keys.env
 source config/dev.env
 set +a
 
@@ -45,5 +46,4 @@ echo $! > temp/uvicorn.pid
 
 echo "Uvicorn started on :$PORT (pid=$(cat temp/uvicorn.pid))"
 echo "Logs: $ROOT_DIR/temp/server.log"
-
 

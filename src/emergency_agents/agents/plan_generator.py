@@ -4,19 +4,35 @@ from __future__ import annotations
 import json
 import uuid
 import logging
-from typing import Dict, Any, List
+import re
+from typing import Dict, Any, List, Optional
+
 from emergency_agents.agents.memory_commit import prepare_memory_node
 from emergency_agents.utils.normalize import normalize_disaster_name
 from emergency_agents.utils.merge import append_timeline
+from emergency_agents.llm.client import LLMClientProtocol
+from emergency_agents.graph.kg_service import KGService
+from emergency_agents.constants import RESCUE_DEMO_INCIDENT_ID
+from emergency_agents.external.orchestrator_client import (
+    OrchestratorClient,
+    OrchestratorClientError,
+    RescueScenarioLocation,
+    RescueScenarioPayload,
+)
 
 logger = logging.getLogger(__name__)
 
 
+def _strip_control_chars(text: str) -> str:
+    return "".join(ch for ch in text if ch >= " " or ch in "\n\r\t")
+
+
 def plan_generator_agent(
     state: Dict[str, Any],
-    kg_service,
-    llm_client,
-    llm_model: str = "glm-4"
+    kg_service: KGService,
+    llm_client: LLMClientProtocol,
+    llm_model: str = "glm-4",
+    orchestrator_client: Optional[OrchestratorClient] = None,
 ) -> Dict[str, Any]:
     """方案生成智能体
     
@@ -48,6 +64,8 @@ def plan_generator_agent(
     
     situation = state.get("situation", {})
     predicted_risks = state.get("predicted_risks", [])
+    casualties = situation.get("initial_casualties") or {}
+    victims_estimate = casualties.get("estimated")
     
     if not situation:
         logger.warning("无态势信息，无法生成方案")
@@ -123,15 +141,15 @@ def plan_generator_agent(
             temperature=0.3
         )
         
-        llm_output = response.choices[0].message.content
-        
+        llm_output = response.choices[0].message.content or ""
+        clean_output = _strip_control_chars(llm_output)
+
         try:
-            result = json.loads(llm_output)
+            result = json.loads(clean_output)
         except json.JSONDecodeError:
-            import re
-            match = re.search(r'\{.*\}', llm_output, re.DOTALL)
+            match = re.search(r'\{.*\}', clean_output, re.DOTALL)
             if match:
-                result = json.loads(match.group(0))
+                result = json.loads(_strip_control_chars(match.group(0)))
             else:
                 result = {
                     "primary_plan": {"name": "应急方案", "phases": []},
@@ -184,13 +202,27 @@ def plan_generator_agent(
             metadata={"agent": "plan_generator", "step": "001", "proposal_id": proposal_id},
         )
 
-        return state | {
+        updated_state = state | {
             "proposals": proposals,
             "plan": primary_plan,
             "alternative_plans": alternative_plans,
             "equipment_recommendations": equipment_reqs,
             "status": "awaiting_approval"
         }
+
+        if orchestrator_client is not None:
+            try:
+                _push_to_orchestrator(
+                    state=updated_state,
+                    plan=primary_plan,
+                    equipment_items=equipment_reqs,
+                    victims_estimate=victims_estimate,
+                    orchestrator=orchestrator_client,
+                )
+            except Exception as exc:
+                logger.warning("orchestrator_push_exception %s", str(exc), exc_info=True)
+
+        return updated_state
         
     except Exception as e:
         logger.error(f"方案生成失败: {e}", exc_info=True)
@@ -198,3 +230,109 @@ def plan_generator_agent(
             "last_error": {"agent": "plan_generator", "error": str(e)}
         }
 
+
+def _push_to_orchestrator(
+    state: Dict[str, Any],
+    plan: Dict[str, Any],
+    equipment_items: List[Dict[str, Any]],
+    victims_estimate: Any,
+    orchestrator: OrchestratorClient,
+) -> None:
+    try:
+        context = state.get("incident_context")
+        if not isinstance(context, dict):
+            context = {}
+            state["incident_context"] = context
+
+        incident_id = context.get("incident_id")
+        if not incident_id:
+            # 兼容旧流程：若外部未提前写入事件上下文，则退回到演示事件，确保流程不中断
+            incident_id = str(state.get("incident_id") or RESCUE_DEMO_INCIDENT_ID)
+            context["incident_id"] = incident_id
+            context.setdefault("incident_title", plan.get("name") or "救援事件")
+            logger.info(
+                "plan_orchestrator_using_default_incident incident_id=%s plan_name=%s",
+                incident_id,
+                plan.get("name"),
+            )
+
+        scenario_payload = _build_rescue_scenario_payload(state, plan, equipment_items, incident_id, victims_estimate)
+        if scenario_payload is None:
+            logger.info("rescue_scenario_skipped_missing_payload incident_id=%s", incident_id)
+            return
+
+        logger.info(
+            "rescue_scenario_publish_attempt incident_id=%s payload_keys=%s",
+            incident_id,
+            list(scenario_payload.to_dict().keys()),
+        )
+        orchestrator.publish_rescue_scenario(scenario_payload)
+        logger.info("rescue_scenario_publish_success incident_id=%s", incident_id)
+    except OrchestratorClientError as exc:
+        logger.warning("orchestrator_push_failed error=%s", str(exc))
+
+
+def _build_rescue_scenario_payload(
+    state: Dict[str, Any],
+    plan: Dict[str, Any],
+    equipment_items: List[Dict[str, Any]],
+    incident_id: str,
+    victims_estimate: Any,
+) -> Optional[RescueScenarioPayload]:
+    situation = state.get("situation") or {}
+    epicenter = situation.get("epicenter") or {}
+    longitude = _safe_float(epicenter.get("lng") or epicenter.get("longitude"))
+    latitude = _safe_float(epicenter.get("lat") or epicenter.get("latitude"))
+    if longitude is None or latitude is None:
+        return None
+
+    location_name = situation.get("affected_area") or plan.get("name") or "救援现场"
+    location = RescueScenarioLocation(longitude=longitude, latitude=latitude, name=location_name)
+
+    phases = plan.get("phases") or []
+    phase_lines = []
+    for phase in phases:
+        phase_name = phase.get("phase")
+        tasks = phase.get("tasks") or []
+        phase_lines.append(f"- {phase_name}：{','.join(tasks[:4])}" if phase_name else f"- {','.join(tasks[:4])}")
+    objectives = plan.get("objectives") or []
+    content_sections = [
+        f"方案名称：{plan.get('name', '主救援方案')}",
+        f"主要目标：{'、'.join(objectives[:3])}" if objectives else "主要目标：快速救援与安全评估",
+        "阶段安排：",
+        *(phase_lines if phase_lines else ["- 详情见任务面板"]),
+    ]
+    content = "\n".join(content_sections)
+
+    hazards = []
+    for risk in state.get("predicted_risks") or []:
+        name = risk.get("display_name") or risk.get("type")
+        if isinstance(name, str) and name:
+            hazards.append(name)
+    equipment_categories = {
+        str(item.get("category"))
+        for item in equipment_items
+        if item.get("category")
+    }
+
+    return RescueScenarioPayload(
+        event_id=incident_id,
+        location=location,
+        title=f"{location_name} 救援方案",
+        content=content,
+        origin="AI指挥助手",
+        victims_estimate=int(victims_estimate) if isinstance(victims_estimate, (int, float)) else None,
+        hazards=hazards or None,
+        scope=["commander"],
+        prompt_level=2,
+        required_capabilities=sorted(equipment_categories) if equipment_categories else None,
+    )
+
+def _safe_float(value: Any) -> Optional[float]:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if numeric != numeric or numeric in (float("inf"), float("-inf")):
+        return None
+    return numeric

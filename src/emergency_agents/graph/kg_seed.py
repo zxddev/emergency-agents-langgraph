@@ -118,7 +118,7 @@ SEED_CYPHER = [
 
 def main() -> None:
     cfg = AppConfig.load_from_env()
-    uri = cfg.neo4j_uri or "bolt://localhost:7687"
+    uri = cfg.neo4j_uri or "bolt://192.168.1.40:7687"
     user = cfg.neo4j_user or "neo4j"
     # pragma: allowlist secret - placeholder credential for development
     password = cfg.neo4j_password or "example-neo4j"

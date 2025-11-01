@@ -1,0 +1,208 @@
+{
+  "$schema": "./schemas/hazard_pack_schema.json",
+  "hazard_type": "landslide",
+  "version": "1.0.0",
+  "severity_levels": {
+    "low": {
+      "threshold": 30,
+      "description": "小规模滑坡(< 1000立方米),无人员被困,道路局部阻断"
+    },
+    "medium": {
+      "threshold": 60,
+      "description": "中等滑坡(1000-10000立方米),可能有人员被埋,房屋受损"
+    },
+    "high": {
+      "threshold": 85,
+      "description": "大型滑坡(> 10000立方米),确认人员被埋,村庄被毁,河道堵塞"
+    },
+    "critical": {
+      "threshold": 100,
+      "description": "特大滑坡,形成堰塞湖,威胁下游数万人,需跨区域联动救援"
+    }
+  },
+  "mission_templates": [
+    {
+      "phase": "reconnaissance",
+      "tasks": [
+        {
+          "task_id": "recon_slope_stability_01",
+          "task_type": "geological_survey",
+          "required_capabilities": ["geological_engineering", "slope_monitoring"],
+          "recommended_equipment": [
+            {"name": "gps_monitor", "quantity": 5, "priority": "critical"},
+            {"name": "crack_gauge", "quantity": 10, "priority": "critical"},
+            {"name": "inclinometer", "quantity": 3, "priority": "recommended"}
+          ],
+          "duration_minutes": 30,
+          "dependencies": [],
+          "parallel_allowed": false,
+          "description": "评估滑坡体稳定性,监测是否有二次滑坡风险",
+          "safety_notes": "严禁进入活动滑坡体,观测点设在安全距离50米以上"
+        },
+        {
+          "task_id": "recon_life_detection_01",
+          "task_type": "trapped_detection",
+          "required_capabilities": ["search_rescue", "life_detector_operation"],
+          "recommended_equipment": [
+            {"name": "acoustic_detector", "quantity": 2, "priority": "critical"},
+            {"name": "thermal_imager", "quantity": 1, "priority": "critical"},
+            {"name": "search_dog", "quantity": 3, "priority": "recommended"}
+          ],
+          "duration_minutes": 45,
+          "dependencies": ["recon_slope_stability_01"],
+          "parallel_allowed": false,
+          "description": "使用生命探测仪和搜救犬定位被埋人员",
+          "safety_notes": "探测时保持安静,避免二次坍塌"
+        }
+      ]
+    },
+    {
+      "phase": "rescue",
+      "tasks": [
+        {
+          "task_id": "rescue_dig_out_01",
+          "task_type": "excavation_rescue",
+          "required_capabilities": ["heavy_equipment_operation", "manual_excavation"],
+          "recommended_equipment": [
+            {"name": "excavator", "quantity": 3, "priority": "critical"},
+            {"name": "shovel", "quantity": 50, "priority": "critical"},
+            {"name": "support_frame", "quantity": 10, "priority": "critical"}
+          ],
+          "duration_minutes": 180,
+          "dependencies": ["recon_life_detection_01", "alert_downstream_01"],
+          "parallel_allowed": false,
+          "description": "挖掘救援被埋人员,使用支撑防止二次坍塌",
+          "safety_notes": "禁止使用大型设备盲目开挖,人工精确挖掘为主,每挖30分钟停工监测稳定性"
+        },
+        {
+          "task_id": "rescue_barrier_lake_01",
+          "task_type": "flood_control",
+          "required_capabilities": ["hydraulic_engineering", "blasting"],
+          "recommended_equipment": [
+            {"name": "pump_truck", "quantity": 5, "priority": "critical"},
+            {"name": "explosives", "quantity": 100, "priority": "recommended"},
+            {"name": "bulldozer", "quantity": 2, "priority": "critical"}
+          ],
+          "duration_minutes": 240,
+          "dependencies": ["recon_slope_stability_01"],
+          "parallel_allowed": true,
+          "description": "处置堰塞湖,开挖泄洪槽或控制爆破,降低溃坝风险",
+          "safety_notes": "爆破前疏散2公里内所有人员,设置监测点实时观测水位"
+        }
+      ]
+    },
+    {
+      "phase": "alert",
+      "tasks": [
+        {
+          "task_id": "alert_downstream_01",
+          "task_type": "downstream_warning",
+          "required_capabilities": ["emergency_broadcast", "dam_monitoring"],
+          "recommended_equipment": [
+            {"name": "warning_siren", "quantity": 20, "priority": "critical"},
+            {"name": "water_level_sensor", "quantity": 5, "priority": "critical"}
+          ],
+          "duration_minutes": 30,
+          "dependencies": ["recon_slope_stability_01"],
+          "parallel_allowed": true,
+          "description": "向下游发布预警,通知可能的溃坝风险",
+          "safety_notes": "预警范围覆盖下游30公里,启动应急预案"
+        },
+        {
+          "task_id": "alert_slope_monitoring_01",
+          "task_type": "continuous_monitoring",
+          "required_capabilities": ["geological_monitoring"],
+          "recommended_equipment": [
+            {"name": "displacement_sensor", "quantity": 10, "priority": "critical"},
+            {"name": "rainfall_gauge", "quantity": 3, "priority": "critical"}
+          ],
+          "duration_minutes": 360,
+          "dependencies": ["recon_slope_stability_01"],
+          "parallel_allowed": true,
+          "description": "持续监测滑坡体位移和降雨量",
+          "safety_notes": "位移速度 > 5mm/h 立即撤离救援人员"
+        }
+      ]
+    },
+    {
+      "phase": "logistics",
+      "tasks": [
+        {
+          "task_id": "logistics_road_clearance_01",
+          "task_type": "road_repair",
+          "required_capabilities": ["road_construction", "heavy_equipment"],
+          "recommended_equipment": [
+            {"name": "bulldozer", "quantity": 4, "priority": "critical"},
+            {"name": "dump_truck", "quantity": 10, "priority": "critical"}
+          ],
+          "duration_minutes": 120,
+          "dependencies": ["recon_slope_stability_01"],
+          "parallel_allowed": true,
+          "description": "清理道路阻塞,开辟救援通道",
+          "safety_notes": "优先打通主干道,设置临时便桥"
+        },
+        {
+          "task_id": "logistics_shelter_setup_01",
+          "task_type": "temporary_shelter",
+          "required_capabilities": ["disaster_relief"],
+          "recommended_equipment": [
+            {"name": "tent", "quantity": 100, "priority": "critical"},
+            {"name": "food_supply", "quantity": 1000, "priority": "critical"},
+            {"name": "water_purifier", "quantity": 5, "priority": "critical"}
+          ],
+          "duration_minutes": 90,
+          "dependencies": [],
+          "parallel_allowed": true,
+          "description": "安置受灾群众,提供临时住所和生活物资",
+          "safety_notes": "安置点选择地质稳定区域,远离滑坡隐患点"
+        }
+      ]
+    }
+  ],
+  "risk_rules": [
+    {
+      "rule_id": "risk_secondary_slide",
+      "condition": "位移监测显示滑坡体仍在活动(速度 > 2mm/h)",
+      "action": "立即撤离所有救援人员和设备,等待稳定48小时后重新评估",
+      "priority": "critical"
+    },
+    {
+      "rule_id": "risk_heavy_rain",
+      "condition": "气象预报未来6小时降雨量 > 50mm",
+      "action": "暂停挖掘作业,加固已挖掘区域,人员撤离到安全地带",
+      "priority": "critical"
+    },
+    {
+      "rule_id": "risk_barrier_lake_overflow",
+      "condition": "堰塞湖水位上涨速度 > 0.5米/小时",
+      "action": "紧急疏散下游5公里内所有人员,加快泄洪槽开挖",
+      "priority": "critical"
+    },
+    {
+      "rule_id": "risk_aftershock",
+      "condition": "发生3级以上余震",
+      "action": "停止作业30分钟,重新检测滑坡体稳定性",
+      "priority": "high"
+    }
+  ],
+  "reference_cases": [
+    {
+      "case_id": "case_maoxian_landslide_2017",
+      "title": "2017年四川茂县特大山体滑坡",
+      "summary": "体积800万立方米,掩埋新磨村,83人失踪,1500人参与救援",
+      "date": "2017-06-24",
+      "location": "四川省阿坝州茂县",
+      "lessons_learned": "高位滑坡破坏力极大;优先使用生命探测仪定位;黄金救援时间仅72小时;雨天禁止作业",
+      "rag_doc_id": "rag_landslide_maoxian_2017"
+    },
+    {
+      "case_id": "case_baige_barrier_lake_2018",
+      "title": "2018年西藏金沙江白格堰塞湖",
+      "summary": "滑坡体积1100万立方米,堵江形成堰塞湖,威胁下游6万人",
+      "date": "2018-10-11",
+      "location": "西藏昌都市江达县",
+      "lessons_learned": "堰塞湖处置刻不容缓;优先采用开挖泄洪槽;必要时控制爆破;实时监测水位变化",
+      "rag_doc_id": "rag_landslide_baige_2018"
+    }
+  ]
+}

@@ -1,0 +1,208 @@
+{
+  "$schema": "./schemas/hazard_pack_schema.json",
+  "hazard_type": "bridge_collapse",
+  "version": "1.0.0",
+  "severity_levels": {
+    "low": {
+      "threshold": 30,
+      "description": "局部结构受损,无人员被困,交通中断但无次生灾害风险"
+    },
+    "medium": {
+      "threshold": 60,
+      "description": "部分坍塌,可能有人员被困,有车辆坠落风险"
+    },
+    "high": {
+      "threshold": 85,
+      "description": "大面积坍塌,确认有人员被困,存在次生灾害(落水/起火)风险"
+    },
+    "critical": {
+      "threshold": 100,
+      "description": "完全坍塌,多人被困,伴随严重次生灾害(燃气泄漏/水淹)"
+    }
+  },
+  "mission_templates": [
+    {
+      "phase": "reconnaissance",
+      "tasks": [
+        {
+          "task_id": "recon_aerial_01",
+          "task_type": "aerial_reconnaissance",
+          "required_capabilities": ["uav_operation", "thermal_imaging", "video_transmission"],
+          "recommended_equipment": [
+            {"name": "thermal_camera", "quantity": 1, "priority": "critical"},
+            {"name": "hd_camera", "quantity": 1, "priority": "critical"},
+            {"name": "spotlight", "quantity": 1, "priority": "recommended"}
+          ],
+          "duration_minutes": 15,
+          "dependencies": [],
+          "parallel_allowed": false,
+          "description": "无人机航拍侦察坍塌全貌,热成像搜索生命迹象",
+          "safety_notes": "注意避开高压电线,保持安全高度50米以上"
+        },
+        {
+          "task_id": "recon_structure_01",
+          "task_type": "structural_assessment",
+          "required_capabilities": ["structural_engineering", "safety_evaluation"],
+          "recommended_equipment": [
+            {"name": "laser_rangefinder", "quantity": 1, "priority": "critical"},
+            {"name": "crack_detector", "quantity": 1, "priority": "recommended"}
+          ],
+          "duration_minutes": 30,
+          "dependencies": ["recon_aerial_01"],
+          "parallel_allowed": false,
+          "description": "结构工程师评估剩余结构稳定性,划定危险区域",
+          "safety_notes": "严禁进入不稳定区域,保持安全距离20米以上"
+        }
+      ]
+    },
+    {
+      "phase": "rescue",
+      "tasks": [
+        {
+          "task_id": "rescue_trapped_01",
+          "task_type": "trapped_rescue",
+          "required_capabilities": ["heavy_rescue", "medical_first_aid", "cutting_tools"],
+          "recommended_equipment": [
+            {"name": "hydraulic_spreader", "quantity": 2, "priority": "critical"},
+            {"name": "cutting_torch", "quantity": 1, "priority": "critical"},
+            {"name": "life_detector", "quantity": 1, "priority": "critical"},
+            {"name": "stretcher", "quantity": 3, "priority": "critical"}
+          ],
+          "duration_minutes": 120,
+          "dependencies": ["recon_structure_01", "alert_perimeter_01"],
+          "parallel_allowed": false,
+          "description": "救援被困人员,使用生命探测仪定位并破拆救援",
+          "safety_notes": "持续监测结构稳定性,设置应急撤离信号,每30分钟评估一次"
+        },
+        {
+          "task_id": "rescue_water_01",
+          "task_type": "water_rescue",
+          "required_capabilities": ["water_rescue", "diving", "boat_operation"],
+          "recommended_equipment": [
+            {"name": "rescue_boat", "quantity": 2, "priority": "critical"},
+            {"name": "diving_suit", "quantity": 4, "priority": "critical"},
+            {"name": "underwater_detector", "quantity": 1, "priority": "recommended"}
+          ],
+          "duration_minutes": 90,
+          "dependencies": ["recon_aerial_01"],
+          "parallel_allowed": true,
+          "description": "搜救落水车辆和人员",
+          "safety_notes": "注意水流速度,设置救生索,潜水深度不超过15米"
+        }
+      ]
+    },
+    {
+      "phase": "alert",
+      "tasks": [
+        {
+          "task_id": "alert_perimeter_01",
+          "task_type": "perimeter_control",
+          "required_capabilities": ["traffic_control", "crowd_management"],
+          "recommended_equipment": [
+            {"name": "警戒线", "quantity": 500, "priority": "critical"},
+            {"name": "warning_signs", "quantity": 20, "priority": "critical"},
+            {"name": "cone_barriers", "quantity": 50, "priority": "recommended"}
+          ],
+          "duration_minutes": 30,
+          "dependencies": ["recon_aerial_01"],
+          "parallel_allowed": true,
+          "description": "设置外围警戒线,疏散周边群众,封锁交通",
+          "safety_notes": "警戒半径不小于200米,设置明显标识"
+        },
+        {
+          "task_id": "alert_secondary_01",
+          "task_type": "secondary_hazard_monitoring",
+          "required_capabilities": ["hazard_monitoring", "gas_detection"],
+          "recommended_equipment": [
+            {"name": "gas_detector", "quantity": 3, "priority": "critical"},
+            {"name": "vibration_sensor", "quantity": 2, "priority": "recommended"}
+          ],
+          "duration_minutes": 180,
+          "dependencies": ["alert_perimeter_01"],
+          "parallel_allowed": true,
+          "description": "持续监测燃气泄漏/余震等次生灾害风险",
+          "safety_notes": "每10分钟报告一次监测数据"
+        }
+      ]
+    },
+    {
+      "phase": "logistics",
+      "tasks": [
+        {
+          "task_id": "logistics_medical_01",
+          "task_type": "medical_support",
+          "required_capabilities": ["emergency_medical", "ambulance_operation"],
+          "recommended_equipment": [
+            {"name": "ambulance", "quantity": 3, "priority": "critical"},
+            {"name": "medical_supplies", "quantity": 10, "priority": "critical"}
+          ],
+          "duration_minutes": 60,
+          "dependencies": [],
+          "parallel_allowed": true,
+          "description": "设立临时医疗点,准备转运伤员",
+          "safety_notes": "医疗点距离现场100米以上"
+        },
+        {
+          "task_id": "logistics_power_01",
+          "task_type": "power_supply",
+          "required_capabilities": ["power_engineering", "generator_operation"],
+          "recommended_equipment": [
+            {"name": "generator", "quantity": 2, "priority": "critical"},
+            {"name": "floodlight", "quantity": 6, "priority": "critical"}
+          ],
+          "duration_minutes": 45,
+          "dependencies": ["alert_perimeter_01"],
+          "parallel_allowed": true,
+          "description": "架设照明系统,为救援提供电力支持",
+          "safety_notes": "发电机远离油料堆放区"
+        }
+      ]
+    }
+  ],
+  "risk_rules": [
+    {
+      "rule_id": "risk_secondary_collapse",
+      "condition": "剩余结构稳定性评估为C级或D级",
+      "action": "立即撤离所有救援人员到安全区域,等待专业加固后再进入",
+      "priority": "critical"
+    },
+    {
+      "rule_id": "risk_gas_leak",
+      "condition": "燃气浓度超过爆炸下限25%",
+      "action": "停止一切动火作业,疏散200米内所有人员,启动防爆通风",
+      "priority": "critical"
+    },
+    {
+      "rule_id": "risk_water_current",
+      "condition": "河流流速超过1.5米/秒",
+      "action": "禁止潜水作业,使用无人船或声呐探测,等待流速降低",
+      "priority": "high"
+    },
+    {
+      "rule_id": "risk_aftershock",
+      "condition": "气象局发布余震预警",
+      "action": "暂停破拆作业,撤离到开阔区域,30分钟后重新评估",
+      "priority": "high"
+    }
+  ],
+  "reference_cases": [
+    {
+      "case_id": "case_wuxi_bridge_2019",
+      "title": "2019年无锡高架桥侧翻事故救援",
+      "summary": "G312国道上海方向K135处高架桥侧翻,3死2伤,成功救出2名被困人员",
+      "date": "2019-10-10",
+      "location": "江苏省无锡市312国道",
+      "lessons_learned": "侧翻桥体存在二次坍塌风险,使用液压顶撑加固后再破拆;优先救援生命体征稳定者",
+      "rag_doc_id": "rag_bridge_collapse_wuxi_2019"
+    },
+    {
+      "case_id": "case_italy_genoa_2018",
+      "title": "2018年意大利热那亚莫兰迪大桥坍塌",
+      "summary": "200米桥段坍塌,43人遇难,国际救援队协同作业72小时",
+      "date": "2018-08-14",
+      "location": "意大利热那亚市",
+      "lessons_learned": "大型桥梁坍塌需要重型吊装设备;优先使用无人机和雷达定位生命迹象,避免盲目破拆造成二次伤害",
+      "rag_doc_id": "rag_bridge_collapse_genoa_2018"
+    }
+  ]
+}

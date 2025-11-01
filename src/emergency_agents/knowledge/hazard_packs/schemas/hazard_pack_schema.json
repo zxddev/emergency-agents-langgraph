@@ -1,0 +1,207 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://emergency-agents.cykj.com/schemas/hazard-pack.schema.json",
+  "title": "Hazard Knowledge Pack Schema",
+  "description": "多灾种知识包标准定义 - 用于灾害救援任务规划的知识底座",
+  "type": "object",
+  "required": ["hazard_type", "version", "mission_templates"],
+  "properties": {
+    "hazard_type": {
+      "type": "string",
+      "enum": [
+        "bridge_collapse",
+        "chemical_leak",
+        "landslide",
+        "earthquake_with_fire",
+        "flood",
+        "building_collapse",
+        "tunnel_accident",
+        "forest_fire"
+      ],
+      "description": "灾种类型标识符"
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$",
+      "description": "知识包版本号(semver格式,如1.0.0)",
+      "examples": ["1.0.0", "1.1.0", "2.0.0"]
+    },
+    "severity_levels": {
+      "type": "object",
+      "description": "严重程度分级阈值定义",
+      "properties": {
+        "low": {
+          "type": "object",
+          "properties": {
+            "threshold": {"type": "number"},
+            "description": {"type": "string"}
+          }
+        },
+        "medium": {
+          "type": "object",
+          "properties": {
+            "threshold": {"type": "number"},
+            "description": {"type": "string"}
+          }
+        },
+        "high": {
+          "type": "object",
+          "properties": {
+            "threshold": {"type": "number"},
+            "description": {"type": "string"}
+          }
+        },
+        "critical": {
+          "type": "object",
+          "properties": {
+            "threshold": {"type": "number"},
+            "description": {"type": "string"}
+          }
+        }
+      }
+    },
+    "mission_templates": {
+      "type": "array",
+      "description": "任务模板列表,按执行阶段组织",
+      "items": {
+        "type": "object",
+        "required": ["phase", "tasks"],
+        "properties": {
+          "phase": {
+            "type": "string",
+            "enum": ["reconnaissance", "rescue", "alert", "logistics"],
+            "description": "任务阶段: reconnaissance(侦察), rescue(救援), alert(警戒), logistics(后勤)"
+          },
+          "tasks": {
+            "type": "array",
+            "items": {"$ref": "#/definitions/task"}
+          }
+        }
+      }
+    },
+    "risk_rules": {
+      "type": "array",
+      "description": "风险规则与应对措施列表",
+      "items": {
+        "type": "object",
+        "required": ["rule_id", "condition", "action"],
+        "properties": {
+          "rule_id": {
+            "type": "string",
+            "description": "规则唯一标识"
+          },
+          "condition": {
+            "type": "string",
+            "description": "触发条件(自然语言描述)"
+          },
+          "action": {
+            "type": "string",
+            "description": "应对措施(自然语言描述)"
+          },
+          "priority": {
+            "type": "string",
+            "enum": ["critical", "high", "medium", "low"],
+            "description": "风险优先级"
+          }
+        }
+      }
+    },
+    "reference_cases": {
+      "type": "array",
+      "description": "RAG文档索引 - 历史案例引用",
+      "items": {
+        "type": "object",
+        "required": ["case_id", "title", "summary"],
+        "properties": {
+          "case_id": {
+            "type": "string",
+            "description": "案例唯一标识"
+          },
+          "title": {
+            "type": "string",
+            "description": "案例标题"
+          },
+          "summary": {
+            "type": "string",
+            "description": "案例摘要"
+          },
+          "date": {
+            "type": "string",
+            "format": "date",
+            "description": "案例发生日期(ISO 8601)"
+          },
+          "location": {
+            "type": "string",
+            "description": "案例发生地点"
+          },
+          "lessons_learned": {
+            "type": "string",
+            "description": "经验教训总结"
+          },
+          "rag_doc_id": {
+            "type": "string",
+            "description": "RAG系统中的文档ID(用于检索)"
+          }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "task": {
+      "type": "object",
+      "description": "单个任务模板定义",
+      "required": ["task_id", "task_type", "required_capabilities", "duration_minutes"],
+      "properties": {
+        "task_id": {
+          "type": "string",
+          "description": "任务唯一标识(格式: phase_type_序号,如recon_aerial_01)"
+        },
+        "task_type": {
+          "type": "string",
+          "description": "任务类型(如aerial_reconnaissance, ground_search, rescue_operation)"
+        },
+        "required_capabilities": {
+          "type": "array",
+          "items": {"type": "string"},
+          "minItems": 1,
+          "description": "必需能力标签列表(用于资源匹配)"
+        },
+        "recommended_equipment": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {"type": "string"},
+              "quantity": {"type": "integer", "minimum": 1},
+              "priority": {"type": "string", "enum": ["critical", "recommended", "optional"]}
+            }
+          },
+          "description": "推荐装备清单"
+        },
+        "duration_minutes": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "预计执行时长(分钟)"
+        },
+        "dependencies": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "前置任务ID列表(表示该任务依赖哪些任务先完成)"
+        },
+        "parallel_allowed": {
+          "type": "boolean",
+          "default": false,
+          "description": "是否允许与前置任务并行执行"
+        },
+        "description": {
+          "type": "string",
+          "description": "任务描述(自然语言)"
+        },
+        "safety_notes": {
+          "type": "string",
+          "description": "安全注意事项"
+        }
+      }
+    }
+  }
+}

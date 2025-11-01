@@ -1,96 +1,167 @@
-# Copyright 2025 msq
 from __future__ import annotations
 
-import json
 import logging
+from dataclasses import dataclass
 from typing import Any, Dict
 
+import structlog
+
+from emergency_agents.config import AppConfig
+from emergency_agents.intent.providers.base import IntentProvider, IntentThresholds
+from emergency_agents.intent.providers.factory import build_providers
+from emergency_agents.intent.providers.types import IntentPrediction
+
 logger = logging.getLogger(__name__)
+structured_logger = structlog.get_logger(__name__)
 
 
-def _safe_json_parse(text: str) -> Dict[str, Any]:
-    """容错JSON解析。
+def _extract_text_from_state(state: Dict[str, Any]) -> str:
+    """从状态中提取最新用户文本。"""
+    raw_text = state.get("raw_text")
+    if isinstance(raw_text, str) and raw_text.strip():
+        return raw_text.strip()
 
-    Args:
-        text: LLM返回的原始文本。
+    messages = state.get("messages") or []
+    if isinstance(messages, list):
+        for message in reversed(messages):
+            role: str | None = None
+            content: Any = None
+            if isinstance(message, dict):
+                role = str(message.get("role") or "").strip() or None
+                content = message.get("content")
+            else:
+                content = getattr(message, "content", None)
+                role_attr = getattr(message, "role", None)
+                type_attr = getattr(message, "type", None)
+                role_candidate = role_attr or type_attr
+                if isinstance(role_candidate, str):
+                    role = role_candidate.strip()
+            if role == "user" and isinstance(content, str) and content.strip():
+                return content.strip()
 
-    Returns:
-        解析后的字典，失败时给出兜底结构。
-    """
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-    import re
-    m = re.search(r"```json\n(.*?)\n```", text, re.DOTALL)
-    if m:
-        try:
-            return json.loads(m.group(1))
-        except Exception:
-            pass
-    m = re.search(r"\{.*\}", text, re.DOTALL)
-    if m:
-        try:
-            return json.loads(m.group(0))
-        except Exception:
-            pass
-    logger.error("intent classify JSON parse failed: %s", text[:200])
-    return {"intent_type": "unknown", "slots": {}, "meta": {"need_confirm": False}}
+    raw_report = state.get("raw_report")
+    if isinstance(raw_report, str) and raw_report.strip():
+        return raw_report.strip()
 
-
-def intent_classifier_node(state: Dict[str, Any], llm_client, llm_model: str) -> Dict[str, Any]:
-    """意图分类节点：若state中无intent则尝试基于文本进行分类。
-
-    Args:
-        state: 图状态，期望包含 messages 或 raw_report。
-        llm_client: LLM客户端。
-        llm_model: 模型名。
-
-    Returns:
-        更新后的state，确保存在 state["intent"] 字段。
-    """
-    if state.get("intent"):
-        return state
-
-    # 输入优先级：messages最后一条用户文本 > raw_report > 空
-    input_text = ""
-    msgs = state.get("messages") or []
-    if isinstance(msgs, list) and msgs:
-        for msg in reversed(msgs):
-            if isinstance(msg, dict) and msg.get("role") == "user" and msg.get("content"):
-                input_text = str(msg.get("content"))
-                break
-    if not input_text:
-        input_text = str(state.get("raw_report") or "").strip()
-
-    if not input_text:
-        # 无输入则标记未知
-        return state | {"intent": {"intent_type": "unknown", "slots": {}, "meta": {"need_confirm": False}}}
-
-    prompt = (
-        "请将以下用户输入分类为预定义意图，并抽取槽位，以JSON返回：\n"
-        "意图集合示例：recon_minimal, device_control_robotdog, trapped_report, hazard_report, route_safe_point_query, \n"
-        "annotation_sign, geo_annotate, device_status_query, plan_task_approval, rfa_request, event_update。\n"
-        "返回JSON结构：{\"intent_type\": str, \"slots\": {..}, \"meta\": {\"need_confirm\": bool}}。\n"
-        f"用户输入：{input_text}\n"
-        "只返回JSON。"
+    structured_logger.warning(
+        "intent_text_missing",
+        state_keys=list(state.keys()),
+        message_count=len(messages) if isinstance(messages, list) else 0,
     )
+    return ""
 
-    try:
-        rsp = llm_client.chat.completions.create(
-            model=llm_model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0
+
+@dataclass
+class IntentClassifierRuntime:
+    """封装意图识别运行时依赖。"""
+
+    provider: IntentProvider
+    fallback: IntentProvider
+    thresholds: IntentThresholds
+
+    def classify_text(self, text: str) -> IntentPrediction:
+        try:
+            return self.provider.predict(text)
+        except Exception as exc:  # pragma: no cover - 极端网络错误兜底
+            structured_logger.warning(
+                "intent_provider_error",
+                provider=getattr(self.provider, "__class__", type(self.provider)).__name__,
+                error=str(exc),
+            )
+            return self.fallback.predict(text)
+
+    def __call__(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        text = _extract_text_from_state(state)
+        if not text:
+            intent_stub = {
+                "intent_type": "unknown",
+                "slots": {},
+                "meta": {"need_confirm": True, "confidence": 0.0, "margin": 0.0, "source": "unknown"},
+            }
+            return state | {"intent": intent_stub}
+
+        prediction = self.classify_text(text)
+        confidence = float(prediction.get("confidence", 0.0) or 0.0)
+        margin = float(prediction.get("margin", 0.0) or 0.0)
+        source = prediction.get("source", "unknown")
+        need_confirm = bool(prediction.get("need_confirm", False))
+        if confidence < self.thresholds.confidence or margin < self.thresholds.margin:
+            need_confirm = True
+
+        intent_raw = str(prediction.get("intent") or "unknown").strip() or "unknown"
+        # 将意图名称统一为小写下划线，方便与内部枚举、schema 对齐
+        intent_name = (
+            intent_raw.lower()
+            .replace("-", "_")
+            .replace(" ", "_")
         )
-        content = rsp.choices[0].message.content
-        intent = _safe_json_parse(content)
-        if not isinstance(intent, dict):
-            intent = {"intent_type": "unknown", "slots": {}, "meta": {"need_confirm": False}}
-        if "meta" not in intent:
-            intent["meta"] = {"need_confirm": False}
-        return state | {"intent": intent}
-    except Exception as e:
-        logger.error("intent classify failed: %s", e, exc_info=True)
-        return state | {"intent": {"intent_type": "unknown", "slots": {}, "meta": {"need_confirm": False}}}
+        slots = prediction.get("slots") if isinstance(prediction.get("slots"), dict) else {}
+
+        if intent_name in {"rescue_task_generate", "rescue-task-generate"} and isinstance(slots, dict):
+            summary_value = slots.get("situation_summary")
+            if isinstance(summary_value, str):
+                summary_clean = summary_value.strip()
+                if not summary_clean or summary_clean == text.strip() or len(summary_clean) < 25:
+                    slots["situation_summary"] = ""
+                    if isinstance(prediction.get("slots"), dict):
+                        prediction["slots"]["situation_summary"] = ""
+
+        intent_payload = {
+            "intent_type": intent_name if not need_confirm else "unknown",
+            "slots": slots,
+            "meta": {
+                "need_confirm": need_confirm,
+                "confidence": confidence,
+                "margin": margin,
+                "source": source,
+            },
+        }
+        structured_logger.info(
+            "intent_classifier_prediction",
+            raw_intent=intent_name,
+            final_intent=intent_payload["intent_type"],
+            confidence=confidence,
+            margin=margin,
+            need_confirm=need_confirm,
+            ranking=prediction.get("ranking", []),
+        )
+
+        structured_logger.info(
+            "intent_classified",
+            intent=intent_payload["intent_type"],
+            confidence=confidence,
+            margin=margin,
+            source=source,
+        )
+        return state | {"intent": intent_payload, "intent_prediction": dict(prediction)}
 
 
+def build_intent_classifier_runtime(
+    cfg: AppConfig,
+    llm_client,
+    llm_model: str,
+) -> IntentClassifierRuntime:
+    provider, fallback, thresholds = build_providers(cfg, llm_client, llm_model)
+    return IntentClassifierRuntime(provider=provider, fallback=fallback, thresholds=thresholds)
+
+
+_default_runtime: IntentClassifierRuntime | None = None
+
+
+def intent_classifier_node(
+    state: Dict[str, Any],
+    llm_client=None,
+    llm_model: str | None = None,
+    runtime: IntentClassifierRuntime | None = None,
+) -> Dict[str, Any]:
+    """意图分类入口。runtime 明确传入时优先使用，否则使用全局默认。"""
+    global _default_runtime
+    if runtime is not None:
+        return runtime(state)
+
+    if _default_runtime is None:
+        if llm_client is None or llm_model is None:
+            raise ValueError("intent_classifier_node requires runtime or (llm_client, llm_model)")
+        cfg = AppConfig.load_from_env()
+        _default_runtime = build_intent_classifier_runtime(cfg, llm_client, llm_model)
+    return _default_runtime(state)

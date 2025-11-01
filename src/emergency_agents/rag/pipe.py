@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Dict, Any
 
+import httpx
 from qdrant_client import QdrantClient
 from llama_index.core import Document, VectorStoreIndex, StorageContext
 from llama_index.core import Settings
@@ -11,6 +12,11 @@ from llama_index.vector_stores.qdrant import QdrantVectorStore
 from llama_index.llms.openai_like import OpenAILike
 from llama_index.embeddings.openai import OpenAIEmbedding
 from prometheus_client import Counter, Histogram
+
+# 全局注册一次 Prometheus 指标，避免多实例重复注册
+_RAG_IDX_COUNTER = Counter('rag_index_total', 'RAG index requests', ['domain'])
+_RAG_QRY_COUNTER = Counter('rag_query_total', 'RAG query requests', ['domain'])
+_RAG_QRY_LATENCY = Histogram('rag_query_seconds', 'RAG query latency seconds', ['domain'])
 
 
 @dataclass
@@ -28,11 +34,12 @@ class RagPipeline:
     OpenAI 兼容接口，确保与全局配置一致，不进行兜底降级。
     """
 
-    def __init__(self, *, qdrant_url: str, embedding_model: str, embedding_dim: int, openai_base_url: str, openai_api_key: str, llm_model: str) -> None:
+    def __init__(self, *, qdrant_url: str, qdrant_api_key: str | None, embedding_model: str, embedding_dim: int, openai_base_url: str, openai_api_key: str, llm_model: str) -> None:
         """初始化管道。
 
         Args:
             qdrant_url: Qdrant 服务地址。
+            qdrant_api_key: Qdrant API Key（可选，本地部署无需认证可传None）。
             embedding_model: 嵌入模型名称。
             embedding_dim: 嵌入维度，必须与集合一致。
             openai_base_url: OpenAI 兼容 API 基址。
@@ -40,10 +47,15 @@ class RagPipeline:
             llm_model: LLM 模型名，用于 LlamaIndex 内部能力。
         """
         self.qdrant_url = qdrant_url
+        self.qdrant_api_key = qdrant_api_key
         self.embedding_model = embedding_model
         self.embedding_dim = embedding_dim
         self.openai_base_url = openai_base_url
         self.openai_api_key = openai_api_key
+
+        # 创建自定义 HTTP 客户端，禁用系统代理环境变量，并设置有界超时
+        timeout = httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=10.0)
+        custom_http_client = httpx.Client(trust_env=False, timeout=timeout)
 
         # 明确指定 LLM 与嵌入模型，不依赖环境兜底
         Settings.llm = OpenAILike(
@@ -53,21 +65,24 @@ class RagPipeline:
             context_window=128000,
             is_chat_model=True,
             is_function_calling_model=False,
+            http_client=custom_http_client,  # 使用自定义客户端
         )
         Settings.embed_model = OpenAIEmbedding(
             model_name=self.embedding_model,
             api_key=self.openai_api_key,
             api_base=self.openai_base_url,
+            http_client=custom_http_client,  # 使用自定义客户端
+            embed_batch_size=32,  # 智谱GLM API限制：最大64条，设置32保守处理
         )
 
-        # metrics
-        self._idx_counter = Counter('rag_index_total', 'RAG index requests', ['domain'])
-        self._qry_counter = Counter('rag_query_total', 'RAG query requests', ['domain'])
-        self._qry_latency = Histogram('rag_query_seconds', 'RAG query latency seconds', ['domain'])
+        # metrics（指向模块级单例指标）
+        self._idx_counter = _RAG_IDX_COUNTER
+        self._qry_counter = _RAG_QRY_COUNTER
+        self._qry_latency = _RAG_QRY_LATENCY
 
     def _vector_store(self, collection: str) -> QdrantVectorStore:
         """构造 Qdrant 向量存储实例。"""
-        client = QdrantClient(url=self.qdrant_url)
+        client = QdrantClient(url=self.qdrant_url, api_key=self.qdrant_api_key)
         return QdrantVectorStore(client=client, collection_name=collection)
 
     def index_documents(self, domain: str, docs: List[Dict[str, Any]]) -> None:
@@ -87,7 +102,7 @@ class RagPipeline:
 
         # 强校验：已存在集合的维度必须一致，否则直接失败
         try:
-            client = QdrantClient(url=self.qdrant_url)
+            client = QdrantClient(url=self.qdrant_url, api_key=self.qdrant_api_key)
             info = client.get_collection(collection)
             actual = info.config.params.vectors.size  # type: ignore[attr-defined]
             if int(actual) != int(self.embedding_dim):

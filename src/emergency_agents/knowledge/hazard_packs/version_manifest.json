@@ -1,0 +1,57 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Hazard Pack Version Manifest",
+  "description": "多灾种知识包版本管理清单",
+  "last_updated": "2025-10-30T22:00:00Z",
+  "packs": {
+    "bridge_collapse": {
+      "current_version": "1.0.0",
+      "latest_stable": "1.0.0",
+      "versions": [
+        {
+          "version": "1.0.0",
+          "release_date": "2025-10-30",
+          "status": "stable",
+          "file": "bridge_collapse.json",
+          "changelog": "初始版本:包含4个阶段8个任务,4条风险规则,2个参考案例",
+          "schema_version": "1.0.0"
+        }
+      ]
+    },
+    "chemical_leak": {
+      "current_version": "1.0.0",
+      "latest_stable": "1.0.0",
+      "versions": [
+        {
+          "version": "1.0.0",
+          "release_date": "2025-10-30",
+          "status": "stable",
+          "file": "chemical_leak.json",
+          "changelog": "初始版本:包含4个阶段8个任务,4条风险规则,2个参考案例",
+          "schema_version": "1.0.0"
+        }
+      ]
+    },
+    "landslide": {
+      "current_version": "1.0.0",
+      "latest_stable": "1.0.0",
+      "versions": [
+        {
+          "version": "1.0.0",
+          "release_date": "2025-10-30",
+          "status": "stable",
+          "file": "landslide.json",
+          "changelog": "初始版本:包含4个阶段8个任务,4条风险规则,2个参考案例",
+          "schema_version": "1.0.0"
+        }
+      ]
+    }
+  },
+  "version_policy": {
+    "naming": "semver (major.minor.patch)",
+    "major_bump": "破坏性变更(任务模板结构调整,字段删除)",
+    "minor_bump": "新增功能(新任务模板,新风险规则)",
+    "patch_bump": "修复错误(文本修正,参数调整)",
+    "deprecation_notice": "旧版本保留6个月后归档"
+  }
+}

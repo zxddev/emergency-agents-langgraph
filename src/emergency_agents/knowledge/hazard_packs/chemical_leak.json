@@ -1,0 +1,208 @@
+{
+  "$schema": "./schemas/hazard_pack_schema.json",
+  "hazard_type": "chemical_leak",
+  "version": "1.0.0",
+  "severity_levels": {
+    "low": {
+      "threshold": 30,
+      "description": "少量泄漏(< 100L),易挥发但低毒性,无明显扩散"
+    },
+    "medium": {
+      "threshold": 60,
+      "description": "中等泄漏(100-1000L),有毒气体扩散,影响周边100米"
+    },
+    "high": {
+      "threshold": 85,
+      "description": "大量泄漏(> 1000L),剧毒/易燃易爆,影响半径500米以上"
+    },
+    "critical": {
+      "threshold": 100,
+      "description": "特大泄漏,多种化学品混合,已发生爆炸/火灾,需全城应急响应"
+    }
+  },
+  "mission_templates": [
+    {
+      "phase": "reconnaissance",
+      "tasks": [
+        {
+          "task_id": "recon_chemical_type_01",
+          "task_type": "chemical_identification",
+          "required_capabilities": ["chemical_analysis", "hazmat_specialist"],
+          "recommended_equipment": [
+            {"name": "chemical_detector", "quantity": 2, "priority": "critical"},
+            {"name": "gas_chromatograph", "quantity": 1, "priority": "recommended"},
+            {"name": "hazmat_suit", "quantity": 4, "priority": "critical"}
+          ],
+          "duration_minutes": 20,
+          "dependencies": [],
+          "parallel_allowed": false,
+          "description": "识别化学品种类和浓度,检测爆炸/中毒风险",
+          "safety_notes": "必须穿戴全封闭防化服,携带便携式呼吸器,2人一组互相监护"
+        },
+        {
+          "task_id": "recon_wind_direction_01",
+          "task_type": "meteorological_analysis",
+          "required_capabilities": ["weather_monitoring"],
+          "recommended_equipment": [
+            {"name": "wind_sensor", "quantity": 3, "priority": "critical"},
+            {"name": "气象站", "quantity": 1, "priority": "recommended"}
+          ],
+          "duration_minutes": 10,
+          "dependencies": [],
+          "parallel_allowed": true,
+          "description": "实时监测风向风速,预测毒气扩散范围",
+          "safety_notes": "每5分钟更新一次风向数据"
+        }
+      ]
+    },
+    {
+      "phase": "rescue",
+      "tasks": [
+        {
+          "task_id": "rescue_injured_01",
+          "task_type": "contaminated_rescue",
+          "required_capabilities": ["hazmat_rescue", "decontamination", "medical_first_aid"],
+          "recommended_equipment": [
+            {"name": "hazmat_suit_level_a", "quantity": 6, "priority": "critical"},
+            {"name": "decontamination_shower", "quantity": 2, "priority": "critical"},
+            {"name": "antidote_kit", "quantity": 5, "priority": "critical"},
+            {"name": "ambulance_hazmat", "quantity": 2, "priority": "critical"}
+          ],
+          "duration_minutes": 90,
+          "dependencies": ["recon_chemical_type_01", "alert_evacuation_01"],
+          "parallel_allowed": false,
+          "description": "救援污染区内受伤人员,进行现场洗消和急救",
+          "safety_notes": "进入前必须确认防护等级,设置洗消通道,严格执行进出登记"
+        },
+        {
+          "task_id": "rescue_leak_control_01",
+          "task_type": "leak_containment",
+          "required_capabilities": ["hazmat_specialist", "valve_operation", "plugging_technique"],
+          "recommended_equipment": [
+            {"name": "plugging_tools", "quantity": 1, "priority": "critical"},
+            {"name": "chemical_neutralizer", "quantity": 500, "priority": "critical"},
+            {"name": "foam_generator", "quantity": 2, "priority": "recommended"}
+          ],
+          "duration_minutes": 120,
+          "dependencies": ["recon_chemical_type_01"],
+          "parallel_allowed": false,
+          "description": "堵漏止泄,中和/覆盖泄漏物,防止进一步扩散",
+          "safety_notes": "禁止直接接触泄漏物,优先远程操作,准备应急撤离路线"
+        }
+      ]
+    },
+    {
+      "phase": "alert",
+      "tasks": [
+        {
+          "task_id": "alert_evacuation_01",
+          "task_type": "mass_evacuation",
+          "required_capabilities": ["crowd_management", "emergency_broadcast"],
+          "recommended_equipment": [
+            {"name": "loudspeaker", "quantity": 10, "priority": "critical"},
+            {"name": "evacuation_bus", "quantity": 20, "priority": "critical"}
+          ],
+          "duration_minutes": 60,
+          "dependencies": ["recon_wind_direction_01"],
+          "parallel_allowed": false,
+          "description": "根据毒气扩散模型,疏散下风向群众(半径500-2000米)",
+          "safety_notes": "优先疏散老人/儿童/孕妇,避开主风向"
+        },
+        {
+          "task_id": "alert_air_monitoring_01",
+          "task_type": "continuous_monitoring",
+          "required_capabilities": ["hazard_monitoring", "data_analysis"],
+          "recommended_equipment": [
+            {"name": "mobile_monitoring_vehicle", "quantity": 2, "priority": "critical"},
+            {"name": "chemical_sensors", "quantity": 10, "priority": "critical"}
+          ],
+          "duration_minutes": 300,
+          "dependencies": ["recon_chemical_type_01"],
+          "parallel_allowed": true,
+          "description": "设置环境监测点,持续监测空气中化学品浓度",
+          "safety_notes": "每10分钟报告一次监测数据,浓度超标立即预警"
+        }
+      ]
+    },
+    {
+      "phase": "logistics",
+      "tasks": [
+        {
+          "task_id": "logistics_decon_station_01",
+          "task_type": "decontamination_setup",
+          "required_capabilities": ["decontamination_specialist"],
+          "recommended_equipment": [
+            {"name": "decon_tent", "quantity": 3, "priority": "critical"},
+            {"name": "shower_unit", "quantity": 6, "priority": "critical"},
+            {"name": "wastewater_tank", "quantity": 2, "priority": "critical"}
+          ],
+          "duration_minutes": 45,
+          "dependencies": ["alert_evacuation_01"],
+          "parallel_allowed": true,
+          "description": "建立洗消站,处理污染人员和装备",
+          "safety_notes": "洗消废水必须集中收集,不得排入市政管网"
+        },
+        {
+          "task_id": "logistics_antidote_supply_01",
+          "task_type": "medical_logistics",
+          "required_capabilities": ["medical_logistics", "pharmacy"],
+          "recommended_equipment": [
+            {"name": "specific_antidote", "quantity": 100, "priority": "critical"},
+            {"name": "oxygen_cylinder", "quantity": 50, "priority": "critical"}
+          ],
+          "duration_minutes": 30,
+          "dependencies": ["recon_chemical_type_01"],
+          "parallel_allowed": true,
+          "description": "根据化学品种类,紧急调配特效解毒剂",
+          "safety_notes": "优先保障一线救援人员和重症伤员"
+        }
+      ]
+    }
+  ],
+  "risk_rules": [
+    {
+      "rule_id": "risk_explosion",
+      "condition": "检测到易燃气体浓度达到爆炸下限10%以上",
+      "action": "立即撤离500米,切断电源,禁止一切火源,使用防爆设备",
+      "priority": "critical"
+    },
+    {
+      "rule_id": "risk_toxic_cloud",
+      "condition": "风速 < 2m/s 且毒气浓度持续上升",
+      "action": "扩大疏散半径至2公里,启动人工稀释(水幕/泡沫覆盖)",
+      "priority": "critical"
+    },
+    {
+      "rule_id": "risk_multi_chemical",
+      "condition": "检测到2种以上化学品混合",
+      "action": "暂停堵漏作业,联系化工专家评估反应风险,等待专业处置方案",
+      "priority": "high"
+    },
+    {
+      "rule_id": "risk_water_contamination",
+      "condition": "泄漏物接近河流/水源地(距离 < 100米)",
+      "action": "紧急构筑围堰,使用吸附材料,通知下游水厂停水",
+      "priority": "high"
+    }
+  ],
+  "reference_cases": [
+    {
+      "case_id": "case_tianjin_explosion_2015",
+      "title": "2015年天津滨海新区爆炸事故",
+      "summary": "危化品仓库连环爆炸,165人遇难,304名消防员参与救援",
+      "date": "2015-08-12",
+      "location": "天津市滨海新区",
+      "lessons_learned": "化工火灾禁止盲目用水扑救;必须先确认化学品种类;优先保护救援人员安全,设置安全撤离距离",
+      "rag_doc_id": "rag_chemical_tianjin_2015"
+    },
+    {
+      "case_id": "case_xiangshui_explosion_2019",
+      "title": "2019年江苏响水化工厂爆炸",
+      "summary": "苯类化合物爆炸,78人遇难,紧急疏散周边3公里居民",
+      "date": "2019-03-21",
+      "location": "江苏省盐城市响水县",
+      "lessons_learned": "化工园区需建立联动机制;及时疏散下风向群众;洗消站必须设在上风向",
+      "rag_doc_id": "rag_chemical_xiangshui_2019"
+    }
+  ]
+}
