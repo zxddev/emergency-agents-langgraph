@@ -434,7 +434,12 @@ async def startup_event():
 
     # 创建checkpointer（复用PostgreSQL连接池）
     from emergency_agents.graph.checkpoint_utils import create_async_postgres_checkpointer
-    sitrep_checkpointer = create_async_postgres_checkpointer(_cfg.postgres_dsn)
+    sitrep_checkpointer, sitrep_close_cb = await create_async_postgres_checkpointer(
+        dsn=_cfg.postgres_dsn,
+        schema="sitrep_checkpoint",
+        min_size=1,
+        max_size=5,
+    )
 
     _sitrep_graph = await build_sitrep_graph(
         incident_dao=incident_dao,
@@ -446,6 +451,7 @@ async def startup_event():
         llm_model=_cfg.llm_model,
         checkpointer=sitrep_checkpointer,
     )
+    _sitrep_graph._checkpoint_close = sitrep_close_cb  # 注册关闭回调
     _register_graph_close(_sitrep_graph)
     logger.info("api_graph_ready", graph="sitrep")
 

@@ -23,20 +23,23 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, NotRequired, TypedDict
 
 import structlog
-from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-from langgraph.graph import END, START, StateGraph, task
+
+try:
+    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+except ModuleNotFoundError:
+    AsyncPostgresSaver = None  # type: ignore[assignment, misc]
+
+from langgraph.func import task
+from langgraph.graph import END, START, StateGraph
 
 from emergency_agents.db.dao import (
     IncidentDAO,
     IncidentRecord,
+    IncidentSnapshotRepository,
     RescueDAO,
     TaskDAO,
 )
-from emergency_agents.db.models import TaskSummary
-from emergency_agents.db.snapshot_repository import (
-    IncidentSnapshotRepository,
-    SnapshotCreateInput,
-)
+from emergency_agents.db.models import IncidentSnapshotCreateInput, TaskSummary
 from emergency_agents.risk.service import RiskCacheManager, RiskZoneRecord
 
 logger = structlog.get_logger(__name__)
@@ -288,7 +291,7 @@ async def call_llm_for_sitrep(
 @task
 async def persist_snapshot_task(
     snapshot_repo: IncidentSnapshotRepository,
-    snapshot_input: SnapshotCreateInput,
+    snapshot_input: IncidentSnapshotCreateInput,
 ) -> str:
     """
     数据库写入任务：持久化态势报告快照
@@ -297,19 +300,19 @@ async def persist_snapshot_task(
     副作用：数据库写入
     """
     start_time = datetime.now(timezone.utc)
-    logger.info("sitrep_persist_start", report_id=snapshot_input.snapshot_id)
+    logger.info("sitrep_persist_start")
 
     # 写入incident_snapshots表
-    snapshot_id = await snapshot_repo.create_snapshot(snapshot_input)
+    record = await snapshot_repo.create_snapshot(snapshot_input)
 
     duration = (datetime.now(timezone.utc) - start_time).total_seconds()
     logger.info(
         "sitrep_persist_completed",
-        snapshot_id=snapshot_id,
+        snapshot_id=record.snapshot_id,
         duration_ms=duration * 1000,
     )
 
-    return snapshot_id
+    return record.snapshot_id
 
 
 # ========== 节点函数：纯计算逻辑，无副作用，不需要@task ==========
@@ -544,11 +547,13 @@ def persist_report(
         return {}
 
     # 构建快照数据
-    snapshot_input = SnapshotCreateInput(
-        snapshot_id=state["report_id"],  # 使用report_id作为快照ID
-        incident_id=state.get("incident_id"),  # 可选：关联到特定事件
+    snapshot_input = IncidentSnapshotCreateInput(
+        incident_id=state.get("incident_id") or "",  # 必填字段，如果没有就用空字符串
         snapshot_type="sitrep_report",  # 态势报告类型
+        generated_at=datetime.now(timezone.utc),  # 必填字段
+        created_by=state["user_id"],  # 必填字段
         payload={
+            "report_id": state["report_id"],  # 将report_id放在payload中
             "metrics": state.get("metrics", {}),
             "summary": state.get("llm_summary", ""),
             "details": {
@@ -585,7 +590,6 @@ def persist_report(
             "time_range_hours": state.get("time_range_hours", 24),
             "generated_at": datetime.now(timezone.utc).isoformat(),
         },
-        creator=state["user_id"],
     )
 
     # 调用@task包装的持久化函数

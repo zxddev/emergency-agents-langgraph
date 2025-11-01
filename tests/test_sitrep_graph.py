@@ -213,18 +213,18 @@ def test_ingest_node(initial_state):
 
 @pytest.mark.unit
 async def test_fetch_active_incidents_node(initial_state, mock_incident_dao):
-    """测试fetch_active_incidents节点：查询活跃事件"""
-    result = fetch_active_incidents(initial_state, mock_incident_dao)
+    """测试fetch_active_incidents节点：幂等性检查逻辑"""
+    # 测试幂等性：如果state中已有数据，应返回空字典
+    state_with_data = initial_state | {
+        "active_incidents": [
+            mock_incident_dao.list_active_incidents.return_value[0]
+        ]
+    }
+    result = fetch_active_incidents(state_with_data, mock_incident_dao)
+    assert result == {}  # 幂等性：已有数据，不重复查询
 
-    # 等待@task函数执行
-    # 注意：在真实环境中，.result()会被调用
-    # 这里Mock测试简化处理
-
-    assert "active_incidents" in result or result == {}
-
-    # 验证DAO方法被调用
-    # 注意：由于@task包装，实际调用时序可能不同
-    # 这里仅验证Mock对象存在
+    # 注意：由于@task需要LangGraph运行上下文，
+    # 实际的数据库调用测试应在集成测试中进行
 
 
 @pytest.mark.unit
