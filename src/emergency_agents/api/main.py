@@ -237,23 +237,8 @@ _amap_client = AmapClient(
 
 _orchestrator_client = OrchestratorClient()
 
-_intent_registry = IntentHandlerRegistry.build(
-    pool=_pg_pool,
-    amap_client=_amap_client,
-    device_directory=_device_directory,
-    video_stream_map=_cfg.video_stream_map,
-    kg_service=_kg,
-    rag_pipeline=_rag,
-    llm_client=_llm_client_rescue,
-    llm_model=_cfg.llm_model,
-    adapter_client=_adapter_client,
-    default_robotdog_id=_cfg.default_robotdog_id,
-    orchestrator_client=_orchestrator_client,
-    rag_timeout=_cfg.rag_analysis_timeout,
-    postgres_dsn=_cfg.postgres_dsn,
-)
-
-_intent_registry.attach_rescue_draft_service(_rescue_draft_service)
+# IntentHandlerRegistry需要异步初始化，在startup_event中完成
+_intent_registry: IntentHandlerRegistry | None = None
 
 _risk_cache_manager: RiskCacheManager | None = None
 _risk_refresh_task: asyncio.Task[None] | None = None
@@ -364,11 +349,32 @@ async def startup_event():
     global _risk_refresh_task
     global _risk_predictor
     global _risk_predict_task
+    global _intent_registry  # 新增
+
     await _pg_pool.open()
     logger.info("api_startup_pg_pool_opened")
     await _asr.start_health_check()
     await voice_chat_handler.start_background_tasks()
     _graph_closers = []
+
+    # 初始化IntentHandlerRegistry（异步初始化，包含ScoutTaskGenerationHandler懒加载）
+    _intent_registry = await IntentHandlerRegistry.build(
+        pool=_pg_pool,
+        amap_client=_amap_client,
+        device_directory=_device_directory,
+        video_stream_map=_cfg.video_stream_map,
+        kg_service=_kg,
+        rag_pipeline=_rag,
+        llm_client=_llm_client_rescue,
+        llm_model=_cfg.llm_model,
+        adapter_client=_adapter_client,
+        default_robotdog_id=_cfg.default_robotdog_id,
+        orchestrator_client=_orchestrator_client,
+        rag_timeout=_cfg.rag_analysis_timeout,
+        postgres_dsn=_cfg.postgres_dsn,
+    )
+    _intent_registry.attach_rescue_draft_service(_rescue_draft_service)
+    logger.info("api_intent_registry_initialized")
 
     _graph_app = await build_app(_cfg.checkpoint_sqlite_path, _cfg.postgres_dsn)
     _register_graph_close(_graph_app)

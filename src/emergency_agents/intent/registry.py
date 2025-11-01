@@ -13,7 +13,6 @@ from emergency_agents.external.amap_client import AmapClient
 from emergency_agents.external.device_directory import DeviceDirectory
 from emergency_agents.external.orchestrator_client import OrchestratorClient
 from emergency_agents.graph.kg_service import KGService
-from emergency_agents.graph.scout_tactical_app import build_scout_tactical_graph
 from emergency_agents.intent.handlers import (
     DeviceControlHandler,
     LocationPositioningHandler,
@@ -35,7 +34,7 @@ class IntentHandlerRegistry:
     handlers: Dict[str, Any]
 
     @classmethod
-    def build(
+    async def build(
         cls,
         pool: AsyncConnectionPool[DictRow],
         amap_client: AmapClient,
@@ -81,11 +80,12 @@ class IntentHandlerRegistry:
         )
         risk_repository = RiskDataRepository(IncidentDAO.create(pool))
         scout_handler = ScoutTaskGenerationHandler(
-            graph=build_scout_tactical_graph(
-                risk_repository=risk_repository,
-                device_directory=device_directory,
-                amap_client=amap_client,
-            ),
+            risk_repository=risk_repository,
+            device_directory=device_directory,  # type: ignore  # 允许None，运行时暴露问题
+            amap_client=amap_client,
+            orchestrator_client=orchestrator_client,  # type: ignore  # 允许None，运行时暴露问题
+            postgres_dsn=postgres_dsn,
+            pool=pool,
         )
 
         handlers: Dict[str, Any] = {
