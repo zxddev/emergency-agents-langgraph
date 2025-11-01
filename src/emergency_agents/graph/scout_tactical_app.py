@@ -1,16 +1,24 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Mapping, NotRequired, Optional, Required, Sequence, Tuple, TypedDict
+from typing import Any, Callable, Dict, List, Mapping, NotRequired, Optional, Required, Sequence, Tuple, TypedDict, Awaitable
 
 import structlog
-from langgraph.graph import task
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from langgraph.graph import StateGraph, task
+from psycopg_pool import AsyncConnectionPool
 
 from emergency_agents.control.models import DeviceType
-from emergency_agents.db.models import RiskZoneRecord
+from emergency_agents.db.dao import RescueTaskRepository, serialize_dataclass
+from emergency_agents.db.models import (
+    RiskZoneRecord,
+    TaskCreateInput,
+    TaskRoutePlanCreateInput,
+)
 from emergency_agents.external.amap_client import AmapClient, Coordinate, RoutePlan
 from emergency_agents.external.device_directory import DeviceDirectory, DeviceEntry
+from emergency_agents.external.orchestrator_client import OrchestratorClient
+from emergency_agents.graph.checkpoint_utils import create_async_postgres_checkpointer
 from emergency_agents.intent.schemas import ScoutTaskGenerationSlots
 from emergency_agents.risk.repository import RiskDataRepository
 
@@ -80,6 +88,13 @@ class SensorAssignment(TypedDict):
     priority: NotRequired[int]  # 优先级 (可选,1-5,5最高)
 
 
+class WaypointRisk(TypedDict):
+    """航点风险评估 - risk_overlay节点的输出"""
+    waypoint_sequence: Required[int]  # 航点序号 (必填)
+    risk_level: Required[int]  # 风险等级 (必填,0-5)
+    hazard_types: Required[List[str]]  # 危险类型列表 (必填,如['landslide','aftershock'])
+
+
 class ScoutTacticalState(TypedDict):
     """侦察战术图状态 - 使用Required/NotRequired明确标注字段必选性
 
@@ -87,121 +102,570 @@ class ScoutTacticalState(TypedDict):
     - Required[T]: 明确必填字段
     - NotRequired[T]: 明确可选字段
     - 绝对禁止使用total=False (会使所有字段变为可选)
+
+    参考: rescue_tactical_app.py:106-156 的最佳实践
     """
-    incident_id: Required[str]  # 事件ID (必填)
-    user_id: Required[str]  # 用户ID (必填)
-    thread_id: Required[str]  # 线程ID (必填)
-    slots: NotRequired[ScoutTaskGenerationSlots]  # 意图槽位 (可选,用于细化需求)
-    selected_devices: NotRequired[List[SelectedDevice]]  # 已选设备列表 (可选,device_selection节点输出)
-    recon_route: NotRequired[ReconRoute]  # 侦察路线 (可选,recon_route_planning节点输出)
-    sensor_assignments: NotRequired[List[SensorAssignment]]  # 传感器分配列表 (可选,sensor_payload_assignment节点输出)
+    # 核心标识字段 (必填)
+    incident_id: Required[str]  # 事件ID
+    user_id: Required[str]  # 用户ID
+    thread_id: Required[str]  # 线程ID
+
+    # 输入槽位 (可选)
+    slots: NotRequired[ScoutTaskGenerationSlots]  # 意图槽位,用于细化需求
+
+    # 流程状态 (可选)
+    status: NotRequired[str]  # 执行状态 (ok/error)
+    error: NotRequired[str]  # 错误信息
+
+    # 节点输出 (可选,各节点逐步填充)
+    scout_plan: NotRequired[ScoutPlan]  # 侦察计划 (build_intel_requirements输出)
+    selected_devices: NotRequired[List[SelectedDevice]]  # 已选设备 (device_selection输出)
+    recon_route: NotRequired[ReconRoute]  # 侦察路线 (route_planning输出)
+    sensor_assignments: NotRequired[List[SensorAssignment]]  # 传感器分配 (sensor_assignment输出)
+    waypoint_risks: NotRequired[List[WaypointRisk]]  # 航点风险 (risk_overlay输出)
+
+    # 持久化结果 (可选)
+    persisted_task: NotRequired[Dict[str, Any]]  # 已保存的任务记录 (persist_task输出)
+    persisted_routes: NotRequired[List[Dict[str, Any]]]  # 已保存的路线记录 (persist_task输出)
+
+    # 输出数据 (可选)
+    ui_actions: NotRequired[List[Dict[str, Any]]]  # 前端UI动作 (prepare_response输出)
+    response_text: NotRequired[str]  # 响应文本 (prepare_response输出)
+    ws_payload: NotRequired[Dict[str, Any]]  # WebSocket推送内容 (ws_notify输出)
 
 
-@dataclass(slots=True)
 class ScoutTacticalGraph:
-    risk_repository: RiskDataRepository
-    device_directory: Optional[DeviceDirectory] = None  # 设备目录(可选,用于设备选择)
-    amap_client: Optional[AmapClient] = None  # 高德地图客户端(可选,用于路线规划)
+    """侦察战术图 - 基于StateGraph的节点化流程
+
+    这是重构后的ScoutTacticalGraph类,遵循LangGraph最佳实践:
+    1. 所有依赖Required,不允许Optional(符合"不做降级"原则)
+    2. 使用StateGraph节点化流程,而非单一invoke()方法
+    3. 通过闭包捕获依赖,传递给节点函数
+    4. 支持durability="sync"持久化长流程状态
+    5. 支持人工审批中断点(未来扩展)
+
+    参考: rescue_tactical_app.py:303-921 的最佳实践实现
+    """
+
+    def __init__(
+        self,
+        *,
+        risk_repository: RiskDataRepository,
+        device_directory: DeviceDirectory,  # Required,不再是Optional
+        amap_client: AmapClient,  # Required,不再是Optional
+        orchestrator_client: OrchestratorClient,  # 新增: 后台通知客户端
+        task_repository: RescueTaskRepository,  # 新增: 任务数据仓库
+        postgres_dsn: str,  # 新增: PostgreSQL连接字符串
+        checkpoint_schema: str = "scout_tactical_checkpoint",  # 检查点表名
+    ) -> None:
+        """初始化侦察战术图
+
+        Args:
+            risk_repository: 风险数据仓库(必需)
+            device_directory: 设备目录(必需,不再可选)
+            amap_client: 高德地图客户端(必需,不再可选)
+            orchestrator_client: Orchestrator客户端(必需,用于WebSocket通知)
+            task_repository: 任务数据仓库(必需,用于持久化任务)
+            postgres_dsn: PostgreSQL连接字符串(必需,用于检查点)
+            checkpoint_schema: 检查点表名(可选,默认scout_tactical_checkpoint)
+
+        注意: 所有依赖都是Required,启动时就会验证完整性,
+              不会在运行时降级处理(符合"不做fallback"原则)
+        """
+        # 存储所有依赖为实例变量
+        self._risk_repository = risk_repository
+        self._device_directory = device_directory
+        self._amap_client = amap_client
+        self._orchestrator_client = orchestrator_client
+        self._task_repository = task_repository
+        self._postgres_dsn = postgres_dsn
+        self._checkpoint_schema = checkpoint_schema
+
+        # 构建StateGraph(将在Phase 4实现)
+        self._graph = self._build_graph()
+
+        # 检查点和编译后的图(将在build()类方法中初始化)
+        self._checkpointer: Optional[AsyncPostgresSaver] = None
+        self._compiled: Optional[Any] = None
+        self._checkpoint_close: Optional[Callable[[], Awaitable[None]]] = None
+
+    def _build_graph(self) -> StateGraph:
+        """构建StateGraph - 8个节点的侦察战术流程
+
+        节点流程:
+        build_intel_requirements → device_selection → route_planning
+        → sensor_assignment → risk_overlay → persist_task
+        → prepare_response → ws_notify → END
+
+        每个节点使用闭包捕获self._xxx依赖,调用对应的@task函数
+
+        参考: rescue_tactical_app.py:397-905 的节点构建模式
+        """
+        graph = StateGraph(ScoutTacticalState)
+
+        # ========== 节点1: build_intel_requirements ==========
+        async def build_intel_requirements(state: ScoutTacticalState) -> Dict[str, Any]:
+            """生成情报需求 - 基于风险点生成侦察计划
+
+            输入: state["slots"], state["incident_id"]
+            输出: state["scout_plan"]
+            """
+            # 幂等性检查
+            if "scout_plan" in state and state.get("scout_plan"):
+                logger.info("build_intel_requirements_skip_existing")
+                return {}  # 已有计划,跳过
+
+            slots = state.get("slots")
+            incident_id = state.get("incident_id", "")
+
+            # 查询活跃风险区域
+            zones = await self._risk_repository.list_active_zones()
+
+            # 调用辅助方法生成计划(复用现有逻辑)
+            plan = self._build_plan(incident_id, slots, zones)
+
+            logger.info(
+                "build_intel_requirements_completed",
+                incident_id=incident_id,
+                target_count=len(plan.get("targets", [])),
+            )
+            return {"scout_plan": plan}
+
+        # ========== 节点2: device_selection ==========
+        async def device_selection(state: ScoutTacticalState) -> Dict[str, Any]:
+            """设备选择 - 根据传感器需求筛选设备
+
+            输入: state["scout_plan"]
+            输出: state["selected_devices"]
+            """
+            # 幂等性检查
+            if "selected_devices" in state and state.get("selected_devices"):
+                logger.info("device_selection_skip_existing")
+                return {}
+
+            plan = state.get("scout_plan")
+            if not plan:
+                logger.warning("device_selection_no_plan")
+                return {"selected_devices": []}
+
+            required_sensors = plan.get("recommendedSensors", [])
+
+            # 调用@task函数(闭包捕获self._device_directory)
+            selected_devices = await select_devices_for_recon_task(
+                device_directory=self._device_directory,
+                required_sensors=required_sensors,
+                prefer_device_type=DeviceType.UAV,
+            )
+
+            logger.info(
+                "device_selection_completed",
+                selected_count=len(selected_devices),
+            )
+            return {"selected_devices": selected_devices}
+
+        # ========== 节点3: route_planning ==========
+        async def route_planning(state: ScoutTacticalState) -> Dict[str, Any]:
+            """路线规划 - 生成多目标巡逻路线
+
+            输入: state["scout_plan"], state["selected_devices"]
+            输出: state["recon_route"]
+            """
+            # 幂等性检查
+            if "recon_route" in state and state.get("recon_route"):
+                logger.info("route_planning_skip_existing")
+                return {}
+
+            plan = state.get("scout_plan")
+            devices = state.get("selected_devices", [])
+
+            if not plan or not devices:
+                logger.warning("route_planning_missing_input", has_plan=bool(plan), has_devices=bool(devices))
+                return {"recon_route": {"waypoints": [], "total_distance_m": 0, "total_duration_sec": 0}}
+
+            # 构建目标列表: [(target_id, coordinate), ...]
+            targets: List[Tuple[str, Coordinate]] = []
+            for target in plan.get("targets", []):
+                target_id = target.get("targetId", "")
+                location = target.get("location", {})
+                lng = location.get("lng")
+                lat = location.get("lat")
+                if isinstance(lng, (int, float)) and isinstance(lat, (int, float)):
+                    coord: Coordinate = {"lng": float(lng), "lat": float(lat)}
+                    targets.append((target_id, coord))
+
+            if not targets:
+                logger.warning("route_planning_no_targets")
+                return {"recon_route": {"waypoints": [], "total_distance_m": 0, "total_duration_sec": 0}}
+
+            # 假设起点为第一个目标附近
+            origin: Coordinate = targets[0][1]
+
+            # 调用@task函数(闭包捕获self._amap_client)
+            recon_route = await plan_recon_route_task(
+                origin=origin,
+                targets=targets,
+                amap_client=self._amap_client,
+            )
+
+            logger.info(
+                "route_planning_completed",
+                waypoint_count=len(recon_route["waypoints"]),
+            )
+            return {"recon_route": recon_route}
+
+        # ========== 节点4: sensor_assignment ==========
+        async def sensor_assignment(state: ScoutTacticalState) -> Dict[str, Any]:
+            """传感器载荷分配 - 为设备和航点分配传感器任务
+
+            输入: state["selected_devices"], state["recon_route"], state["scout_plan"]
+            输出: state["sensor_assignments"]
+            """
+            # 幂等性检查
+            if "sensor_assignments" in state and state.get("sensor_assignments"):
+                logger.info("sensor_assignment_skip_existing")
+                return {}
+
+            devices = state.get("selected_devices", [])
+            route = state.get("recon_route")
+            plan = state.get("scout_plan")
+
+            if not devices or not route or not plan:
+                logger.warning("sensor_assignment_missing_input")
+                return {"sensor_assignments": []}
+
+            waypoints = route.get("waypoints", [])
+            required_sensors = plan.get("recommendedSensors", [])
+
+            # 调用@task函数
+            sensor_assignments = await assign_sensor_payloads_task(
+                devices=devices,
+                waypoints=waypoints,
+                required_sensors=required_sensors,
+            )
+
+            logger.info(
+                "sensor_assignment_completed",
+                assignment_count=len(sensor_assignments),
+            )
+            return {"sensor_assignments": sensor_assignments}
+
+        # ========== 节点5: risk_overlay ==========
+        async def risk_overlay(state: ScoutTacticalState) -> Dict[str, Any]:
+            """风险叠加 - 为每个航点叠加风险数据
+
+            输入: state["recon_route"]
+            输出: state["waypoint_risks"]
+            """
+            # 幂等性检查
+            if "waypoint_risks" in state and state.get("waypoint_risks"):
+                logger.info("risk_overlay_skip_existing")
+                return {}
+
+            route = state.get("recon_route")
+            if not route:
+                logger.warning("risk_overlay_no_route")
+                return {"waypoint_risks": []}
+
+            waypoints = route.get("waypoints", [])
+            if not waypoints:
+                return {"waypoint_risks": []}
+
+            # 调用@task函数(闭包捕获self._risk_repository)
+            waypoint_risks = await risk_overlay_task(
+                waypoints=waypoints,
+                risk_repository=self._risk_repository,
+            )
+
+            logger.info(
+                "risk_overlay_completed",
+                waypoint_count=len(waypoint_risks),
+            )
+            return {"waypoint_risks": waypoint_risks}
+
+        # ========== 节点6: persist_task ==========
+        async def persist_task_node(state: ScoutTacticalState) -> Dict[str, Any]:
+            """持久化任务 - 保存侦察任务到数据库
+
+            输入: state["scout_plan"], state["incident_id"], state["user_id"]
+            输出: state["persisted_task"]
+            """
+            # 幂等性检查
+            if "persisted_task" in state and state.get("persisted_task"):
+                logger.info("persist_task_skip_existing")
+                return {}
+
+            plan = state.get("scout_plan")
+            if not plan:
+                logger.warning("persist_task_no_plan")
+                return {}
+
+            # 构建任务数据
+            task_id = f"scout_{state['incident_id']}_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+            scout_task_data = {
+                "task_id": task_id,
+                "description": f"侦察任务 - {len(plan.get('targets', []))}个目标点",
+                "incident_id": state["incident_id"],
+                "user_id": state["user_id"],
+                "scout_plan": plan,
+            }
+
+            # 调用@task函数(闭包捕获self._task_repository)
+            persisted = await persist_scout_task(
+                scout_task=scout_task_data,
+                task_repository=self._task_repository,
+            )
+
+            logger.info(
+                "persist_task_completed",
+                task_id=task_id,
+                record_id=persisted.get("task_record_id"),
+            )
+            return {"persisted_task": persisted}
+
+        # ========== 节点7: prepare_response ==========
+        async def prepare_response(state: ScoutTacticalState) -> Dict[str, Any]:
+            """准备响应 - 生成UI动作和响应文本
+
+            输入: state所有数据
+            输出: state["ui_actions"], state["response_text"]
+            """
+            # 生成UI动作
+            ui_result = await prepare_ui_actions_task(state)
+            ui_actions = ui_result.get("ui_actions", [])
+
+            # 生成响应文本
+            plan = state.get("scout_plan")
+            if plan:
+                response_text = self._compose_response(plan)
+            else:
+                response_text = "侦察计划生成失败"
+
+            logger.info(
+                "prepare_response_completed",
+                ui_action_count=len(ui_actions),
+            )
+            return {
+                "ui_actions": ui_actions,
+                "response_text": response_text,
+            }
+
+        # ========== 节点8: ws_notify ==========
+        async def ws_notify(state: ScoutTacticalState) -> Dict[str, Any]:
+            """WebSocket通知 - 推送侦察场景到后台
+
+            输入: state所有数据
+            输出: state["ws_payload"]
+            """
+            # 构建推送载荷
+            plan = state.get("scout_plan")
+            devices = state.get("selected_devices", [])
+            route = state.get("recon_route")
+
+            if not plan:
+                logger.warning("ws_notify_no_plan")
+                return {}
+
+            payload = {
+                "taskId": state.get("persisted_task", {}).get("task_record_id", ""),
+                "scenario": "scout",
+                "incidentId": state["incident_id"],
+                "targetCount": len(plan.get("targets", [])),
+                "deviceCount": len(devices),
+                "waypointCount": len(route.get("waypoints", [])) if route else 0,
+            }
+
+            # 调用@task函数(闭包捕获self._orchestrator_client)
+            notify_result = await notify_backend_task(
+                payload=payload,
+                orchestrator=self._orchestrator_client,
+            )
+
+            logger.info(
+                "ws_notify_completed",
+                success=notify_result.get("success", False),
+            )
+            return {"ws_payload": notify_result}
+
+        # ========== 添加节点到图 ==========
+        graph.add_node("build_intel_requirements", build_intel_requirements)
+        graph.add_node("device_selection", device_selection)
+        graph.add_node("route_planning", route_planning)
+        graph.add_node("sensor_assignment", sensor_assignment)
+        graph.add_node("risk_overlay", risk_overlay)
+        graph.add_node("persist_task", persist_task_node)
+        graph.add_node("prepare_response", prepare_response)
+        graph.add_node("ws_notify", ws_notify)
+
+        # ========== 设置流程边 ==========
+        graph.set_entry_point("build_intel_requirements")
+        graph.add_edge("build_intel_requirements", "device_selection")
+        graph.add_edge("device_selection", "route_planning")
+        graph.add_edge("route_planning", "sensor_assignment")
+        graph.add_edge("sensor_assignment", "risk_overlay")
+        graph.add_edge("risk_overlay", "persist_task")
+        graph.add_edge("persist_task", "prepare_response")
+        graph.add_edge("prepare_response", "ws_notify")
+        graph.add_edge("ws_notify", "__end__")
+
+        logger.info("scout_tactical_graph_built", node_count=8)
+        return graph
+
+    @classmethod
+    async def build(
+        cls,
+        *,
+        risk_repository: RiskDataRepository,
+        device_directory: DeviceDirectory,
+        amap_client: AmapClient,
+        orchestrator_client: OrchestratorClient,
+        task_repository: RescueTaskRepository,
+        postgres_dsn: str,
+        checkpoint_schema: str = "scout_tactical_checkpoint",
+    ) -> "ScoutTacticalGraph":
+        """异步构建侦察战术图,绑定PostgreSQL checkpointer
+
+        这是推荐的构建方式,确保:
+        1. 所有依赖在启动时验证完整性(Required,不允许None)
+        2. 异步创建PostgreSQL检查点连接池
+        3. 编译StateGraph并绑定checkpointer
+        4. 返回ready-to-use的图实例
+
+        Args:
+            risk_repository: 风险数据仓库(必需)
+            device_directory: 设备目录(必需)
+            amap_client: 高德地图客户端(必需)
+            orchestrator_client: Orchestrator客户端(必需)
+            task_repository: 任务数据仓库(必需)
+            postgres_dsn: PostgreSQL连接字符串(必需)
+            checkpoint_schema: 检查点表名(可选)
+
+        Returns:
+            ScoutTacticalGraph: 已初始化并编译的图实例
+
+        Example:
+            graph = await ScoutTacticalGraph.build(
+                risk_repository=risk_repo,
+                device_directory=device_dir,
+                amap_client=amap,
+                orchestrator_client=orchestrator,
+                task_repository=task_repo,
+                postgres_dsn="postgresql://user:pass@host:port/db",
+            )
+            result = await graph.invoke(state)
+        """
+        logger.info(
+            "scout_tactical_graph_init",
+            checkpoint_schema=checkpoint_schema,
+        )
+
+        # 创建实例
+        instance = cls(
+            risk_repository=risk_repository,
+            device_directory=device_directory,
+            amap_client=amap_client,
+            orchestrator_client=orchestrator_client,
+            task_repository=task_repository,
+            postgres_dsn=postgres_dsn,
+            checkpoint_schema=checkpoint_schema,
+        )
+
+        # 创建PostgreSQL checkpointer
+        checkpointer, close_cb = await create_async_postgres_checkpointer(
+            dsn=postgres_dsn,
+            schema=checkpoint_schema,
+            min_size=1,  # 最小连接数
+            max_size=5,  # 最大连接数
+        )
+        instance._checkpointer = checkpointer
+        instance._checkpoint_close = close_cb
+
+        # 编译图并绑定checkpointer
+        instance._compiled = instance._graph.compile(checkpointer=checkpointer)
+
+        logger.info(
+            "scout_tactical_graph_ready",
+            checkpoint_schema=checkpoint_schema,
+        )
+        return instance
 
     async def invoke(
         self,
         state: ScoutTacticalState,
         config: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """侦察战术图主入口 - 串联执行所有节点
+    ) -> ScoutTacticalState:
+        """执行侦察战术图 - 使用StateGraph编排8个节点
 
-        执行流程:
-        1. 生成侦察计划(基于风险点)
-        2. [可选] 设备选择(如果提供device_directory)
-        3. [可选] 路线规划(如果提供amap_client和已选设备)
-        4. [可选] 传感器分配(如果有设备和航点)
+        这是重构后的invoke()方法,基于LangGraph StateGraph模式:
+        1. 使用编译后的图(self._compiled)执行节点流程
+        2. 配置durability="sync"确保每步同步持久化
+        3. 支持人工审批中断点(未来扩展)
+
+        节点流程:
+        build_intel_requirements → device_selection → route_planning
+        → sensor_assignment → risk_overlay → persist_task
+        → prepare_response → ws_notify → END
 
         Args:
-            state: 侦察战术状态
-            config: 配置(如durability级别)
+            state: 侦察战术状态(必须包含incident_id, user_id, thread_id)
+            config: 可选配置(如durability级别,会与默认配置合并)
 
         Returns:
-            Dict包含: scout_plan, selected_devices, recon_route, sensor_assignments, response_text
-        """
-        slots = state.get("slots")
-        incident_id = state.get("incident_id", "")
+            ScoutTacticalState: 执行完成后的状态(包含所有节点输出)
 
-        # 步骤1: 生成基础侦察计划(基于风险点)
-        zones = await self.risk_repository.list_active_zones()
-        plan = self._build_plan(incident_id, slots, zones)
+        Raises:
+            RuntimeError: 如果图未初始化(未调用build()方法)
+
+        Example:
+            graph = await ScoutTacticalGraph.build(...)
+            state = {
+                "incident_id": "INC-001",
+                "user_id": "user123",
+                "thread_id": "scout-INC-001",
+                "slots": {...},
+            }
+            result = await graph.invoke(state)
+            print(result["response_text"])
+
+        参考: rescue_tactical_app.py:907-921 的invoke()实现
+        """
+        # 检查图是否已编译(必须先调用build())
+        if self._compiled is None:
+            raise RuntimeError(
+                "ScoutTacticalGraph 尚未初始化完成。"
+                "请使用 ScoutTacticalGraph.build() 方法创建实例。"
+            )
+
+        # 构建配置: 合并用户配置与默认配置
+        if config is None:
+            config = {}
+
+        # 确保有configurable字段
+        if "configurable" not in config:
+            config["configurable"] = {}
+
+        # 设置thread_id(如果未提供)
+        if "thread_id" not in config["configurable"]:
+            config["configurable"]["thread_id"] = state.get("thread_id", "")
+
+        # 设置durability="sync"(长流程,每步完成后同步保存checkpoint)
+        # 参考: docs/新业务逻辑md/langgraph资料/references/concept-durable-execution.md:88-90
+        if "durability" not in config:
+            config["durability"] = "sync"
+
         logger.info(
-            "scout_plan_generated",
-            incident_id=incident_id,
-            target_count=len(plan.get("targets", [])),
-            risk_count=plan["overview"].get("riskSummary", {}).get("total", 0),
+            "scout_tactical_invoke_start",
+            thread_id=config["configurable"]["thread_id"],
+            incident_id=state.get("incident_id"),
         )
 
-        result: Dict[str, Any] = {
-            "status": "ok",
-            "scout_plan": plan,
-        }
+        # 执行编译后的图
+        result = await self._compiled.ainvoke(state, config=config)
 
-        # 步骤2: 设备选择(如果配置了设备目录)
-        if self.device_directory:
-            required_sensors = plan.get("recommendedSensors", [])
-            prefer_type = DeviceType.UAV  # 默认优先使用无人机
-            selected_devices = select_devices_for_recon_task(
-                device_directory=self.device_directory,
-                required_sensors=required_sensors,
-                prefer_device_type=prefer_type,
-            )
-            result["selected_devices"] = selected_devices
-            logger.info(
-                "scout_devices_selected",
-                selected_count=len(selected_devices),
-                device_ids=[d["device_id"] for d in selected_devices],
-            )
-
-            # 步骤3: 路线规划(如果有设备且配置了amap_client)
-            if selected_devices and self.amap_client:
-                # 构建目标列表: [(target_id, coordinate), ...]
-                targets: List[Tuple[str, Coordinate]] = []
-                for target in plan.get("targets", []):
-                    target_id = target.get("targetId", "")
-                    location = target.get("location", {})
-                    lng = location.get("lng")
-                    lat = location.get("lat")
-                    if isinstance(lng, (int, float)) and isinstance(lat, (int, float)):
-                        coord: Coordinate = {"lng": float(lng), "lat": float(lat)}
-                        targets.append((target_id, coord))
-
-                # 假设起点为第一个目标附近(简化实现,未来可从incident坐标获取)
-                origin: Coordinate = targets[0][1] if targets else {"lng": 120.0, "lat": 30.0}
-
-                recon_route = await plan_recon_route_task(
-                    origin=origin,
-                    targets=targets,
-                    amap_client=self.amap_client,
-                )
-                result["recon_route"] = recon_route
-                logger.info(
-                    "scout_route_planned",
-                    waypoint_count=len(recon_route["waypoints"]),
-                    total_distance_m=recon_route["total_distance_m"],
-                )
-
-                # 步骤4: 传感器分配(如果有设备和航点)
-                waypoints = recon_route["waypoints"]
-                if waypoints:
-                    sensor_assignments = assign_sensor_payloads_task(
-                        devices=selected_devices,
-                        waypoints=waypoints,
-                        required_sensors=required_sensors,
-                    )
-                    result["sensor_assignments"] = sensor_assignments
-                    logger.info(
-                        "scout_sensors_assigned",
-                        assignment_count=len(sensor_assignments),
-                    )
-
-        # 生成响应文本
-        response_text = self._compose_response(plan)
-        result["response_text"] = response_text
+        logger.info(
+            "scout_tactical_invoke_complete",
+            thread_id=config["configurable"]["thread_id"],
+            status=result.get("status", "unknown"),
+        )
 
         return result
 
@@ -693,24 +1157,322 @@ def assign_sensor_payloads_task(
     return assignments
 
 
+@task
+async def risk_overlay_task(
+    waypoints: List[ReconWaypoint],
+    risk_repository: RiskDataRepository,
+) -> List[WaypointRisk]:
+    """风险叠加任务 - 为每个航点叠加风险数据
+
+    这是一个带@task装饰器的幂等函数,用于:
+    1. 遍历所有航点坐标
+    2. 查询该坐标附近的风险区域
+    3. 评估航点的综合风险等级
+
+    Args:
+        waypoints: 航点列表(包含坐标信息)
+        risk_repository: 风险数据仓库
+
+    Returns:
+        List[WaypointRisk]: 航点风险评估列表(航点序号、风险等级、危险类型)
+
+    幂等性保证: @task装饰器确保相同输入返回相同结果,
+                查询风险数据库是确定性操作
+    """
+    logger.info(
+        "risk_overlay_started",
+        waypoint_count=len(waypoints),
+    )
+
+    risks: List[WaypointRisk] = []
+
+    for waypoint in waypoints:
+        sequence = waypoint["sequence"]
+        coord = waypoint["location"]
+
+        # 查询该坐标附近500米内的风险区域
+        try:
+            nearby_zones = await risk_repository.find_zones_near(
+                lng=coord["lng"],
+                lat=coord["lat"],
+                radius_meters=500,
+            )
+        except Exception as exc:
+            logger.warning(
+                "risk_overlay_query_failed",
+                waypoint_seq=sequence,
+                coord=coord,
+                error=str(exc),
+            )
+            nearby_zones = []
+
+        # 计算综合风险等级: 取最高严重等级
+        if nearby_zones:
+            max_severity = max(zone.severity for zone in nearby_zones)
+            hazard_types = [zone.hazard_type for zone in nearby_zones]
+        else:
+            max_severity = 0
+            hazard_types = []
+
+        risk: WaypointRisk = {
+            "waypoint_sequence": sequence,
+            "risk_level": max_severity,
+            "hazard_types": hazard_types,
+        }
+        risks.append(risk)
+
+        logger.debug(
+            "risk_overlay_waypoint_evaluated",
+            waypoint_seq=sequence,
+            risk_level=max_severity,
+            hazard_count=len(hazard_types),
+        )
+
+    logger.info(
+        "risk_overlay_completed",
+        total_waypoints=len(waypoints),
+        high_risk_count=sum(1 for r in risks if r["risk_level"] >= 4),
+    )
+    return risks
+
+
+@task
+async def persist_scout_task(
+    scout_task: Dict[str, Any],
+    task_repository: RescueTaskRepository,
+) -> Dict[str, Any]:
+    """持久化侦察任务 - 保存任务到数据库
+
+    这是一个带@task装饰器的幂等函数,用于:
+    1. 将侦察任务数据保存到tasks表
+    2. 使用task_id(code字段)作为唯一标识
+    3. 如果任务已存在则跳过(幂等性保证)
+
+    Args:
+        scout_task: 侦察任务数据字典,包含:
+            - task_id: 任务唯一标识
+            - description: 任务描述
+            - incident_id: 事件ID
+            - user_id: 创建者ID
+            - scout_plan: 侦察计划(存入plan_step jsonb字段)
+        task_repository: 任务数据仓库
+
+    Returns:
+        Dict包含: task_record_id (数据库记录ID)
+
+    幂等性保证: @task装饰器 + code字段唯一性约束
+                重复调用不会创建重复记录
+    """
+    task_id = scout_task.get("task_id", "")
+    logger.info(
+        "persist_scout_task_started",
+        task_id=task_id,
+    )
+
+    # 检查任务是否已存在(基于code字段)
+    existing = await task_repository.find_by_code(task_id)
+    if existing:
+        logger.info(
+            "persist_scout_task_already_exists",
+            task_id=task_id,
+            record_id=existing.id,
+        )
+        return {"task_record_id": existing.id}
+
+    # 创建新任务记录
+    task_input = TaskCreateInput(
+        task_type="uav_recon",  # 使用现有的任务类型枚举
+        status="pending",  # 初始状态为待执行
+        priority=90,  # 侦察任务优先级较高
+        description=scout_task.get("description", "侦察任务"),
+        deadline=None,  # 侦察任务通常无固定截止时间
+        target_entity_id=None,  # 可选,未来可关联具体实体
+        event_id=scout_task.get("incident_id"),
+        created_by=scout_task.get("user_id"),
+        updated_by=scout_task.get("user_id"),
+        code=task_id,  # 幂等性关键: 使用task_id作为唯一code
+    )
+
+    try:
+        record = await task_repository.create_task(task_input)
+        logger.info(
+            "persist_scout_task_created",
+            task_id=task_id,
+            record_id=record.id,
+        )
+        return {"task_record_id": record.id}
+    except Exception as exc:
+        logger.error(
+            "persist_scout_task_failed",
+            task_id=task_id,
+            error=str(exc),
+        )
+        raise
+
+
+@task
+def prepare_ui_actions_task(
+    state: ScoutTacticalState,
+) -> Dict[str, Any]:
+    """准备UI动作 - 生成前端交互指令
+
+    这是一个带@task装饰器的幂等函数,用于:
+    1. 基于状态数据生成前端UI动作列表
+    2. 包括路线预览、侦察面板打开等指令
+
+    Args:
+        state: 侦察战术状态(包含route、devices等数据)
+
+    Returns:
+        Dict包含: ui_actions (UI动作列表)
+
+    幂等性保证: @task装饰器 + 纯计算函数(无副作用)
+                相同输入总是返回相同输出
+    """
+    logger.info("prepare_ui_actions_started")
+
+    route = state.get("recon_route")
+    devices = state.get("selected_devices", [])
+    plan = state.get("scout_plan")
+
+    ui_actions: List[Dict[str, Any]] = []
+
+    # 动作1: 预览侦察路线(如果有航点)
+    if route and route.get("waypoints"):
+        ui_actions.append({
+            "action": "preview_route",
+            "data": {
+                "waypoints": route["waypoints"],
+                "total_distance_m": route.get("total_distance_m", 0),
+                "total_duration_sec": route.get("total_duration_sec", 0),
+            },
+        })
+
+    # 动作2: 打开侦察控制面板(如果有设备)
+    if devices:
+        ui_actions.append({
+            "action": "open_scout_panel",
+            "data": {
+                "devices": devices,
+                "device_count": len(devices),
+            },
+        })
+
+    # 动作3: 显示风险提示(如果有)
+    if plan and plan.get("riskHints"):
+        ui_actions.append({
+            "action": "show_risk_hints",
+            "data": {
+                "hints": plan["riskHints"],
+            },
+        })
+
+    logger.info(
+        "prepare_ui_actions_completed",
+        action_count=len(ui_actions),
+    )
+    return {"ui_actions": ui_actions}
+
+
+@task
+def notify_backend_task(
+    payload: Dict[str, Any],
+    orchestrator: OrchestratorClient,
+) -> Dict[str, Any]:
+    """后台通知任务 - 推送侦察场景到Java后台
+
+    这是一个带@task装饰器的幂等函数,用于:
+    1. 将侦察任务推送到Orchestrator服务
+    2. 触发后台的WebSocket通知和业务流程
+
+    Args:
+        payload: 推送载荷(包含taskId、scenario等数据)
+        orchestrator: Orchestrator客户端
+
+    Returns:
+        Dict包含: 推送响应(success/error)
+
+    幂等性保证: @task装饰器 + Orchestrator端需支持幂等性
+                (建议Orchestrator使用taskId去重)
+
+    注意: 如果Orchestrator服务不支持幂等性,
+          重复调用可能导致重复通知,需要业务层容忍
+    """
+    task_id = payload.get("taskId", "")
+    logger.info(
+        "notify_backend_started",
+        task_id=task_id,
+    )
+
+    try:
+        response = orchestrator.publish_scout_scenario(payload)
+        logger.info(
+            "notify_backend_succeeded",
+            task_id=task_id,
+            response=response,
+        )
+        return {"success": True, "response": response}
+    except Exception as exc:
+        logger.error(
+            "notify_backend_failed",
+            task_id=task_id,
+            error=str(exc),
+        )
+        # 不抛出异常,返回失败状态(允许流程继续)
+        return {"success": False, "error": str(exc)}
+
+
 def build_scout_tactical_graph(
     *,
     risk_repository: RiskDataRepository,
     device_directory: Optional[DeviceDirectory] = None,
     amap_client: Optional[AmapClient] = None,
 ) -> ScoutTacticalGraph:
-    """构建侦察战术图
+    """[已废弃] 旧的同步工厂函数 - 请迁移到 ScoutTacticalGraph.build()
 
-    Args:
-        risk_repository: 风险数据仓库(必需)
-        device_directory: 设备目录(可选,提供则启用设备选择功能)
-        amap_client: 高德地图客户端(可选,提供则启用路线规划功能)
+    ⚠️ 此函数已废弃,无法与新的StateGraph架构配合使用。
 
-    Returns:
-        ScoutTacticalGraph实例
+    迁移指南:
+    --------
+    旧代码:
+        graph = build_scout_tactical_graph(
+            risk_repository=risk_repo,
+            device_directory=device_dir,
+            amap_client=amap,
+        )
+
+    新代码:
+        graph = await ScoutTacticalGraph.build(
+            risk_repository=risk_repo,
+            device_directory=device_dir,  # 现在是Required,不再Optional
+            amap_client=amap,  # 现在是Required,不再Optional
+            orchestrator_client=orchestrator,  # 新增必需依赖
+            task_repository=task_repo,  # 新增必需依赖
+            postgres_dsn="postgresql://...",  # 新增必需依赖
+        )
+
+    关键变化:
+    1. 必须使用async/await调用
+    2. device_directory和amap_client不再Optional(遵循"不做降级"原则)
+    3. 需要提供orchestrator_client、task_repository、postgres_dsn
+
+    Raises:
+        RuntimeError: 始终抛出,提示迁移到新接口
     """
-    return ScoutTacticalGraph(
-        risk_repository=risk_repository,
-        device_directory=device_directory,
-        amap_client=amap_client,
+    raise RuntimeError(
+        "build_scout_tactical_graph() 已废弃！\n"
+        "\n"
+        "新架构使用 StateGraph + PostgreSQL checkpointer,必须异步初始化。\n"
+        "\n"
+        "请迁移到:\n"
+        "  graph = await ScoutTacticalGraph.build(\n"
+        "      risk_repository=...,\n"
+        "      device_directory=...,  # Required\n"
+        "      amap_client=...,  # Required\n"
+        "      orchestrator_client=...,  # 新增\n"
+        "      task_repository=...,  # 新增\n"
+        "      postgres_dsn=...,  # 新增\n"
+        "  )\n"
+        "\n"
+        "参考: docs/新业务逻辑md/new_0.1/Scout重构-StateGraph迁移方案.md"
     )
