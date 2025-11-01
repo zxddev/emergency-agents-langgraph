@@ -7,7 +7,7 @@ import asyncio
 import math
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Dict, List, Optional, Tuple, TypedDict
+from typing import Any, Callable, Dict, List, Optional, Required, NotRequired, Tuple, TypedDict
 
 import structlog
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
@@ -42,76 +42,117 @@ from emergency_agents.rag.pipe import RagPipeline, RagChunk
 logger = structlog.get_logger(__name__)
 
 
-class ResourceCandidate(TypedDict, total=False):
-    resource_id: str
-    name: str
-    rescuer_type: str
-    lng: float
-    lat: float
-    skills: List[str]
-    equipment: Dict[str, Any]
-    availability: bool
-    status: str
+class ResourceCandidate(TypedDict):
+    """救援资源候选者数据模型
+
+    注意：所有字段都是可选的（NotRequired），因为资源数据是从不同来源逐步聚合的
+    """
+    resource_id: NotRequired[str]
+    name: NotRequired[str]
+    rescuer_type: NotRequired[str]
+    lng: NotRequired[float]
+    lat: NotRequired[float]
+    skills: NotRequired[List[str]]
+    equipment: NotRequired[Dict[str, Any]]
+    availability: NotRequired[bool]
+    status: NotRequired[str]
 
 
-class MatchedResource(TypedDict, total=False):
-    resource_id: str
-    name: str
-    rescuer_type: str
-    capability_match: str
-    distance_km: float
-    lack_reasons: List[str]
-    equipment_summary: List[str]
-    skills: List[str]
-    eta_minutes: float
-    cache_hit: bool
-    route_id: str
+class MatchedResource(TypedDict):
+    """匹配的救援资源数据模型
+
+    注意：所有字段都是可选的（NotRequired），因为匹配结果在不同阶段逐步完善
+    """
+    resource_id: NotRequired[str]
+    name: NotRequired[str]
+    rescuer_type: NotRequired[str]
+    capability_match: NotRequired[str]
+    distance_km: NotRequired[float]
+    lack_reasons: NotRequired[List[str]]
+    equipment_summary: NotRequired[List[str]]
+    skills: NotRequired[List[str]]
+    eta_minutes: NotRequired[float]
+    cache_hit: NotRequired[bool]
+    route_id: NotRequired[str]
 
 
-class RoutePlanData(TypedDict, total=False):
-    resource_id: str
-    route_id: str
-    distance_meters: int
-    duration_seconds: int
-    eta_minutes: float
-    cache_hit: bool
-    raw_plan: RoutePlan
+class RoutePlanData(TypedDict):
+    """路径规划数据模型
+
+    注意：所有字段都是可选的（NotRequired），因为路径数据可能从缓存或API获取
+    """
+    resource_id: NotRequired[str]
+    route_id: NotRequired[str]
+    distance_meters: NotRequired[int]
+    duration_seconds: NotRequired[int]
+    eta_minutes: NotRequired[float]
+    cache_hit: NotRequired[bool]
+    raw_plan: NotRequired[RoutePlan]
 
 
-class AnalysisSummary(TypedDict, total=False):
-    kg_count: int
-    rag_count: int
-    matched_count: int
-    unmatched_count: int
-    cache_hits: int
-    cache_misses: int
+class AnalysisSummary(TypedDict):
+    """分析汇总统计数据模型
+
+    注意：所有字段都是可选的（NotRequired），因为统计数据在流程中逐步累积
+    """
+    kg_count: NotRequired[int]
+    rag_count: NotRequired[int]
+    matched_count: NotRequired[int]
+    unmatched_count: NotRequired[int]
+    cache_hits: NotRequired[int]
+    cache_misses: NotRequired[int]
 
 
-class RescueTacticalState(TypedDict, total=False):
-    task_id: str
-    user_id: str
-    thread_id: str
-    slots: RescueTaskGenerationSlots
-    simulation_mode: bool
-    status: str
-    error: str
-    resolved_location: Dict[str, Any]
-    resources: List[ResourceCandidate]
-    kg_requirements: List[Dict[str, Any]]
-    rag_cases: List[Dict[str, Any]]
-    rag_equipments: List[Dict[str, Any]]
-    recommendations: List[Dict[str, Any]]
-    matched_resources: List[MatchedResource]
-    unmatched_resources: List[MatchedResource]
-    routes: List[RoutePlanData]
-    ws_payload: Dict[str, Any]
-    response_text: str
-    recommendation: Dict[str, Any]
-    analysis_summary: AnalysisSummary
-    conversation_context: Dict[str, Any]
-    incident_response: Optional[Dict[str, Any]]
-    persisted_task: Dict[str, Any]
-    persisted_routes: List[Dict[str, Any]]
+class RescueTacticalState(TypedDict):
+    """救援战术子图状态定义
+
+    核心标识字段（Required）：task_id, user_id, thread_id
+    其他所有字段（NotRequired）：在图执行过程中逐步填充
+
+    参考：rescue_task_generation.py:865-873 的实际初始化模式
+    """
+    # 核心标识字段（必填）
+    task_id: Required[str]
+    user_id: Required[str]
+    thread_id: Required[str]
+
+    # 输入槽位与配置（可选）
+    slots: NotRequired[RescueTaskGenerationSlots]
+    simulation_mode: NotRequired[bool]
+    auto_persist: NotRequired[bool]
+    conversation_context: NotRequired[Dict[str, Any]]
+
+    # 流程状态（可选）
+    status: NotRequired[str]
+    error: NotRequired[str]
+
+    # 位置解析结果（可选）
+    resolved_location: NotRequired[Dict[str, Any]]
+
+    # 资源数据（可选）
+    resources: NotRequired[List[ResourceCandidate]]
+    matched_resources: NotRequired[List[MatchedResource]]
+    unmatched_resources: NotRequired[List[MatchedResource]]
+
+    # 知识图谱与RAG结果（可选）
+    kg_requirements: NotRequired[List[Dict[str, Any]]]
+    rag_cases: NotRequired[List[Dict[str, Any]]]
+    rag_equipments: NotRequired[List[Dict[str, Any]]]
+    recommendations: NotRequired[List[Dict[str, Any]]]
+
+    # 路径规划结果（可选）
+    routes: NotRequired[List[RoutePlanData]]
+
+    # 输出数据（可选）
+    ws_payload: NotRequired[Dict[str, Any]]
+    response_text: NotRequired[str]
+    recommendation: NotRequired[Dict[str, Any]]
+    analysis_summary: NotRequired[AnalysisSummary]
+
+    # 持久化结果（可选）
+    incident_response: NotRequired[Optional[Dict[str, Any]]]
+    persisted_task: NotRequired[Dict[str, Any]]
+    persisted_routes: NotRequired[List[Dict[str, Any]]]
 
 
 # ========== @task包装函数：确保副作用操作的幂等性 ==========

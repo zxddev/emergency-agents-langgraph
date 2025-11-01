@@ -240,6 +240,7 @@ _orchestrator_client = OrchestratorClient()
 _intent_registry = IntentHandlerRegistry.build(
     pool=_pg_pool,
     amap_client=_amap_client,
+    device_directory=_device_directory,
     video_stream_map=_cfg.video_stream_map,
     kg_service=_kg,
     rag_pipeline=_rag,

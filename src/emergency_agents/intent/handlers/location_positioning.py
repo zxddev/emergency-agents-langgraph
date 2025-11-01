@@ -9,6 +9,7 @@ from emergency_agents.db.models import EntityLocation, EventLocation, PoiLocatio
 from emergency_agents.external.amap_client import AmapClient
 from emergency_agents.intent.handlers.base import IntentHandler
 from emergency_agents.intent.schemas import LocationPositioningSlots
+from emergency_agents.ui.actions import camera_fly_to, serialize_actions
 
 logger = logging.getLogger(__name__)
 
@@ -57,19 +58,31 @@ class LocationPositioningHandler(IntentHandler[LocationPositioningSlots]):
             "sourceIntent": "location-positioning",
             "displayName": record.name,
         }
-        # TODO(Java Integration): 通过 emergency-web-api 通知前端移动视角
+
+        # 使用统一 UI Actions 协议通知前端移动视角
+        ui_actions = serialize_actions([
+            camera_fly_to(
+                lng=record.lng,
+                lat=record.lat,
+                metadata={
+                    "intent": "location-positioning",
+                    "target_type": slots.target_type,
+                    "user_id": user_id,
+                }
+            )
+        ])
         logger.info(
-            "location_positioning_todo_notify",
+            "location_positioning_ui_actions_emitted",
             extra={
                 "intent": "location-positioning",
                 "thread_id": state.get("thread_id"),
                 "user_id": user_id,
-                "payload": payload,
+                "count": len(ui_actions),
             },
         )
 
         message = f"已定位至 {record.name} ({record.lat:.4f}, {record.lng:.4f})"
-        return {"response_text": message, "location": payload}
+        return {"response_text": message, "location": payload, "ui_actions": ui_actions}
 
     async def _resolve_location(self, slots: LocationPositioningSlots) -> LocationRecord:
         target = slots.target_type

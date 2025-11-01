@@ -10,6 +10,7 @@ from psycopg_pool import AsyncConnectionPool
 from emergency_agents.db.dao import DeviceDAO, LocationDAO, TaskDAO, IncidentDAO
 from emergency_agents.external.adapter_client import AdapterHubClient
 from emergency_agents.external.amap_client import AmapClient
+from emergency_agents.external.device_directory import DeviceDirectory
 from emergency_agents.external.orchestrator_client import OrchestratorClient
 from emergency_agents.graph.kg_service import KGService
 from emergency_agents.graph.scout_tactical_app import build_scout_tactical_graph
@@ -38,6 +39,7 @@ class IntentHandlerRegistry:
         cls,
         pool: AsyncConnectionPool[DictRow],
         amap_client: AmapClient,
+        device_directory: DeviceDirectory | None,
         video_stream_map: Dict[str, str],
         kg_service: KGService,
         rag_pipeline: RagPipeline,
@@ -79,7 +81,11 @@ class IntentHandlerRegistry:
         )
         risk_repository = RiskDataRepository(IncidentDAO.create(pool))
         scout_handler = ScoutTaskGenerationHandler(
-            graph=build_scout_tactical_graph(risk_repository=risk_repository),
+            graph=build_scout_tactical_graph(
+                risk_repository=risk_repository,
+                device_directory=device_directory,
+                amap_client=amap_client,
+            ),
         )
 
         handlers: Dict[str, Any] = {
