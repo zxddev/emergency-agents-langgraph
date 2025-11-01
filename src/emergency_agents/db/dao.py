@@ -345,6 +345,47 @@ class TaskDAO:
         )
         return result
 
+    async def list_recent_tasks(self, hours: int = 24) -> list[TaskSummary]:
+        """查询最近N小时的任务 (created_at >= NOW() - INTERVAL 'N hours' AND deleted_at IS NULL)
+
+        Args:
+            hours: 时间范围（小时），默认24小时
+
+        Returns:
+            最近创建的任务列表，按创建时间倒序排列
+            用于SITREP等需要任务统计的场景
+        """
+        query = (
+            "SELECT id::text AS id, "
+            "       code, "
+            "       description, "
+            "       status, "
+            "       progress, "
+            "       updated_at "
+            "  FROM operational.tasks "
+            " WHERE created_at >= NOW() - make_interval(hours => %(hours)s) "
+            "   AND deleted_at IS NULL "
+            " ORDER BY created_at DESC"
+        )
+
+        start = time.perf_counter()
+        async with self._pool.connection() as conn:
+            async with conn.cursor(row_factory=class_row(TaskSummary)) as cur:
+                await cur.execute(query, {"hours": hours})
+                rows = await cur.fetchall()
+                result = list(rows)
+
+        duration = time.perf_counter() - start
+        DAO_CALL_LATENCY.labels("task", "list_recent_tasks").observe(duration)
+        DAO_CALL_TOTAL.labels("task", "list_recent_tasks", "success").inc()
+        logger.info(
+            "dao_task_list_recent_tasks",
+            duration_ms=duration * 1000,
+            hours=hours,
+            count=len(result),
+        )
+        return result
+
 
 class IncidentDAO:
     """事件（Incident）相关只读接口。"""
@@ -512,6 +553,49 @@ class IncidentDAO:
             count=len(results),
         )
         return results
+
+    async def list_active_incidents(self) -> list[IncidentRecord]:
+        """查询所有活跃事件 (status='active' AND deleted_at IS NULL)
+
+        返回所有当前正在处理中的事件，按优先级和更新时间排序
+        用于SITREP等需要全局事件视图的场景
+        """
+        query = (
+            "SELECT id::text AS id, "
+            "       parent_event_id::text AS parent_event_id, "
+            "       event_code, "
+            "       title, "
+            "       type::text AS type, "
+            "       priority, "
+            "       status::text AS status, "
+            "       description, "
+            "       created_by, "
+            "       updated_by, "
+            "       created_at, "
+            "       updated_at, "
+            "       deleted_at "
+            "  FROM operational.events "
+            " WHERE status = 'active' "
+            "   AND deleted_at IS NULL "
+            " ORDER BY priority DESC, updated_at DESC"
+        )
+
+        start = time.perf_counter()
+        async with self._pool.connection() as conn:
+            async with conn.cursor(row_factory=class_row(IncidentRecord)) as cur:
+                await cur.execute(query)
+                rows = await cur.fetchall()
+                result = list(rows)
+
+        duration = time.perf_counter() - start
+        DAO_CALL_LATENCY.labels("incident", "list_active_incidents").observe(duration)
+        DAO_CALL_TOTAL.labels("incident", "list_active_incidents", "success").inc()
+        logger.info(
+            "dao_incident_list_active_incidents",
+            duration_ms=duration * 1000,
+            count=len(result),
+        )
+        return result
 
     async def list_active_risk_zones(self, *, reference_time: Optional[datetime] = None) -> list[RiskZoneRecord]:
         now = reference_time or datetime.now(timezone.utc)

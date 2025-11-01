@@ -23,12 +23,14 @@ from emergency_agents.config import AppConfig
 from emergency_agents.logging import configure_logging, set_trace_id, clear_trace_id  # 统一日志配置
 from emergency_agents.api.voice_chat import handle_voice_chat, voice_chat_handler
 from emergency_agents.api import rescue as rescue_api
+from emergency_agents.api import sitrep as sitrep_api
 from emergency_agents.external.adapter_client import AdapterHubClient
 from emergency_agents.external.amap_client import AmapClient
 from emergency_agents.external.orchestrator_client import OrchestratorClient
 from emergency_agents.graph.app import build_app
 from emergency_agents.graph.intent_orchestrator_app import build_intent_orchestrator_graph
 from emergency_agents.graph.voice_control_app import build_voice_control_graph
+from emergency_agents.graph.sitrep_app import build_sitrep_graph
 from emergency_agents.memory.conversation_manager import (
     ConversationManager,
     ConversationNotFoundError,
@@ -44,6 +46,8 @@ from emergency_agents.db.dao import (
     IncidentRepository,
     IncidentSnapshotRepository,
     RescueTaskRepository,
+    TaskDAO,
+    RescueDAO,
 )
 from emergency_agents.audit.logger import get_audit_logger, log_human_approval
 from langgraph.types import Command
@@ -79,6 +83,7 @@ if not _cfg.postgres_dsn:
 _graph_app: Any | None = None
 _intent_graph: Any | None = None
 _voice_control_graph: Any | None = None
+_sitrep_graph: Any | None = None
 _graph_closers: list[Callable[[], Awaitable[None]]] = []
 
 
@@ -246,6 +251,7 @@ _risk_predictor: RiskPredictor | None = None
 _risk_predict_task: asyncio.Task[None] | None = None
 
 app.include_router(rescue_api.router)
+app.include_router(sitrep_api.router, prefix="/sitrep", tags=["sitrep"])
 
 
 def _classifier_wrapper(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -344,6 +350,7 @@ async def startup_event():
     global _graph_app
     global _intent_graph
     global _voice_control_graph
+    global _sitrep_graph
     global _graph_closers
     global _risk_cache_manager
     global _risk_refresh_task
@@ -400,6 +407,7 @@ async def startup_event():
     app.state.voice_control_graph = _voice_control_graph
     logger.info("api_graph_ready", graph="voice_control")
 
+    # 初始化RiskCacheManager（SITREP依赖它）
     incident_dao = IncidentDAO.create(_pg_pool)
     _risk_cache_manager = RiskCacheManager(
         incident_dao=incident_dao,
@@ -418,6 +426,34 @@ async def startup_event():
     _risk_predict_task = asyncio.create_task(
         _risk_predictor.run_periodic(refresh_interval)
     )
+
+    # ========== 初始化SITREP子图 ==========
+    task_dao = TaskDAO.create(_pg_pool)
+    rescue_dao = RescueDAO.create(_pg_pool)
+    snapshot_repo = IncidentSnapshotRepository.create(_pg_pool)
+
+    # 创建checkpointer（复用PostgreSQL连接池）
+    from emergency_agents.graph.checkpoint_utils import create_async_postgres_checkpointer
+    sitrep_checkpointer = create_async_postgres_checkpointer(_cfg.postgres_dsn)
+
+    _sitrep_graph = await build_sitrep_graph(
+        incident_dao=incident_dao,
+        task_dao=task_dao,
+        risk_cache_manager=_risk_cache_manager,  # 复用已初始化的risk_cache_manager
+        rescue_dao=rescue_dao,
+        snapshot_repo=snapshot_repo,
+        llm_client=_llm_client,
+        llm_model=_cfg.llm_model,
+        checkpointer=sitrep_checkpointer,
+    )
+    _register_graph_close(_sitrep_graph)
+    logger.info("api_graph_ready", graph="sitrep")
+
+    # 将依赖注入到sitrep_api模块
+    sitrep_api._sitrep_graph = _sitrep_graph
+    sitrep_api._incident_dao = incident_dao
+    sitrep_api._snapshot_repo = snapshot_repo
+    # ========== SITREP子图初始化完成 ==========
     if _intent_registry is not None:
         _intent_registry.attach_risk_cache(_risk_cache_manager)
     logger.info(
@@ -432,6 +468,7 @@ async def shutdown_event():
     global _graph_app
     global _intent_graph
     global _voice_control_graph
+    global _sitrep_graph
     global _graph_closers
     global _risk_cache_manager
     global _risk_refresh_task
@@ -447,13 +484,14 @@ async def shutdown_event():
         await close_cb()
     _graph_closers.clear()
     _graph_app_attr = _graph_app if _graph_app is not None else None
-    for resource in (_graph_app_attr, _intent_graph, _voice_control_graph):
+    for resource in (_graph_app_attr, _intent_graph, _voice_control_graph, _sitrep_graph):
         if resource is not None and hasattr(resource, "_checkpoint_close"):
             setattr(resource, "_checkpoint_close", None)
     logger.info("api_shutdown_graphs_closed")
     _graph_app = None
     _intent_graph = None
     _voice_control_graph = None
+    _sitrep_graph = None
 
     if hasattr(_intent_registry, "close"):
         close_result = _intent_registry.close()
