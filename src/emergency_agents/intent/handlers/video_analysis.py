@@ -23,13 +23,14 @@ class VideoAnalysisHandler(IntentHandler[VideoAnalysisSlots]):
         """视频分析意图处理 - 基于 GLM-4V 视觉大模型
 
         流程：
-        1. 使用device_id查询设备信息和视频流地址
-        2. 从视频流截取当前帧
-        3. 调用 GLM-4V 进行场景分析
-        4. 返回自然语言描述 + 结构化数据
+        1. 根据设备名称查询设备信息（获取device_id）
+        2. 根据device_id获取视频流地址
+        3. 从视频流截取当前帧
+        4. 调用 GLM-4V 进行场景分析
+        5. 返回自然语言描述 + 结构化数据
 
         Args:
-            slots: 视频分析槽位（device_id由LLM根据设备名称映射解析得到）
+            slots: 视频分析槽位（包含用户输入的device_name）
             state: 会话状态
 
         Returns:
@@ -38,9 +39,6 @@ class VideoAnalysisHandler(IntentHandler[VideoAnalysisSlots]):
         Reference:
             - video/vision.py: VisionAnalyzer 视觉分析器
             - video/frame_capture.py: VideoFrameCapture 帧截取工具
-
-        Note:
-            device_id应该在意图识别阶段由LLM根据设备名称映射表解析得到
         """
         logger.info(
             "video_analysis_start",
@@ -48,16 +46,16 @@ class VideoAnalysisHandler(IntentHandler[VideoAnalysisSlots]):
                 "intent": "video-analysis",
                 "thread_id": state.get("thread_id"),
                 "user_id": state.get("user_id"),
-                "device_id": slots.device_id,
+                "device_name": slots.device_name,
                 "analysis_goal": slots.analysis_goal,
             },
         )
 
-        # 1. 查询设备信息
-        device = await self.device_dao.fetch_video_device(slots.device_id)
+        # 1. 根据设备名称查询设备信息
+        device = await self.device_dao.fetch_video_device_by_name(slots.device_name)
         if device is None:
             return {
-                "response_text": f"未找到设备 {slots.device_id}，请检查设备ID是否正确。",
+                "response_text": f"未找到设备「{slots.device_name}」，请检查设备名称是否正确。",
                 "video_analysis": {"status": "device_not_found"},
             }
 

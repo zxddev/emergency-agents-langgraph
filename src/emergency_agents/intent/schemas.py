@@ -229,26 +229,26 @@ class VideoAnalysisSlots(BaseSlots):
     用于视频流截取和GLM-4V视觉分析，支持无人机、机器狗等设备的实时画面分析。
 
     Attributes:
-        device_id: 设备ID（由LLM根据设备名称映射表解析得到）
+        device_name: 设备名称（用户输入的原始设备名称，如"无人机A"、"机器狗01"）
         device_type: 设备类型（uav/robotdog/camera）
         analysis_goal: 分析目标（damage_assessment/person_detection/fire_detection等）
         analysis_params: 额外的分析参数（可选）
 
     Note:
-        意图识别时，会将所有设备的"名称->ID"映射提供给LLM，
-        LLM负责从用户输入的设备名称找到对应的device_id填充到此槽位。
+        Handler内部会根据device_name查询device表获取device_id，
+        然后再根据device_id查询视频流地址。
 
     Example:
         用户说："查看无人机A的画面"
-        LLM从映射中找到："无人机A" -> "uav-001"
+        LLM提取设备名称：
         slots = VideoAnalysisSlots(
-            device_id="uav-001",
+            device_name="无人机A",  # 直接保存用户说的设备名称
             device_type="uav",
             analysis_goal="damage_assessment"
         )
     """
 
-    device_id: str  # LLM根据设备名称映射解析得到的设备ID
+    device_name: str  # 用户输入的设备名称（如"无人机A"）
     device_type: str
     analysis_goal: str
     analysis_params: Optional[Dict[str, Any]] = None

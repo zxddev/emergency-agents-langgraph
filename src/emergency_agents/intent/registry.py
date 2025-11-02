@@ -32,7 +32,6 @@ from emergency_agents.services import RescueDraftService
 @dataclass
 class IntentHandlerRegistry:
     handlers: Dict[str, Any]
-    device_dao: DeviceDAO | None = None  # 暴露给main.py用于创建device_map_getter
 
     @classmethod
     async def build(
@@ -105,7 +104,7 @@ class IntentHandlerRegistry:
             "ui_camera_flyto": UIControlHandler(),
             "ui_toggle_layer": UIControlHandler(),
         }
-        return cls(handlers=handlers, device_dao=device_dao)
+        return cls(handlers=handlers)
 
     def get(self, intent_type: str) -> Any | None:
         return self.handlers.get(intent_type)

@@ -491,7 +491,7 @@ async def test_full_sitrep_flow_integration():
         RescueDAO,
         TaskDAO,
     )
-    from emergency_agents.db.snapshot_repository import IncidentSnapshotRepository
+    from emergency_agents.db.dao import IncidentSnapshotRepository
     from emergency_agents.graph.checkpoint_utils import (
         create_async_postgres_checkpointer,
     )
@@ -523,8 +523,13 @@ async def test_full_sitrep_flow_integration():
         # 创建LLM客户端
         llm_client = get_openai_client(cfg)
 
-        # 创建checkpointer
-        checkpointer = create_async_postgres_checkpointer(cfg.postgres_dsn)
+        # 创建checkpointer（标准异步创建，指定schema，单连接）
+        checkpointer, close_cb = await create_async_postgres_checkpointer(
+            dsn=cfg.postgres_dsn,
+            schema="test_sitrep_checkpoint_full",
+            min_size=1,
+            max_size=1,
+        )
 
         # 构建graph
         graph = await build_sitrep_graph(

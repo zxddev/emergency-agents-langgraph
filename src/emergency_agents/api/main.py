@@ -53,11 +53,7 @@ from emergency_agents.audit.logger import get_audit_logger, log_human_approval
 from langgraph.types import Command
 from emergency_agents.voice.asr.service import ASRService
 from emergency_agents.voice.asr.base import ASRConfig as ASRConfigModel
-from emergency_agents.intent.classifier import (
-    intent_classifier_node,
-    build_intent_classifier_runtime,
-    IntentClassifierRuntime,
-)
+from emergency_agents.intent.classifier import intent_classifier_node
 from emergency_agents.intent.prompt_missing import prompt_missing_slots_node
 from emergency_agents.intent.registry import IntentHandlerRegistry
 from emergency_agents.intent.validator import validate_and_prompt_node
@@ -242,7 +238,6 @@ _orchestrator_client = OrchestratorClient()
 
 # IntentHandlerRegistry需要异步初始化，在startup_event中完成
 _intent_registry: IntentHandlerRegistry | None = None
-_intent_classifier_runtime: IntentClassifierRuntime | None = None  # 意图分类器运行时（支持设备映射）
 
 _risk_cache_manager: RiskCacheManager | None = None
 _risk_refresh_task: asyncio.Task[None] | None = None
@@ -254,12 +249,11 @@ app.include_router(sitrep_api.router, prefix="/sitrep", tags=["sitrep"])
 
 
 def _classifier_wrapper(state: Dict[str, Any]) -> Dict[str, Any]:
-    """意图分类器包装器，使用全局runtime（包含设备映射支持）"""
+    """意图分类器包装器"""
     return intent_classifier_node(
         state,
         llm_client=_intent_llm_client,
         llm_model=_cfg.intent_llm_model or _cfg.llm_model,
-        runtime=_intent_classifier_runtime,  # 使用预先构建的runtime（包含device_map_getter）
     )
 
 
@@ -402,40 +396,6 @@ async def startup_event():
     )
     _intent_registry.attach_rescue_draft_service(_rescue_draft_service)
     logger.info("api_intent_registry_initialized")
-
-    # 创建设备映射getter（用于LLM意图识别时解析设备名称->设备ID）
-    global _intent_classifier_runtime
-    if _intent_registry.device_dao is not None:
-        device_dao = _intent_registry.device_dao
-
-        def get_device_map() -> Dict[str, str]:
-            """同步获取设备映射（在async context中调用）"""
-            import asyncio
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # 在async context中，创建新的event loop运行async函数
-                # 注意：这是一个权宜之计，更好的做法是将整个predict改为async
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor() as pool:
-                    future = pool.submit(asyncio.run, device_dao.get_all_device_name_to_id_map())
-                    return future.result()
-            else:
-                return loop.run_until_complete(device_dao.get_all_device_name_to_id_map())
-
-        _intent_classifier_runtime = build_intent_classifier_runtime(
-            cfg=_cfg,
-            llm_client=_intent_llm_client,
-            llm_model=_cfg.intent_llm_model or _cfg.llm_model,
-            device_map_getter=get_device_map,
-        )
-        logger.info("intent_classifier_runtime_initialized", has_device_map=True)
-    else:
-        _intent_classifier_runtime = build_intent_classifier_runtime(
-            cfg=_cfg,
-            llm_client=_intent_llm_client,
-            llm_model=_cfg.intent_llm_model or _cfg.llm_model,
-        )
-        logger.warning("intent_classifier_runtime_initialized_without_device_map")
 
     _graph_app = await build_app(_cfg.checkpoint_sqlite_path, _cfg.postgres_dsn)
     _register_graph_close(_graph_app)
