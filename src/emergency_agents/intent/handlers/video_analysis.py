@@ -17,6 +17,22 @@ class VideoAnalysisHandler(IntentHandler[VideoAnalysisSlots]):
     stream_map: Mapping[str, str]
 
     async def handle(self, slots: VideoAnalysisSlots, state: dict[str, object]) -> dict[str, object]:
+        """视频分析意图处理
+
+        Args:
+            slots: 视频分析槽位（设备ID、分析目标）
+            state: 会话状态
+
+        Returns:
+            处理结果（当前未实现，会抛出错误）
+
+        Raises:
+            NotImplementedError: 视频分析功能尚未实现
+
+        Reference:
+            - 代码审查报告-强类型与@task合规性.md 第3.1节：占位代码检查
+            - 不做降级/fallback/mock 原则：直接暴露问题
+        """
         logger.info(
             "intent_request",
             extra={
@@ -24,7 +40,7 @@ class VideoAnalysisHandler(IntentHandler[VideoAnalysisSlots]):
                 "thread_id": state.get("thread_id"),
                 "user_id": state.get("user_id"),
                 "target": slots.device_id,
-                "status": "processing",
+                "status": "not_implemented",
             },
         )
 
@@ -42,13 +58,15 @@ class VideoAnalysisHandler(IntentHandler[VideoAnalysisSlots]):
                 "video_analysis": {"status": "missing_stream"},
             }
 
-        message = (
-            f"已进入视频流分析流程（{device.name or device.id}）。"
-            " 当前阶段为占位实现，等待视频处理模块接入。"
+        # 直接抛出错误，不返回占位数据（符合"不做降级"原则）
+        raise NotImplementedError(
+            f"视频分析功能尚未实现。"
+            f"设备：{device.name or device.id}（{device.id}），"
+            f"分析目标：{slots.analysis_goal}。"
+            f"需要接入以下模块之一：\n"
+            f"1. GLM-4V 视觉大模型（推荐）\n"
+            f"2. YOLO 目标检测 + 场景分析\n"
+            f"3. 其他视频处理管道\n"
+            f"请在 src/emergency_agents/video/ 目录实现视频处理模块，"
+            f"然后修改此 Handler 调用真实模块。"
         )
-        payload = {
-            "status": "pending_pipeline",
-            "device": serialize_dataclass(device) | {"stream_url": stream_url},
-            "analysis_goal": slots.analysis_goal,
-        }
-        return {"response_text": message, "video_analysis": payload}

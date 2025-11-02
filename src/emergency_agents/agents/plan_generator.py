@@ -7,6 +7,8 @@ import logging
 import re
 from typing import Dict, Any, List, Optional
 
+from langgraph.func import task
+
 from emergency_agents.agents.memory_commit import prepare_memory_node
 from emergency_agents.utils.normalize import normalize_disaster_name
 from emergency_agents.utils.merge import append_timeline
@@ -25,6 +27,39 @@ logger = logging.getLogger(__name__)
 
 def _strip_control_chars(text: str) -> str:
     return "".join(ch for ch in text if ch >= " " or ch in "\n\r\t")
+
+
+@task
+def _generate_plan_with_llm(
+    llm_client: LLMClientProtocol,
+    llm_model: str,
+    prompt: str,
+) -> str:
+    """调用 LLM 生成救援方案（幂等）
+
+    副作用操作：LLM API 调用，必须用 @task 包装以确保幂等性和支持 checkpoint 恢复
+
+    Args:
+        llm_client: LLM 客户端
+        llm_model: 模型名称
+        prompt: 提示词
+
+    Returns:
+        LLM 响应内容
+
+    Reference:
+        - LangGraph 最佳实践检查清单第4条：Task Decorator（副作用操作）
+        - rescue_tactical_app.py 中的 @task 使用示例
+    """
+    response = llm_client.chat.completions.create(
+        model=llm_model,
+        messages=[
+            {"role": "system", "content": "你是专业的应急救援指挥专家，精通灾害应对和资源调度。"},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.3
+    )
+    return response.choices[0].message.content or ""
 
 
 def plan_generator_agent(
@@ -131,17 +166,10 @@ def plan_generator_agent(
 }}
 
 只返回JSON。"""
-        
-        response = llm_client.chat.completions.create(
-            model=llm_model,
-            messages=[
-                {"role": "system", "content": "你是专业的应急救援指挥专家，精通灾害应对和资源调度。"},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.3
-        )
-        
-        llm_output = response.choices[0].message.content or ""
+
+        # 调用 @task 包装的 LLM 函数（确保幂等性和 checkpoint 恢复）
+        llm_future = _generate_plan_with_llm(llm_client, llm_model, prompt)
+        llm_output = llm_future.result()
         clean_output = _strip_control_chars(llm_output)
 
         try:
