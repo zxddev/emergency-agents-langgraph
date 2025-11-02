@@ -22,6 +22,28 @@
 
 ---
 
+## 2025-11-02 复核：真实数据链路确认
+
+- **事件/任务/资源全部来自真实 DAO 查询**  
+  - `fetch_active_incidents_task` 通过 `IncidentDAO.list_active_incidents()` 直连 `operational.events` 表，SQL 定义于 `src/emergency_agents/db/dao.py:557`。  
+  - `fetch_recent_tasks_task` 调用 `TaskDAO.list_recent_tasks()`，按 `created_at` 过滤最近任务（同文件 `:348`），无任何内存模拟。  
+  - `fetch_resource_usage_task` 使用 `RescueDAO.list_available_rescuers()`（`dao.py:1015`）统计真实救援资源。
+
+- **风险数据来自实时缓存而非写死**  
+  - `fetch_risk_zones_task` 依赖 `RiskCacheManager.get_active_zones(force_refresh=True)`，缓存初始化与定时刷新流程在 `src/emergency_agents/api/main.py:410-427`，数据源最终回落到 `IncidentDAO.list_active_risk_zones()`。
+
+- **LLM 摘要与快照持久化为真实副作用**  
+  - `call_llm_for_sitrep` 使用注入的 `llm_client.chat.completions.create()`，temperature=0，确保执行真实 LLM 请求（`src/emergency_agents/graph/sitrep_app.py:240-288`）。  
+  - `persist_snapshot_task` 将报告写入 `incident_snapshots` 表，输入结构体为 `IncidentSnapshotCreateInput`（`sitrep_app.py:292-315`），并由 API `/sitrep/history` 直接读取。
+
+- **Graph 调用链无 Mock/Fallback**  
+  - `rg "Mock" src/emergency_agents/graph/sitrep_app.py` 返回 0 项，整个子图没有模拟对象。  
+  - API 入口 `src/emergency_agents/api/sitrep.py:127-213` 对子图调用 `ainvoke(..., durability="sync")`，若报告缺失直接抛错，不存在兜底响应。
+
+结论：SITREP 子图已经接入完整的数据库/缓存/LLM 链路，未发现任何 mock 或降级逻辑，满足“不得兜底或模拟”的开发要求。
+
+---
+
 ## 架构设计
 
 ### 子图流程
