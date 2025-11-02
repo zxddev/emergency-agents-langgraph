@@ -49,6 +49,7 @@ class IntentHandlerRegistry:
         orchestrator_client: OrchestratorClient | None,
         rag_timeout: float,
         postgres_dsn: str,
+        vllm_url: str,  # GLM-4V 视觉模型 API 地址
     ) -> "IntentHandlerRegistry":
         if not postgres_dsn:
             raise RuntimeError("POSTGRES_DSN 未配置，无法初始化意图处理器注册表。")
@@ -92,7 +93,7 @@ class IntentHandlerRegistry:
             "task-progress-query": TaskProgressQueryHandler(task_dao),
             "location-positioning": LocationPositioningHandler(location_dao, amap_client),
             "device-control": DeviceControlHandler(device_dao, adapter_client, default_robotdog_id),
-            "video-analysis": VideoAnalysisHandler(device_dao, video_stream_map),
+            "video-analysis": VideoAnalysisHandler(device_dao, video_stream_map, vllm_url),
             "rescue-task-generate": rescue_generation,
             "rescue_task_generate": rescue_generation,
             "rescue-simulation": rescue_simulation,

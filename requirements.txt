@@ -31,3 +31,7 @@ torchaudio>=2.0.0
 
 httpx>=0.27.0
 jsonschema>=4.19.0
+
+# 视频分析依赖（用于视频流截取和GLM-4V视觉分析）
+opencv-python>=4.8.0  # 视频流处理和帧截取
+Pillow>=10.0.0        # 图像格式转换

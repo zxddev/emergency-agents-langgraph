@@ -189,7 +189,7 @@ if not _cfg.postgres_dsn:
 _pg_pool: AsyncConnectionPool[DictRow] = AsyncConnectionPool(
     conninfo=_cfg.postgres_dsn,
     min_size=1,
-    max_size=10,
+    max_size=4,
     open=False,
 )
 _conversation_manager = ConversationManager(_pg_pool)
@@ -222,15 +222,9 @@ _adapter_client = AdapterHubClient(
     timeout=_cfg.adapter_timeout,
 )
 
-_device_directory_pool: ConnectionPool | None = (
-    ConnectionPool(conninfo=_cfg.postgres_dsn, open=True) if _cfg.postgres_dsn else None
-)
-_device_directory = PostgresDeviceDirectory(_device_directory_pool) if _device_directory_pool else None
-
-_voice_control_pipeline = VoiceControlPipeline(
-    default_robotdog_id=_cfg.default_robotdog_id,
-    device_directory=_device_directory,
-)
+_device_directory_pool: ConnectionPool | None = None
+_device_directory: PostgresDeviceDirectory | None = None
+_voice_control_pipeline: VoiceControlPipeline | None = None
 
 _amap_client = AmapClient(
     api_key=_cfg.amap_api_key or "",
@@ -364,6 +358,24 @@ async def startup_event():
     await voice_chat_handler.start_background_tasks()
     _graph_closers = []
 
+    # 延迟初始化设备目录连接池，避免模块导入阶段占用数据库连接
+    global _device_directory_pool
+    global _device_directory
+    global _voice_control_pipeline
+    if _device_directory_pool is None:
+        _device_directory_pool = ConnectionPool(
+            conninfo=_cfg.postgres_dsn,
+            min_size=1,
+            max_size=3,
+            open=True,
+        )
+        _device_directory_pool.wait(timeout=60.0)
+        _device_directory = PostgresDeviceDirectory(_device_directory_pool)
+        _voice_control_pipeline = VoiceControlPipeline(
+            default_robotdog_id=_cfg.default_robotdog_id,
+            device_directory=_device_directory,
+        )
+
     # 初始化IntentHandlerRegistry（异步初始化，包含ScoutTaskGenerationHandler懒加载）
     _intent_registry = await IntentHandlerRegistry.build(
         pool=_pg_pool,
@@ -379,6 +391,7 @@ async def startup_event():
         orchestrator_client=_orchestrator_client,
         rag_timeout=_cfg.rag_analysis_timeout,
         postgres_dsn=_cfg.postgres_dsn,
+        vllm_url=_cfg.openai_base_url,  # GLM-4V 使用相同的 OpenAI 兼容端点
     )
     _intent_registry.attach_rescue_draft_service(_rescue_draft_service)
     logger.info("api_intent_registry_initialized")
@@ -397,6 +410,9 @@ async def startup_event():
     )
     _register_graph_close(_intent_graph)
     logger.info("api_graph_ready", graph="intent_orchestrator")
+
+    if _voice_control_pipeline is None:
+        raise RuntimeError("VoiceControlPipeline 未初始化")
 
     _voice_control_graph = await build_voice_control_graph(
         pipeline=_voice_control_pipeline,
@@ -438,7 +454,7 @@ async def startup_event():
         dsn=_cfg.postgres_dsn,
         schema="sitrep_checkpoint",
         min_size=1,
-        max_size=5,
+        max_size=1,
     )
 
     _sitrep_graph = await build_sitrep_graph(
