@@ -1,0 +1,19 @@
+{
+  "basic": {
+    "disaster_type": "地震灾害",
+    "occurrence_time": "2025-01-02T14:28:00",
+    "report_time": "2025-11-03T00:30:00",
+    "location": "四川省",
+    "command_unit": "应急指挥部"
+  },
+  "casualties": {},
+  "disruptions": {},
+  "infrastructure": {},
+  "agriculture": {},
+  "resources": {
+    "deployed_forces": []
+  },
+  "support_needs": {},
+  "risk_outlook": {},
+  "operations": {}
+}

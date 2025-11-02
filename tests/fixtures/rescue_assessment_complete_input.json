@@ -1,0 +1,99 @@
+{
+  "basic": {
+    "disaster_type": "地震灾害",
+    "occurrence_time": "2025-01-02T14:28:00",
+    "report_time": "2025-11-03T10:00:00",
+    "location": "四川省阿坝州汶川县映秀镇",
+    "command_unit": "前突侦察指挥组",
+    "frontline_overview": "震中映秀镇建筑损毁严重，道路中断，通信受阻，部分区域仍有余震",
+    "communication_status": "卫星通信已建立，北斗短报文可用，移动通信中断",
+    "weather_trend": "未来24小时晴转多云，气温5-15℃，无降雨"
+  },
+  "casualties": {
+    "affected_population": 50000,
+    "deaths": 100,
+    "missing": 50,
+    "injured": 300,
+    "emergency_evacuation": 5000,
+    "emergency_resettlement": 3000,
+    "urgent_life_support": 8000,
+    "requiring_support": 10000,
+    "casualty_notes": "伤员主要为建筑倒塌所致，多为挤压伤和骨折，重伤员需立即转运"
+  },
+  "disruptions": {
+    "road_blocked_villages": 15,
+    "power_outage_villages": 20,
+    "water_outage_villages": 18,
+    "telecom_outage_villages": 12,
+    "infrastructure_notes": "主要干道已抢通，但通行能力有限，仅能通行轻型车辆"
+  },
+  "infrastructure": {
+    "collapsed_buildings": 500,
+    "severely_damaged_buildings": 1200,
+    "mildly_damaged_buildings": 3000,
+    "transport_damage": "映秀至汶川主干道中断3处，桥梁损毁2座，隧道堵塞1处",
+    "communication_damage": "3座通信基站损毁，光缆中断多处",
+    "energy_damage": "2座变电站受损，10kV线路倒塌8处",
+    "water_facility_damage": "主供水管网破裂，3座水厂受损",
+    "public_service_damage": "县医院主楼受损严重，学校教学楼倒塌2栋",
+    "direct_economic_loss": 50000.0,
+    "other_critical_damage": "政府办公楼受损，应急指挥中心临时迁移"
+  },
+  "agriculture": {
+    "affected_area_ha": 5000.0,
+    "ruined_area_ha": 2000.0,
+    "destroyed_area_ha": 500.0,
+    "livestock_loss": "猪500头、牛30头、羊200只死亡",
+    "other_agri_loss": "大棚损毁200个，农机损毁50台"
+  },
+  "resources": {
+    "deployed_forces": [
+      {
+        "name": "国家地震灾害紧急救援队",
+        "personnel": 150,
+        "equipment": "生命探测仪、破拆工具、医疗急救设备",
+        "tasks": "重点区域搜救、伤员救治"
+      },
+      {
+        "name": "四川消防救援总队",
+        "personnel": 300,
+        "equipment": "挖掘机、装载机、救援车辆",
+        "tasks": "废墟清理、人员搜救、道路抢通"
+      },
+      {
+        "name": "武警某部工兵分队",
+        "personnel": 200,
+        "equipment": "工程机械、桥梁架设设备",
+        "tasks": "桥梁抢修、道路抢通"
+      },
+      {
+        "name": "解放军某医院野战医疗队",
+        "personnel": 80,
+        "equipment": "野战医院、救护车、医疗药品",
+        "tasks": "伤员救治、卫生防疫"
+      }
+    ],
+    "air_support": "2架米-171直升机（用于伤员转运和物资投送）",
+    "medical_support": "野战医疗点2个已建立，配备手术能力",
+    "engineering_support": "挖掘机10台、装载机5台、推土机3台",
+    "logistics_support": "物资中转站已设立，建立前方仓库3个"
+  },
+  "support_needs": {
+    "reinforcement_forces": "需增援：专业医疗队2支（每支50人，具备创伤外科能力）、重型救援队1支（80人，配备大型破拆设备）、工兵分队1支（用于桥梁抢修）",
+    "material_shortages": "紧急需要：帐篷500顶（4人规格，防风防水）、食品100吨（即食食品）、饮用水50吨（桶装水）、医疗药品50箱（外伤急救包、抗生素、止痛药）、柴油30吨（工程机械用）",
+    "infrastructure_requests": "需调配：直升机2架增援（用于偏远地区伤员转运）、卫星电话100部、应急发电车5台、净水设备3套",
+    "coordination_matters": "需协调：1）周边县市医院接收重伤员（预计50人）；2）开通空中救援绿色通道；3）调配省级医疗专家（骨科、胸外科）；4）建立跨区域物资调配机制"
+  },
+  "risk_outlook": {
+    "aftershock_risk": "余震风险高，24小时内可能发生5级以上余震，持续监测震情",
+    "meteorological_risk": "未来24小时无降雨，有利于救援，但3天后可能有降雨，需防范次生灾害",
+    "hydrological_risk": "上游河道巡查中，发现2处堰塞湖隐患，需密切监测",
+    "hazardous_sources": "映秀镇化工厂受损，暂无泄漏风险，已设置警戒，需专业队伍评估",
+    "safety_measures": "已设置安全警戒线，危险建筑已标识，禁止无关人员进入废墟作业区，救援人员配备个人防护装备"
+  },
+  "operations": {
+    "completed_actions": "已完成：搜救被困人员300人，转运重伤员80人，抢通主干道3条，建立野战医疗点2个，安置群众3000人",
+    "ongoing_actions": "正在进行：仍有50人被困待救（位置已确定），继续搜救作业，伤员救治，道路抢修，堰塞湖监测",
+    "pending_actions": "待决策：1）是否增派救援力量；2）是否启动跨省物资调配；3）是否实施交通管制；4）是否组织大规模人员转移（考虑堰塞湖风险）"
+  }
+}
