@@ -180,9 +180,18 @@ cat docs/行动计划/ACTION-PLAN-DAY1.md
 ```
 
 ### Step 2：环境检查（30分钟）
+
+> ⚠️ **重要提示**：本项目**必须使用虚拟环境**运行！
+>
+> 原因：项目依赖CPU-only版本的PyTorch（用于语音VAD检测），如果使用系统Python可能加载错误的CUDA版本导致Bus error。
+
 ```bash
 # 检查Python版本
-python --version  # 需要 >= 3.10
+python3 --version  # 需要 >= 3.10
+
+# 创建并激活虚拟环境（如果还没有）
+python3 -m venv .venv
+source .venv/bin/activate
 
 # 安装依赖
 pip install -r requirements.txt
@@ -190,8 +199,12 @@ pip install -r requirements.txt
 # 检查配置文件
 cat config/dev.env
 
-# 启动API服务
-python -m uvicorn emergency_agents.api.main:app --reload --port 8008
+# 启动API服务（使用项目脚本，会自动激活venv）
+./scripts/dev-run.sh
+
+# 或手动启动（确保已激活venv）
+# source .venv/bin/activate
+# PYTHONPATH=src python -m uvicorn emergency_agents.api.main:app --reload --port 8008
 
 # 测试健康检查（新终端）
 curl http://localhost:8008/healthz
@@ -229,17 +242,39 @@ curl http://localhost:8008/healthz
 ## 📞 遇到问题？
 
 ### 常见问题
-1. **LLM连接失败**
+
+1. **Bus error或Segmentation fault（PyTorch导入失败）**
+   - **症状**：运行`pytest`或`import torch`时Bus error
+   - **根因**：使用了系统Python而非虚拟环境，加载了错误的PyTorch版本
+   - **解决方案**：
+     ```bash
+     # 方式1：激活venv后运行
+     source .venv/bin/activate
+     pytest tests/
+
+     # 方式2：直接使用venv的pytest
+     .venv/bin/pytest tests/
+
+     # 方式3：使用项目脚本（自动激活venv）
+     ./scripts/dev-run.sh
+     ```
+   - **验证修复**：
+     ```bash
+     .venv/bin/python3 -c "import torch; print(f'✅ torch {torch.__version__} works')"
+     ```
+   - **详细诊断**：参见 `docs/新业务逻辑md/new_0.1/PyTorch-Bus-Error问题诊断.md`
+
+2. **LLM连接失败**
    - 检查API Key是否正确
    - 检查网络连接
    - 尝试使用curl直接调用LLM API验证
 
-2. **依赖安装失败**
-   - 使用虚拟环境：`python -m venv .venv`
+3. **依赖安装失败**
+   - 使用虚拟环境：`python3 -m venv .venv`
    - 激活环境：`source .venv/bin/activate`
    - 重新安装：`pip install -r requirements.txt`
 
-3. **AI输出格式不稳定**
+4. **AI输出格式不稳定**
    - 降低temperature到0
    - 使用safe_json_parse函数（带重试）
    - 在prompt末尾强调"只返回JSON"

@@ -21,7 +21,13 @@ structlog>=24.1.0
 python-multipart>=0.0.20
 opuslib>=3.0.1
 numpy>=1.24.0,<2.0.0
+
+# PyTorch CPU-only版本（用于语音VAD检测，不需要GPU）
+# 重要：必须使用CPU-only版本以避免WSL2环境中的Bus error
+# 安装方法：pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+# 当前venv中已安装：torch==2.4.1+cpu, torchaudio==2.4.1+cpu
 torch>=2.0.0
 torchaudio>=2.0.0
+
 httpx>=0.27.0
 jsonschema>=4.19.0
