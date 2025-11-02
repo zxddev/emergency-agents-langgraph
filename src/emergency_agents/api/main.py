@@ -24,6 +24,7 @@ from emergency_agents.logging import configure_logging, set_trace_id, clear_trac
 from emergency_agents.api.voice_chat import handle_voice_chat, voice_chat_handler
 from emergency_agents.api import rescue as rescue_api
 from emergency_agents.api import sitrep as sitrep_api
+from emergency_agents.api import reports as reports_api
 from emergency_agents.external.adapter_client import AdapterHubClient
 from emergency_agents.external.amap_client import AmapClient
 from emergency_agents.external.orchestrator_client import OrchestratorClient
@@ -31,6 +32,10 @@ from emergency_agents.graph.app import build_app
 from emergency_agents.graph.intent_orchestrator_app import build_intent_orchestrator_graph
 from emergency_agents.graph.voice_control_app import build_voice_control_graph
 from emergency_agents.graph.sitrep_app import build_sitrep_graph
+from emergency_agents.graph.recon_app import build_recon_graph_async
+from emergency_agents.external.recon_gateway import PostgresReconGateway
+from emergency_agents.planner.recon_llm import OpenAIReconLLMEngine, ReconLLMConfig
+from emergency_agents.planner.recon_pipeline import ReconPipeline
 from emergency_agents.memory.conversation_manager import (
     ConversationManager,
     ConversationNotFoundError,
@@ -56,6 +61,7 @@ from emergency_agents.voice.asr.base import ASRConfig as ASRConfigModel
 from emergency_agents.intent.classifier import intent_classifier_node
 from emergency_agents.intent.prompt_missing import prompt_missing_slots_node
 from emergency_agents.intent.registry import IntentHandlerRegistry
+from emergency_agents.context.service import ContextService
 from emergency_agents.intent.validator import validate_and_prompt_node
 from emergency_agents.api.intent_processor import (
     IntentProcessResult,
@@ -84,7 +90,9 @@ _graph_app: Any | None = None
 _intent_graph: Any | None = None
 _voice_control_graph: Any | None = None
 _sitrep_graph: Any | None = None
+_recon_graph: Any | None = None
 _graph_closers: list[Callable[[], Awaitable[None]]] = []
+_context_service: ContextService | None = None
 
 
 # ========== Trace-ID中间件：自动注入请求追踪ID ==========
@@ -225,6 +233,7 @@ _adapter_client = AdapterHubClient(
 _device_directory_pool: ConnectionPool | None = None
 _device_directory: PostgresDeviceDirectory | None = None
 _voice_control_pipeline: VoiceControlPipeline | None = None
+_recon_sync_pool: ConnectionPool | None = None
 
 _amap_client = AmapClient(
     api_key=_cfg.amap_api_key or "",
@@ -246,6 +255,7 @@ _risk_predict_task: asyncio.Task[None] | None = None
 
 app.include_router(rescue_api.router)
 app.include_router(sitrep_api.router, prefix="/sitrep", tags=["sitrep"])
+app.include_router(reports_api.router)
 
 
 def _classifier_wrapper(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -258,10 +268,53 @@ def _classifier_wrapper(state: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _validator_wrapper(state: Dict[str, Any], llm_client: Any, llm_model: str) -> Dict[str, Any]:
+    # 预归一化：将别名/下划线形式统一成短横线，避免schema查找遗漏
+    intent = state.get("intent") or {}
+    itype_raw = str((intent.get("intent_type") or "").strip())
+    norm = itype_raw.replace(" ", "").replace("_", "-").lower()
+    if norm in ("video-analysis", "video-analyze"):
+        state = state | {"intent": intent | {"intent_type": "video-analysis"}}
+    if norm in ("task-progress-query", "taskprogressquery"):
+        state = state | {"intent": intent | {"intent_type": "task-progress-query"}}
     return validate_and_prompt_node(state, llm_client, llm_model)
 
 
 def _prompt_wrapper(state: Dict[str, Any], llm_client: Any, llm_model: str) -> Dict[str, Any]:
+    # 增强：当视频分析缺少设备名时，提供结构化候选（DAO+Mem0）
+    # 为视频分析构造结构化候选（同步查询 device_video_link）
+    try:
+        intent = state.get("intent") or {}
+        itype = str((intent.get("intent_type") or "").strip()).lower()
+        itype_norm = itype.replace(" ", "").replace("_", "-")
+        if itype_norm in ("video-analysis", "video-analyze"):
+            import psycopg
+            from emergency_agents.intent.prompt_missing import prompt_missing_slots_enhanced
+            from emergency_agents.intent.schemas import ClarifyOption
+
+            options: list[ClarifyOption] = []
+            # 同步查询：优先 device_video_link，其次 device_detail.stream_url
+            sql = (
+                "WITH candidates AS (\n"
+                "  SELECT d.id::text AS id, d.name AS name\n"
+                "    FROM operational.device d\n"
+                "    JOIN operational.device_video_link dvl ON dvl.id = d.id\n"
+                "   WHERE COALESCE(NULLIF(dvl.video_link, ''), '') <> ''\n"
+                "  UNION ALL\n"
+                "  SELECT d.id::text AS id, d.name AS name\n"
+                "    FROM operational.device d\n"
+                "    JOIN operational.device_detail dd ON dd.device_id = d.id\n"
+                "   WHERE COALESCE(NULLIF(dd.device_detail->>'stream_url', ''), '') <> ''\n"
+                ") SELECT id, name FROM candidates GROUP BY id, name ORDER BY name ASC LIMIT 10"
+            )
+            with psycopg.connect(_cfg.postgres_dsn) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(sql)
+                    for dev_id, name in cur.fetchall():
+                        options.append({"label": name or dev_id, "device_id": dev_id})
+            return prompt_missing_slots_enhanced(state, llm_client, llm_model, options=options)
+    except Exception:
+        pass
+    # 其它意图退回通用文本澄清
     return prompt_missing_slots_node(state, llm_client, llm_model)
 
 
@@ -352,6 +405,8 @@ async def startup_event():
     global _risk_predictor
     global _risk_predict_task
     global _intent_registry  # 新增
+    global _context_service
+    global _recon_sync_pool
 
     await _pg_pool.open()
     logger.info("api_startup_pg_pool_opened")
@@ -412,6 +467,9 @@ async def startup_event():
     _register_graph_close(_intent_graph)
     logger.info("api_graph_ready", graph="intent_orchestrator")
 
+    # 会话上下文服务（基于全局 AsyncConnectionPool）
+    _context_service = ContextService(pool=_pg_pool)
+
     if _voice_control_pipeline is None:
         raise RuntimeError("VoiceControlPipeline 未初始化")
 
@@ -464,7 +522,7 @@ async def startup_event():
         risk_cache_manager=_risk_cache_manager,  # 复用已初始化的risk_cache_manager
         rescue_dao=rescue_dao,
         snapshot_repo=snapshot_repo,
-        llm_client=_llm_client,
+        llm_client=_llm_client_rescue,
         llm_model=_cfg.llm_model,
         checkpointer=sitrep_checkpointer,
     )
@@ -477,6 +535,13 @@ async def startup_event():
     sitrep_api._incident_dao = incident_dao
     sitrep_api._snapshot_repo = snapshot_repo
     # ========== SITREP子图初始化完成 ==========
+
+    # ========== 注入Reports API依赖 ==========
+    reports_api._kg_service = _kg
+    reports_api._rag_pipeline = _rag
+    logger.info("api_reports_dependencies_injected")
+    # ========== Reports API依赖注入完成 ==========
+
     if _intent_registry is not None:
         _intent_registry.attach_risk_cache(_risk_cache_manager)
     logger.info(
@@ -485,6 +550,42 @@ async def startup_event():
         refresh_interval_seconds=refresh_interval,
     )
 
+    # ========== 初始化RECON子图(侦察方案) ==========
+    # 使用与全局一致的数据库,但在checkpoint层使用独立schema(recon_checkpoint)
+    if not _cfg.recon_llm_model or not _cfg.recon_llm_base_url or not _cfg.recon_llm_api_key:
+        # 遵循“不兜底/不降级”: 明确要求配置RECON LLM参数
+        raise RuntimeError("RECON_LLM_* 未配置,无法初始化侦察子图")
+
+    # 构造同步ConnectionPool用于网关(与Async连接池并存,职责分离)
+    _recon_sync_pool = ConnectionPool(
+        conninfo=_cfg.postgres_dsn,
+        min_size=1,
+        max_size=1,
+        open=True,
+    )
+    recon_gateway = PostgresReconGateway(_recon_sync_pool)
+
+    recon_llm = OpenAIReconLLMEngine(
+        config=ReconLLMConfig(
+            model=_cfg.recon_llm_model,
+            base_url=_cfg.recon_llm_base_url,
+            api_key=_cfg.recon_llm_api_key,
+            temperature=0.2,
+            timeout_seconds=_cfg.llm_request_timeout_seconds,
+        )
+    )
+    recon_pipeline = ReconPipeline(gateway=recon_gateway, llm_engine=recon_llm)
+
+    _recon_graph = await build_recon_graph_async(
+        pipeline=recon_pipeline,
+        gateway=recon_gateway,
+        dsn=_cfg.postgres_dsn,
+        schema="recon_checkpoint",
+    )
+    _register_graph_close(_recon_graph)
+    app.state.recon_graph = _recon_graph
+    logger.info("api_graph_ready", graph="recon")
+
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -492,11 +593,13 @@ async def shutdown_event():
     global _intent_graph
     global _voice_control_graph
     global _sitrep_graph
+    global _recon_graph
     global _graph_closers
     global _risk_cache_manager
     global _risk_refresh_task
     global _risk_predictor
     global _risk_predict_task
+    global _recon_sync_pool
     await voice_chat_handler.stop_background_tasks()
     await _asr.stop_health_check()
     await _adapter_client.aclose()
@@ -515,6 +618,7 @@ async def shutdown_event():
     _intent_graph = None
     _voice_control_graph = None
     _sitrep_graph = None
+    _recon_graph = None
 
     if hasattr(_intent_registry, "close"):
         close_result = _intent_registry.close()
@@ -523,6 +627,12 @@ async def shutdown_event():
     await _pg_pool.close()
     if _device_directory_pool is not None:
         _device_directory_pool.close()
+    if _recon_sync_pool is not None:
+        try:
+            _recon_sync_pool.close()
+        except Exception:
+            pass
+        _recon_sync_pool = None
     for task in (_risk_refresh_task, _risk_predict_task):
         if task is not None:
             task.cancel()
@@ -819,6 +929,7 @@ async def intent_process(req: IntentProcessRequest):
         build_history=_build_history,
         mem0_metrics=_mem0_metrics_factory(),
         channel=req.channel,
+        context_service=_context_service,
     )
     return {
         "status": result.status,

@@ -148,33 +148,245 @@ class RescueAssessmentInput(BaseModel):
     operations: OperationsProgress
 
 
+class EquipmentRecommendation(BaseModel):
+    """装备推荐项"""
+    name: str = Field(..., description="装备名称")
+    score: float = Field(..., description="推荐得分")
+    source: str = Field(default="知识图谱", description="推荐来源")
+
+
 class RescueAssessmentResponse(BaseModel):
     report_text: str = Field(..., description="面向指挥大厅的完整灾情汇报，Markdown 格式。")
     key_points: List[str] = Field(
         default_factory=list,
         description="便于前端展示的要点摘要，可用于快速检索关键结论。",
     )
+    data_sources: List[str] = Field(
+        default_factory=list,
+        description="报告生成使用的数据来源列表（如：知识图谱、RAG规范库等）。",
+    )
+    confidence_score: float = Field(
+        ...,
+        ge=0.0,
+        le=1.0,
+        description="报告置信度评分（0-1），基于输入完整性和外部数据支撑度计算。",
+    )
+    referenced_specs: List[str] = Field(
+        default_factory=list,
+        description="报告引用的应急预案规范文档标题列表。",
+    )
+    referenced_cases: List[str] = Field(
+        default_factory=list,
+        description="报告引用的历史救援案例标题列表。",
+    )
+    equipment_recommendations: List[EquipmentRecommendation] = Field(
+        default_factory=list,
+        description="基于知识图谱推荐的救援装备配置清单。",
+    )
+    errors: List[str] = Field(
+        default_factory=list,
+        description="数据获取过程中遇到的错误或警告信息（透明展示）。",
+    )
 
 
 router = APIRouter(prefix="/reports", tags=["reports"])
 
+_kg_service: Any | None = None
+_rag_pipeline: Any | None = None
+
 
 @router.post("/rescue-assessment", response_model=RescueAssessmentResponse)
 async def generate_rescue_assessment(payload: RescueAssessmentInput) -> RescueAssessmentResponse:
-    """生成救援评估汇报。"""
+    """生成救援评估汇报（集成KG+RAG）。
 
+    流程：
+    1. 调用KG获取装备推荐
+    2. 调用RAG检索规范文档
+    3. 调用KG检索历史案例
+    4. 构造增强prompt（包含权威参考资料）
+    5. 调用LLM生成报告
+    6. 计算置信度评分
+    7. 返回完整报告信息
+    """
+    total_start = time.perf_counter()
     cfg = AppConfig.load_from_env()
+    disaster_type = payload.basic.disaster_type.value
+    location = payload.basic.location
+
+    logger.info(
+        "rescue_assessment_start",
+        disaster_type=disaster_type,
+        location=location,
+    )
+
+    data_sources: List[str] = []
+    errors: List[str] = []
+    equipment_list: List[EquipmentRecommendation] = []
+    spec_titles: List[str] = []
+    case_titles: List[str] = []
+    reference_materials: List[str] = []
+
+    kg_start = time.perf_counter()
+    try:
+        if _kg_service is None:
+            raise RuntimeError("KG Service 未初始化")
+
+        logger.info(
+            "kg_recommend_equipment_start",
+            hazard=disaster_type,
+            environment=payload.basic.frontline_overview,
+        )
+
+        kg_equipment = _kg_service.recommend_equipment(
+            hazard=disaster_type,
+            environment=payload.basic.frontline_overview,
+            top_k=5
+        )
+
+        kg_elapsed_ms = int((time.perf_counter() - kg_start) * 1000)
+        logger.info(
+            "kg_recommend_equipment_success",
+            result_count=len(kg_equipment),
+            latency_ms=kg_elapsed_ms,
+        )
+
+        equipment_list = [
+            EquipmentRecommendation(
+                name=item.get("name", "未知装备"),
+                score=float(item.get("score", 0.0)),
+                source="知识图谱"
+            )
+            for item in kg_equipment
+        ]
+
+        if equipment_list:
+            data_sources.append("知识图谱装备库")
+            reference_materials.append(
+                "**推荐装备配置（基于知识图谱）：**\n" +
+                "\n".join([f"- {eq.name}（推荐指数：{eq.score:.2f}）" for eq in equipment_list])
+            )
+
+    except Exception as e:
+        kg_elapsed_ms = int((time.perf_counter() - kg_start) * 1000)
+        error_msg = f"知识图谱装备推荐失败: {str(e)}"
+        logger.error(
+            "kg_recommend_equipment_failed",
+            error=str(e),
+            latency_ms=kg_elapsed_ms,
+        )
+        errors.append(error_msg)
+
+    rag_spec_start = time.perf_counter()
+    try:
+        if _rag_pipeline is None:
+            raise RuntimeError("RAG Pipeline 未初始化")
+
+        spec_query = f"{disaster_type}应急预案规范"
+        logger.info(
+            "rag_query_specs_start",
+            query=spec_query,
+            domain="规范",
+        )
+
+        spec_chunks = _rag_pipeline.query(
+            question=spec_query,
+            domain="规范",
+            top_k=3
+        )
+
+        rag_spec_elapsed_ms = int((time.perf_counter() - rag_spec_start) * 1000)
+        logger.info(
+            "rag_query_specs_success",
+            result_count=len(spec_chunks),
+            latency_ms=rag_spec_elapsed_ms,
+        )
+
+        if spec_chunks:
+            data_sources.append("RAG规范文档库")
+            spec_titles = [chunk.source for chunk in spec_chunks]
+            reference_materials.append(
+                "**应急预案规范（RAG检索）：**\n" +
+                "\n".join([
+                    f"- [{chunk.source}@{chunk.loc}] {chunk.text[:100]}..."
+                    for chunk in spec_chunks
+                ])
+            )
+
+    except Exception as e:
+        rag_spec_elapsed_ms = int((time.perf_counter() - rag_spec_start) * 1000)
+        error_msg = f"RAG规范检索失败: {str(e)}"
+        logger.error(
+            "rag_query_specs_failed",
+            error=str(e),
+            latency_ms=rag_spec_elapsed_ms,
+        )
+        errors.append(error_msg)
+
+    kg_case_start = time.perf_counter()
+    try:
+        if _kg_service is None:
+            raise RuntimeError("KG Service 未初始化")
+
+        case_keywords = f"{disaster_type} {location}"
+        logger.info(
+            "kg_search_cases_start",
+            keywords=case_keywords,
+        )
+
+        kg_cases = _kg_service.search_cases(
+            keywords=case_keywords,
+            top_k=3
+        )
+
+        kg_case_elapsed_ms = int((time.perf_counter() - kg_case_start) * 1000)
+        logger.info(
+            "kg_search_cases_success",
+            result_count=len(kg_cases),
+            latency_ms=kg_case_elapsed_ms,
+        )
+
+        if kg_cases:
+            data_sources.append("知识图谱案例库")
+            case_titles = [case.get("title", "未知案例") for case in kg_cases]
+            reference_materials.append(
+                "**历史救援案例（知识图谱）：**\n" +
+                "\n".join([
+                    f"- {case.get('title', '未知')}: {case.get('summary', '无摘要')[:80]}..."
+                    for case in kg_cases
+                ])
+            )
+
+    except Exception as e:
+        kg_case_elapsed_ms = int((time.perf_counter() - kg_case_start) * 1000)
+        error_msg = f"知识图谱案例检索失败: {str(e)}"
+        logger.error(
+            "kg_search_cases_failed",
+            error=str(e),
+            latency_ms=kg_case_elapsed_ms,
+        )
+        errors.append(error_msg)
+
     prompt_payload = _build_prompt_payload(payload)
-    prompt = build_rescue_assessment_prompt(prompt_payload)
+
+    if not reference_materials:
+        reference_materials.append("**注意：未检索到外部参考资料，报告仅基于输入数据生成**")
+
+    prompt = build_rescue_assessment_prompt(prompt_payload, reference_materials)
+
+    logger.info(
+        "prompt_built",
+        prompt_length=len(prompt),
+        data_sources_count=len(data_sources),
+    )
 
     llm_client = get_openai_client(cfg)
-    started_at = time.perf_counter()
+    llm_start = time.perf_counter()
 
     try:
         completion = llm_client.chat.completions.create(
             model=cfg.llm_model,
             temperature=0.2,
-            max_tokens=1500,
+            max_tokens=2000,
             presence_penalty=0,
             frequency_penalty=0,
             messages=[
@@ -182,39 +394,77 @@ async def generate_rescue_assessment(payload: RescueAssessmentInput) -> RescueAs
                     "role": "system",
                     "content": (
                         "你是一名国家级应急救援指挥专家，擅长将复杂灾情转化为结构化的正式汇报。"
-                        "务必严格遵循用户提供的数据，严禁虚构。"
+                        "务必严格遵循用户提供的数据和权威参考资料，严禁虚构。"
+                        "在汇报中引用外部资料时，需标注来源。"
                     ),
                 },
                 {"role": "user", "content": prompt},
             ],
         )
-    except Exception as exc:  # noqa: BLE001
-        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+    except Exception as exc:
+        llm_elapsed_ms = int((time.perf_counter() - llm_start) * 1000)
         logger.exception(
-            "rescue_assessment_generation_failed",
-            latency_ms=elapsed_ms,
-            disaster_type=payload.basic.disaster_type.value,
+            "rescue_assessment_llm_failed",
+            latency_ms=llm_elapsed_ms,
+            disaster_type=disaster_type,
         )
         raise HTTPException(status_code=502, detail="模型生成失败，请稍后重试") from exc
 
-    elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+    llm_elapsed_ms = int((time.perf_counter() - llm_start) * 1000)
     content = completion.choices[0].message.content if completion.choices else None
     if not content:
         logger.error(
             "rescue_assessment_empty_response",
-            latency_ms=elapsed_ms,
-            disaster_type=payload.basic.disaster_type.value,
+            latency_ms=llm_elapsed_ms,
+            disaster_type=disaster_type,
         )
         raise HTTPException(status_code=502, detail="模型未返回有效内容")
 
-    key_points = _extract_key_points(payload)
     logger.info(
-        "rescue_assessment_generated",
-        latency_ms=elapsed_ms,
-        disaster_type=payload.basic.disaster_type.value,
-        key_points=key_points,
+        "rescue_assessment_llm_success",
+        latency_ms=llm_elapsed_ms,
+        output_length=len(content),
     )
-    return RescueAssessmentResponse(report_text=content, key_points=key_points)
+
+    input_completeness = _calculate_input_completeness(payload)
+    confidence_score = _calculate_confidence_score(
+        input_completeness=input_completeness,
+        spec_count=len(spec_titles),
+        case_count=len(case_titles),
+        equipment_count=len(equipment_list),
+    )
+
+    logger.info(
+        "confidence_score_calculated",
+        input_completeness=input_completeness,
+        spec_count=len(spec_titles),
+        case_count=len(case_titles),
+        equipment_count=len(equipment_list),
+        confidence_score=confidence_score,
+    )
+
+    key_points = _extract_key_points(payload)
+    total_elapsed_ms = int((time.perf_counter() - total_start) * 1000)
+
+    logger.info(
+        "rescue_assessment_completed",
+        total_latency_ms=total_elapsed_ms,
+        disaster_type=disaster_type,
+        confidence_score=confidence_score,
+        data_sources_count=len(data_sources),
+        errors_count=len(errors),
+    )
+
+    return RescueAssessmentResponse(
+        report_text=content,
+        key_points=key_points,
+        data_sources=data_sources,
+        confidence_score=confidence_score,
+        referenced_specs=spec_titles,
+        referenced_cases=case_titles,
+        equipment_recommendations=equipment_list,
+        errors=errors,
+    )
 
 
 def _fmt_datetime(dt: datetime) -> str:
@@ -379,4 +629,75 @@ def _extract_key_points(payload: RescueAssessmentInput) -> List[str]:
         points.append(f"气象风险：{risk.meteorological_risk}")
 
     return points[:8]
+
+
+def _calculate_input_completeness(payload: RescueAssessmentInput) -> float:
+    """计算输入数据的完整性得分
+
+    遍历输入payload的所有字段，统计非空字段占比
+    """
+    total_fields = 0
+    filled_fields = 0
+
+    for field_name, field_value in payload.model_dump().items():
+        if isinstance(field_value, dict):
+            for sub_key, sub_value in field_value.items():
+                total_fields += 1
+                if sub_value is not None and sub_value != "" and sub_value != []:
+                    filled_fields += 1
+        elif isinstance(field_value, list):
+            total_fields += 1
+            if field_value:
+                filled_fields += 1
+        else:
+            total_fields += 1
+            if field_value is not None and field_value != "":
+                filled_fields += 1
+
+    return filled_fields / total_fields if total_fields > 0 else 0.0
+
+
+def _calculate_confidence_score(
+    input_completeness: float,
+    spec_count: int,
+    case_count: int,
+    equipment_count: int,
+    expected_specs: int = 3,
+    expected_cases: int = 2,
+    expected_equipment: int = 5,
+) -> float:
+    """计算报告置信度评分
+
+    Args:
+        input_completeness: 输入完整性（0-1）
+        spec_count: 检索到的规范数量
+        case_count: 检索到的案例数量
+        equipment_count: 推荐到的装备数量
+        expected_specs: 期望的规范数量
+        expected_cases: 期望的案例数量
+        expected_equipment: 期望的装备数量
+
+    Returns:
+        综合置信度评分（0-1）
+    """
+    external_support = (
+        min(spec_count / expected_specs, 1.0) * 0.4
+        + min(case_count / expected_cases, 1.0) * 0.3
+        + min(equipment_count / expected_equipment, 1.0) * 0.3
+    )
+
+    source_count = sum([
+        1 if spec_count > 0 else 0,
+        1 if case_count > 0 else 0,
+        1 if equipment_count > 0 else 0,
+    ])
+    source_diversity = source_count / 3.0
+
+    confidence = (
+        input_completeness * 0.4
+        + external_support * 0.4
+        + source_diversity * 0.2
+    )
+
+    return round(confidence, 3)
 
