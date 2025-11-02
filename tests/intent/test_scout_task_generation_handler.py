@@ -43,28 +43,39 @@ class _StubRiskRepository:
     async def list_active_zones(self) -> list[RiskZoneRecord]:
         return list(self.zones)
 
+    async def find_zones_near(self, *, lng: float, lat: float, radius_meters: float) -> list[RiskZoneRecord]:
+        """查询指定坐标附近的风险区域（测试实现，返回所有活跃区域）"""
+        return await self.list_active_zones()
 
+
+@pytest.mark.integration
 @pytest.mark.anyio
-async def test_scout_handler_generates_plan() -> None:
-    """测试 ScoutTaskGenerationHandler 使用懒加载模式生成侦察计划"""
+async def test_scout_handler_generates_plan(
+    async_postgres_pool: AsyncConnectionPool,
+    postgres_dsn: str,
+    device_directory: DeviceDirectory,
+) -> None:
+    """测试 ScoutTaskGenerationHandler 使用懒加载模式生成侦察计划
+
+    注意：此测试需要真实PostgreSQL连接和DeviceDirectory（用于LangGraph graph构建）
+    """
     # 创建 Stub 风险数据仓库（包含1个化工泄漏风险区域）
     risk_repository = _StubRiskRepository()
 
-    # 创建 Mock 依赖（Handler 会懒加载 Graph，这里只需提供构造参数）
-    mock_device_directory = Mock(spec=DeviceDirectory)
+    # 创建 Mock 依赖（Handler 会懒加载 Graph）
+    # 注意：DeviceDirectory使用真实fixture（集成测试）
     mock_amap_client = Mock(spec=AmapClient)
     mock_orchestrator = Mock(spec=OrchestratorClient)
-    mock_pool = Mock(spec=AsyncConnectionPool)
-    postgres_dsn = "postgresql://test:test@localhost:5432/test_db"
 
     # 创建 Handler（使用新的懒加载模式）
+    # 注意：postgres_dsn, pool, device_directory需要真实值以支持LangGraph graph构建
     handler = ScoutTaskGenerationHandler(
         risk_repository=risk_repository,  # type: ignore[arg-type]
-        device_directory=mock_device_directory,
+        device_directory=device_directory,  # 真实DeviceDirectory（来自fixture）
         amap_client=mock_amap_client,
         orchestrator_client=mock_orchestrator,
-        postgres_dsn=postgres_dsn,
-        pool=mock_pool,
+        postgres_dsn=postgres_dsn,  # 真实DSN（来自fixture）
+        pool=async_postgres_pool,  # 真实连接池（来自fixture）
     )
 
     # 准备意图槽位

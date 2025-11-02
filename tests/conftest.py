@@ -5,13 +5,20 @@ import inspect
 import os
 import sys
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, AsyncIterator, Iterable, Optional
 
 import pytest
-from psycopg_pool import ConnectionPool
+from psycopg_pool import AsyncConnectionPool, ConnectionPool
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, os.fspath(ROOT / "src"))
+
+
+# 配置pytest-anyio只使用asyncio后端（避免trio依赖）
+@pytest.fixture(scope="session")
+def anyio_backend():
+    """配置pytest-anyio只使用asyncio后端"""
+    return "asyncio"
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -60,6 +67,22 @@ def postgres_pool(postgres_dsn: str) -> Iterable[ConnectionPool]:
         yield pool
     finally:
         pool.close()
+
+
+@pytest.fixture
+async def async_postgres_pool(postgres_dsn: str) -> AsyncIterator[AsyncConnectionPool[Any]]:
+    """提供 PostgreSQL 异步连接池（用于 RescueTaskRepository）
+
+    参考：psycopg文档要求open()后必须wait()等待连接建立
+    https://www.psycopg.org/psycopg3/docs/advanced/pool.html
+    """
+    pool = AsyncConnectionPool(postgres_dsn, min_size=2, max_size=10, open=False)
+    await pool.open()
+    await pool.wait(timeout=10.0)
+    try:
+        yield pool
+    finally:
+        await pool.close()
 
 
 @pytest.fixture
@@ -130,6 +153,12 @@ def empty_risk_repository():
                     updated_at=now,
                 )
             ]
+
+        async def find_zones_near(
+            self, *, lng: float, lat: float, radius_meters: float
+        ) -> list[RiskZoneRecord]:
+            """查询指定坐标附近的风险区域（测试实现，返回所有活跃区域）"""
+            return await self.list_active_zones()
 
     return _EmptyRiskRepository()
 

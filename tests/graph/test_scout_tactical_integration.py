@@ -43,11 +43,14 @@ logger = logging.getLogger(__name__)
 
 
 def _create_test_state_minimal() -> ScoutTacticalState:
-    """创建最小化测试状态(仅包含 Required 字段)"""
+    """创建最小化测试状态(仅包含 Required 字段)
+
+    注意：使用固定的incident_id（假设数据库中已存在对应的events记录）
+    """
     import uuid
 
     return ScoutTacticalState(
-        incident_id="test-incident-001",
+        incident_id="fef8469f-5f78-4dd4-8825-dbc915d1b630",  # 固定的默认事件ID
         user_id="test-user",
         thread_id=f"test-thread-{uuid.uuid4().hex[:8]}",  # 使用唯一ID避免checkpoint冲突
     )
@@ -76,6 +79,7 @@ def _prepare_test_devices(pool: ConnectionPool) -> None:
 @pytest.mark.anyio
 async def test_device_selection_with_real_db(
     postgres_pool: ConnectionPool,
+    async_postgres_pool,
     device_directory: DeviceDirectory,
     empty_risk_repository,
 ) -> None:
@@ -91,16 +95,23 @@ async def test_device_selection_with_real_db(
     _prepare_test_devices(postgres_pool)
 
     # 创建测试所需的依赖（Mock 未测试的组件）
-    from unittest.mock import AsyncMock
+    from unittest.mock import AsyncMock, Mock
 
-    # Mock AmapClient（允许任意方法调用，返回 None 触发降级逻辑）
+    # Mock AmapClient（返回真实的RoutePlan结构，符合类型约定）
     mock_amap_client = AsyncMock()
+    mock_amap_client.direction.return_value = {
+        "distance_meters": 1500,  # 1.5公里
+        "duration_seconds": 180,  # 3分钟
+        "steps": [],
+        "cache_hit": False,
+    }
 
     # Mock OrchestratorClient（不验证后端通知）
-    mock_orchestrator = AsyncMock()
+    # 注意：OrchestratorClient是同步客户端，必须使用Mock而非AsyncMock
+    mock_orchestrator = Mock()
     mock_orchestrator.publish_scout_scenario.return_value = {"success": True}
 
-    task_repository = RescueTaskRepository.create(postgres_pool)
+    task_repository = RescueTaskRepository.create(async_postgres_pool)
     postgres_dsn = os.getenv("POSTGRES_DSN", "postgresql://rescue:rescue_password@localhost:5432/rescue_system")
 
     # 构建 Scout 战术图（使用新的异步 build() 方法）
@@ -138,8 +149,12 @@ async def test_device_selection_with_real_db(
     assert "name" in first_device, "设备必须包含 name"
     assert "device_type" in first_device, "设备必须包含 device_type"
 
-    # 验证设备类型
-    assert first_device["device_type"] in ["UAV", "ROBOTDOG", "USV", "UGV"], f"未知设备类型: {first_device['device_type']}"
+    # 验证设备类型（DeviceType枚举值是小写字符串，如'uav', 'robotdog'）
+    from emergency_agents.control.models import DeviceType
+    valid_types = {t.value for t in DeviceType}  # {'uav', 'robotdog', 'usv', 'ugv'}
+    # 兼容数据库中的其他格式（'drone', 'dog', 'ship', 'robot', 'command_vehicle'）
+    valid_types.update(['drone', 'dog', 'ship', 'robot', 'command_vehicle'])
+    assert first_device["device_type"] in valid_types, f"未知设备类型: {first_device['device_type']}"
 
     # 验证设备ID前缀(如果是测试数据)
     if first_device["device_id"].startswith("TEST-"):
@@ -155,6 +170,7 @@ async def test_device_selection_with_real_db(
 @pytest.mark.anyio
 async def test_route_planning_with_real_amap(
     postgres_pool: ConnectionPool,
+    async_postgres_pool,
     device_directory: DeviceDirectory,
     amap_client: AmapClient,
     empty_risk_repository,
@@ -171,13 +187,14 @@ async def test_route_planning_with_real_amap(
     _prepare_test_devices(postgres_pool)
 
     # 创建测试所需的依赖（Mock 未测试的组件）
-    from unittest.mock import AsyncMock
+    from unittest.mock import Mock
 
     # Mock OrchestratorClient（不验证后端通知）
-    mock_orchestrator = AsyncMock()
+    # 注意：OrchestratorClient是同步客户端，必须使用Mock而非AsyncMock
+    mock_orchestrator = Mock()
     mock_orchestrator.publish_scout_scenario.return_value = {"success": True}
 
-    task_repository = RescueTaskRepository.create(postgres_pool)
+    task_repository = RescueTaskRepository.create(async_postgres_pool)
     postgres_dsn = os.getenv("POSTGRES_DSN", "postgresql://rescue:rescue_password@localhost:5432/rescue_system")
 
     # 构建 Scout 战术图（使用新的异步 build() 方法，启用真实 amap_client）
@@ -212,13 +229,17 @@ async def test_route_planning_with_real_amap(
 
     # 验证第一个航点的数据结构
     first_waypoint = waypoints[0]
-    assert "lat" in first_waypoint, "航点必须包含纬度"
-    assert "lng" in first_waypoint, "航点必须包含经度"
     assert "sequence" in first_waypoint, "航点必须包含序号"
+    assert "location" in first_waypoint, "航点必须包含位置信息"
+
+    # 验证location嵌套字段
+    location = first_waypoint["location"]
+    assert "lat" in location, "location必须包含纬度"
+    assert "lng" in location, "location必须包含经度"
 
     # 验证坐标合理性(杭州周边范围 29-31°N, 119-121°E)
-    assert 29.0 < first_waypoint["lat"] < 31.0, f"纬度超出预期范围: {first_waypoint['lat']}"
-    assert 119.0 < first_waypoint["lng"] < 121.0, f"经度超出预期范围: {first_waypoint['lng']}"
+    assert 29.0 < location["lat"] < 31.0, f"纬度超出预期范围: {location['lat']}"
+    assert 119.0 < location["lng"] < 121.0, f"经度超出预期范围: {location['lng']}"
 
     # 验证总里程和时长
     assert "total_distance_m" in route, "路线必须包含总里程"
