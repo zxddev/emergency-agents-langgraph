@@ -4,7 +4,7 @@
 **目标**: 最快速度实现前端与 AI 大脑的交互，展示战术救援/侦察能力
 **优先级**: P0（峰会演示核心功能）
 **创建日期**: 2025-11-02
-**状态**: ✅ Python 后端就绪，等待前端实现
+**状态**: ⚠️ Python 后端核心链路已上线，但 UI Actions 协议与风险缓存使用范围需按最新实现同步更新，仍等待前端接入落地
 
 ---
 
@@ -14,19 +14,11 @@
 用户需求："我现在要最快速度的完成和前端的交互，战术救援和战术侦察，还有战略救援和战略侦察，还有风险提醒"
 
 ### 核心发现（基于 10 层代码验证）
-1. **✅ Python 后端 100% 就绪**:
-   - 战术救援图 (RescueTacticalGraph) - 完整实现
-   - 战术侦察图 (ScoutTacticalGraph) - 完整实现（1479 行，8 个节点）
-   - UI Actions 协议 - 完整定义（5 种 Action 类型）
-   - 风险缓存管理 - 已集成到 handlers
-
-2. **❌ 战略层不存在**:
-   - 代码中无 StrategicGraph 实现
-   - 当前仅支持战术层（Tactical），不支持战略层（Strategic）
-
-3. **🎯 瓶颈在前端**:
-   - Python 已返回完整 ui_actions 数组
-   - 缺少前端 Action Dispatcher 和 UI 组件
+1. **✅ 战术链路可执行**：`RescueTacticalGraph` 与 `ScoutTacticalGraph` 均已按 StateGraph 架构落地（`src/emergency_agents/graph/rescue_tactical_app.py`、`src/emergency_agents/graph/scout_tactical_app.py:1-1479`），处理器会返回 UI 动作矩阵。
+2. **📌 UI Actions 实际包含标准 + 扩展动作**：标准动作来自 `src/emergency_agents/ui/actions.py`（`camera_flyto` / `open_panel` / `show_toast` / `show_risk_warning` / `focus_entity`），再叠加 `toggle_layer`、`raw_action` 以及侦察子图内联生成的 `preview_route`、`open_scout_panel`、`show_risk_hints` 等扩展动作，文档需覆盖全部清单。
+3. **⚠️ 风险缓存仅在救援链路启用**：`RescueTaskGenerationHandler` 会优先命中 `RiskCacheManager`（`src/emergency_agents/intent/handlers/rescue_task_generation.py:232-310`），`ScoutTaskGenerationHandler` 则直接访问 `RiskDataRepository`（`src/emergency_agents/intent/handlers/scout_task_generation.py`），与原描述不符。
+4. **🎯 瓶颈仍在前端**：Python 端已返回结构化 `ui_actions` 队列，但缺少 Action Dispatcher 与地图/面板组件，前端需按真实协议补齐。
+5. **❌ 战略层不存在**：代码中没有 StrategicGraph 实现，目前仅交付战术层能力（救援/侦察）。
 
 ### 最快速实施路径
 **3 天 MVP 方案**（每天都有可演示进展）：
@@ -309,21 +301,79 @@ async function handleShowRiskWarning(payload: ShowRiskWarningPayload) {
 
 ---
 
-#### 1.2.5 focus_entity - 聚焦实体（暂不实现）
+#### 1.2.5 focus_entity - 聚焦实体（救援链路已产出）
 
-**状态**: ⚠️ 当前 RescueHandler 中 `entity` 可能为 `None`，暂不实现
+**状态**: ✅ 当救援意图解析到实体信息时，`RescueTaskGenerationHandler` 会直接输出 `focus_entity` 动作（`src/emergency_agents/intent/handlers/rescue_task_generation.py:792-809`），用于地图聚焦被困目标。
 
 **Payload 结构**:
 ```typescript
 interface FocusEntityPayload {
-  entity_id: string;  // 被困实体 ID
+  entity_id: string;      // 被困实体 ID
+  zoom?: number;          // 可选：聚焦时的缩放级别
 }
 ```
 
-**前端实现计划**（Phase 2）:
-- 查询实体位置
-- 相机飞行到实体
-- 高亮实体图标
+**实际示例**:
+```json
+{
+  "action": "focus_entity",
+  "payload": {
+    "entityId": "rescue-target-001",
+    "zoom": 18
+  },
+  "metadata": {
+    "incident_id": "fef8469f-5f78-4dd4-8825-dbc915d1b630",
+    "task_id": "task-123"
+  }
+}
+```
+
+**前端处理建议**:
+- 调用地图 API 聚焦到实体坐标，可与 `camera_flyto` 联动降低跳转延迟。
+- 在实体图标上叠加闪烁/描边，提升指挥员识别度。
+
+---
+
+#### 1.2.6 toggle_layer - 图层开关
+
+**用途**: 从后端远程控制应急地图的专题图层（`src/emergency_agents/ui/actions.py:20-65`）。
+
+**Payload 结构**:
+```typescript
+interface ToggleLayerPayload {
+  layer_code: string;             // 图层编码（需与前端约定）
+  layer_name?: string;            // 图层名称（可选，用于提示）
+  on: boolean;                    // true 开启 / false 关闭
+}
+```
+
+**解析要点**:
+- 建议前端维护 “layer_code → 数据源 / 样式” 映射表。
+- 当图层不存在时记录告警日志，不做静默失败。
+
+---
+
+#### 1.2.7 raw_action - 兼容自定义动作
+
+**用途**: 作为应急兜底接口传输暂未建模的 UI 指令，保持协议向后兼容（`src/emergency_agents/ui/actions.py:181-186`）。
+
+**解析要点**:
+- `payload`、`metadata` 均为 `Record<string, any>`；前端在消费前需校验 `action` 字段。
+- 建议在接入阶段对未识别的 `action` 做日志标记，以便回填正式类型。
+
+---
+
+### 1.3 侦察子图扩展动作
+
+`ScoutTacticalGraph` 会在节点 `prepare_ui_actions_task` 中追加扩展动作（`src/emergency_agents/graph/scout_tactical_app.py:1320-1374`），其结构与标准 UIAction 不同，前端需单独适配：
+
+| 动作 ID | 数据结构 | 触发条件 | 作用 |
+|---------|----------|----------|------|
+| `preview_route` | `{ waypoints: ReconWaypoint[]; total_distance_m: number; total_duration_sec: number }` | 生成完整航线后输出 | 地图展示侦察路线，为行动人员预演路径 |
+| `open_scout_panel` | `{ devices: SelectedDevice[]; device_count: number }` | 存在可执行设备时输出 | 打开侦察面板，展示设备分配 |
+| `show_risk_hints` | `{ hints: string[] }` | 侦察计划包含风险提示时输出 | 在 UI 上弹出风险提示列表 |
+
+> ⚠️ 以上扩展动作当前由侦察子图直接返回，为保持一致性，可在前端解析后转化为标准组件（例如调用现有面板/地图模块）。
 
 ---
 
@@ -1511,12 +1561,13 @@ curl -X POST http://localhost:8008/intent/process \
 
 **已验证的文件**（基于 10 层深度分析）:
 
-1. `src/emergency_agents/ui/actions.py` (216 行) - UI Actions 协议定义
+1. `src/emergency_agents/ui/actions.py` (216 行) - UI Actions 协议定义（含标准动作 + `toggle_layer` / `raw_action`）
 2. `src/emergency_agents/intent/handlers/rescue_task_generation.py:792-843` - Rescue UI Actions 生成
 3. `src/emergency_agents/intent/handlers/scout_task_generation.py:115-129` - Scout UI Actions 生成
 4. `src/emergency_agents/api/intent_processor.py:513-559` - UI Actions 提取和序列化
 5. `src/emergency_agents/api/main.py:783` - `/intent/process` 端点定义
 6. `src/emergency_agents/graph/scout_tactical_app.py` (1479 行，8 节点) - 侦察战术图
+7. `src/emergency_agents/graph/scout_tactical_app.py:1320-1374` - 侦察子图扩展动作（`preview_route` / `open_scout_panel` / `show_risk_hints`）
 
 ### 附录 B: 相关文档
 
@@ -1538,9 +1589,11 @@ curl -X POST http://localhost:8008/intent/process \
 ## 十、总结
 
 ### 核心发现
-1. **✅ Python 后端 100% 就绪**: 战术救援/侦察图完整实现，UI Actions 协议完善
-2. **🎯 瓶颈在前端**: 缺少 Action Dispatcher 和 UI 组件
-3. **❌ 战略层不存在**: 当前仅支持战术层，需要明确告知用户
+1. **✅ 战术链路可执行**：战术救援 / 侦察图已在 StateGraph 上线，可产出 UI 动作。
+2. **📌 UI Actions 含扩展动作**：需同步消费标准 + 扩展动作（含侦察子图专属）以避免信息缺失。
+3. **⚠️ 风险缓存仅覆盖救援链路**：侦察链路仍直接访问 `RiskDataRepository`，缓存命中率依赖后端补齐。
+4. **🎯 前端仍为瓶颈**：缺少 Dispatcher 与组件，当前动作只能落在日志中。
+5. **❌ 战略层不存在**：目前范围仅限战术层功能。
 
 ### 最快实施路径
 采用 **3 天 MVP 方案**，渐进式集成：

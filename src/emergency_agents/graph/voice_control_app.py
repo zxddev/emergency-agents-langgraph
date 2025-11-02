@@ -259,7 +259,7 @@ async def build_voice_control_graph(
         dsn=postgres_dsn,
         schema=checkpoint_schema,
         min_size=1,
-        max_size=3,
+        max_size=1,
     )
     compiled = graph.compile(checkpointer=checkpointer)
     setattr(compiled, "_checkpoint_close", close_cb)

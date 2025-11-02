@@ -378,8 +378,10 @@ async def test_simple_graph_flow_integration():
     cfg = AppConfig.load_from_env()
 
     # 创建临时连接池（简化测试）
-    async with AsyncConnectionPool(cfg.postgres_dsn, min_size=1, max_size=2) as pool:
+    async with AsyncConnectionPool(cfg.postgres_dsn, min_size=1, max_size=1) as pool:
         await pool.open()
+        # 等待最小连接建立，避免并发建立时的竞态导致 getconn 超时
+        await pool.wait(timeout=60.0)
 
         # 创建最小依赖
         incident_dao = IncidentDAO.create(pool)
@@ -401,7 +403,7 @@ async def test_simple_graph_flow_integration():
             dsn=cfg.postgres_dsn,
             schema="test_sitrep_checkpoint",
             min_size=1,
-            max_size=2,
+            max_size=1,
         )
 
         try:
@@ -501,8 +503,9 @@ async def test_full_sitrep_flow_integration():
     cfg = AppConfig.load_from_env()
 
     # 创建连接池
-    async with AsyncConnectionPool(cfg.postgres_dsn, min_size=1, max_size=5) as pool:
+    async with AsyncConnectionPool(cfg.postgres_dsn, min_size=1, max_size=1) as pool:
         await pool.open()
+        await pool.wait(timeout=60.0)
 
         # 创建DAO
         incident_dao = IncidentDAO.create(pool)

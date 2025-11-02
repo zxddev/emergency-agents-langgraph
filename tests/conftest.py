@@ -23,10 +23,18 @@ def anyio_backend():
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_pyfunc_call(pyfuncitem: pytest.Function) -> Optional[bool]:
-    """异步测试兼容层：仅传递函数签名接受的 fixture，避免参数不匹配."""
+    """异步测试执行钩子（避免与 pytest-anyio 冲突）。
+
+    若用例标注了 anyio/asyncio 等异步标记，则交由对应插件管理事件循环；
+    仅在无任何异步插件接管时，才启用手动事件循环以兼容旧测试。
+    """
 
     function = pyfuncitem.obj
     if not asyncio.iscoroutinefunction(function):
+        return None
+
+    # 交给 pytest-anyio / pytest-asyncio 管理
+    if "anyio" in pyfuncitem.keywords or "asyncio" in pyfuncitem.keywords:
         return None
 
     signature = inspect.signature(function)
@@ -61,9 +69,9 @@ def postgres_dsn() -> str:
 @pytest.fixture(scope="session")
 def postgres_pool(postgres_dsn: str) -> Iterable[ConnectionPool]:
     """提供 PostgreSQL 连接池（同步版本，用于 DeviceDirectory）"""
-    pool = ConnectionPool(postgres_dsn, min_size=1, max_size=2, open=True)
+    pool = ConnectionPool(postgres_dsn, min_size=1, max_size=1, open=True)
     try:
-        pool.wait()
+        pool.wait(timeout=60)
         yield pool
     finally:
         pool.close()
@@ -76,9 +84,9 @@ async def async_postgres_pool(postgres_dsn: str) -> AsyncIterator[AsyncConnectio
     参考：psycopg文档要求open()后必须wait()等待连接建立
     https://www.psycopg.org/psycopg3/docs/advanced/pool.html
     """
-    pool = AsyncConnectionPool(postgres_dsn, min_size=2, max_size=10, open=False)
+    pool = AsyncConnectionPool(postgres_dsn, min_size=1, max_size=1, open=False)
     await pool.open()
-    await pool.wait(timeout=10.0)
+    await pool.wait(timeout=60.0)
     try:
         yield pool
     finally:
@@ -164,7 +172,7 @@ def empty_risk_repository():
 
 
 @pytest.fixture(autouse=True)
-def cleanup_test_data(postgres_pool: ConnectionPool, request: pytest.FixtureRequest):
+def cleanup_test_data(request: pytest.FixtureRequest):
     """自动清理测试数据（所有 device_id 以 TEST- 开头的记录）"""
     # 只在集成测试中执行清理
     if "integration" not in request.keywords:
@@ -174,9 +182,10 @@ def cleanup_test_data(postgres_pool: ConnectionPool, request: pytest.FixtureRequ
     # 测试前不清理，允许测试准备数据
     yield
 
-    # 测试后清理
+    # 测试后清理（延迟获取postgres_pool）
     try:
-        with postgres_pool.connection() as conn:
+        pool = request.getfixturevalue("postgres_pool")
+        with pool.connection() as conn:
             conn.execute("DELETE FROM operational.device WHERE device_id LIKE 'TEST-%'")
             conn.commit()
     except Exception:

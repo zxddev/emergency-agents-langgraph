@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Mapping, NotRequired, Optional, Required, Sequence, Tuple, TypedDict, Awaitable
+from typing import Any, Callable, Dict, List, Mapping, NotRequired, Optional, Required, Sequence, Tuple, TypedDict, Awaitable, Literal, Iterable
 
 import structlog
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
@@ -24,6 +24,173 @@ from emergency_agents.intent.schemas import ScoutTaskGenerationSlots
 from emergency_agents.risk.repository import RiskDataRepository
 
 logger = structlog.get_logger(__name__)
+
+_SENSOR_DISPLAY_LABELS: Dict[str, str] = {
+    "camera": "高清相机",
+    "gas_detector": "气体检测",
+    "thermal_imaging": "热成像",
+    "sonar": "声呐",
+    "depth_camera": "深度成像",
+}
+
+_SENSOR_KEYWORDS: Dict[str, Iterable[str]] = {
+    "gas_detector": ("gas", "气", "有毒", "检测"),
+    "thermal_imaging": ("thermal", "infrared", "热成像", "红外"),
+    "sonar": ("sonar", "声呐"),
+    "depth_camera": ("depth", "lidar", "激光", "深度"),
+    "camera": ("camera", "visible", "video", "摄像", "光学"),
+}
+
+
+def _normalize_sensor_name(value: str) -> Optional[str]:
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    for token, keywords in _SENSOR_KEYWORDS.items():
+        if any(keyword in text for keyword in keywords):
+            return token
+    return None
+
+
+def _normalize_sensor_list(values: Iterable[str]) -> List[str]:
+    normalized: List[str] = []
+    for item in values:
+        token = _normalize_sensor_name(item)
+        if token:
+            normalized.append(token)
+    if not normalized:
+        normalized.append("camera")
+    seen: set[str] = set()
+    unique: List[str] = []
+    for item in normalized:
+        if item in seen:
+            continue
+        seen.add(item)
+        unique.append(item)
+    return unique
+
+
+def _sensor_display(tokens: Iterable[str]) -> str:
+    friendly: List[str] = []
+    for token in tokens:
+        label = _SENSOR_DISPLAY_LABELS.get(token, token.replace("_", " "))
+        friendly.append(label)
+    return "、".join(friendly)
+
+
+def _evaluate_device_selection(
+    *,
+    device_directory: DeviceDirectory,
+    required_sensors: Sequence[str],
+    prefer_device_type: Optional[DeviceType],
+) -> DeviceSelectionOutcome:
+    normalized_required = _normalize_sensor_list(required_sensors)
+
+    all_devices = list(device_directory.list_entries())
+    logger.info(
+        "device_selection_started",
+        total_devices=len(all_devices),
+        required_sensors=list(required_sensors),
+        normalized_required=normalized_required,
+        prefer_type=prefer_device_type.value if prefer_device_type else None,
+    )
+
+    if prefer_device_type:
+        candidates = [
+            dev for dev in all_devices if dev.device_type == prefer_device_type
+        ]
+    else:
+        candidates = all_devices
+
+    if not candidates:
+        logger.warning(
+            "device_selection_no_candidates",
+            required_sensors=normalized_required,
+        )
+        return {
+            "status": "none",
+            "missingSensors": list(normalized_required),
+            "coverageSensors": [],
+            "devices": [],
+            "usableDevices": [],
+        }
+
+    selected: List[SelectedDevice] = []
+    usable_devices: List[SelectedDevice] = []
+    coverage_tokens: set[str] = set()
+
+    for dev in candidates:
+        selected_dev: SelectedDevice = {
+            "device_id": dev.device_id,
+            "name": dev.name,
+            "device_type": dev.device_type.value if dev.device_type else "unknown",
+        }
+        if dev.vendor:
+            selected_dev["vendor"] = dev.vendor
+
+        capabilities: List[str] = []
+        if dev.device_type == DeviceType.UAV:
+            capabilities.extend(["flight", "camera", "gps"])
+        elif dev.device_type == DeviceType.ROBOTDOG:
+            capabilities.extend(["ground_movement", "camera", "thermal_imaging"])
+        elif dev.device_type == DeviceType.UGV:
+            capabilities.extend(["ground_movement", "camera", "depth_camera"])
+        elif dev.device_type == DeviceType.USV:
+            capabilities.extend(["water_surface", "sonar", "camera"])
+        if capabilities:
+            selected_dev["capabilities"] = capabilities
+
+        matched = [token for token in normalized_required if token in capabilities]
+        missing = [token for token in normalized_required if token not in matched]
+        if matched:
+            coverage_tokens.update(matched)
+            usable_devices.append(
+                {
+                    **selected_dev,
+                    "matchedSensors": matched,
+                    "missingSensors": missing,
+                }
+            )
+        selected_dev["matchedSensors"] = matched
+        selected_dev["missingSensors"] = missing
+        selected.append(selected_dev)
+
+    if not usable_devices:
+        logger.warning(
+            "device_selection_without_capability",
+            required_sensors=normalized_required,
+            candidate_ids=[dev["device_id"] for dev in selected],
+        )
+        return {
+            "status": "none",
+            "missingSensors": list(normalized_required),
+            "coverageSensors": [],
+            "devices": selected,
+            "usableDevices": [],
+        }
+
+    missing_overall = [token for token in normalized_required if token not in coverage_tokens]
+    status: Literal["full", "partial"]
+    if missing_overall:
+        status = "partial"
+    else:
+        status = "full"
+
+    outcome: DeviceSelectionOutcome = {
+        "status": status,
+        "missingSensors": missing_overall,
+        "coverageSensors": sorted(coverage_tokens),
+        "devices": selected,
+        "usableDevices": usable_devices,
+    }
+    logger.info(
+        "device_selection_completed",
+        status=status,
+        coverage=list(coverage_tokens),
+        missing=missing_overall,
+        usable_ids=[dev["device_id"] for dev in usable_devices],
+    )
+    return outcome
 
 
 class ScoutPlanOverview(TypedDict):
@@ -52,6 +219,7 @@ class ScoutPlan(TypedDict):
     intelRequirements: Required[List[Dict[str, Any]]]  # 情报需求 (必填)
     recommendedSensors: Required[List[str]]  # 推荐传感器 (必填)
     riskHints: Required[List[str]]  # 风险提示 (必填)
+    executionAdvice: NotRequired[Dict[str, Any]]  # 执行建议 (可选)
 
 
 class SelectedDevice(TypedDict):
@@ -61,6 +229,18 @@ class SelectedDevice(TypedDict):
     device_type: Required[str]  # 设备类型 (必填,如'uav','robotdog')
     vendor: NotRequired[Optional[str]]  # 厂商 (可选)
     capabilities: NotRequired[List[str]]  # 能力列表 (可选,如['flight','camera','infrared'])
+    matchedSensors: NotRequired[List[str]]  # 已覆盖传感器 (可选)
+    missingSensors: NotRequired[List[str]]  # 仍缺传感器 (可选)
+
+
+class DeviceSelectionOutcome(TypedDict):
+    """设备筛选结果摘要。"""
+
+    status: Required[Literal["full", "partial", "none"]]  # 覆盖状态
+    missingSensors: Required[List[str]]  # 整体仍缺的传感器
+    coverageSensors: Required[List[str]]  # 已覆盖的传感器
+    devices: Required[List[SelectedDevice]]  # 全量候选设备
+    usableDevices: Required[List[SelectedDevice]]  # 可实际执行的设备(具备至少一个传感器)
 
 
 class ReconWaypoint(TypedDict):
@@ -121,6 +301,7 @@ class ScoutTacticalState(TypedDict):
     # 节点输出 (可选,各节点逐步填充)
     scout_plan: NotRequired[ScoutPlan]  # 侦察计划 (build_intel_requirements输出)
     selected_devices: NotRequired[List[SelectedDevice]]  # 已选设备 (device_selection输出)
+    device_selection_result: NotRequired[DeviceSelectionOutcome]  # 设备筛选结果
     recon_route: NotRequired[ReconRoute]  # 侦察路线 (route_planning输出)
     sensor_assignments: NotRequired[List[SensorAssignment]]  # 传感器分配 (sensor_assignment输出)
     waypoint_risks: NotRequired[List[WaypointRisk]]  # 航点风险 (risk_overlay输出)
@@ -252,17 +433,28 @@ class ScoutTacticalGraph:
             required_sensors = plan.get("recommendedSensors", [])
 
             # 调用@task函数(闭包捕获self._device_directory)
-            selected_devices = await select_devices_for_recon_task(
+            selection = await select_devices_for_recon_task(
                 device_directory=self._device_directory,
                 required_sensors=required_sensors,
                 prefer_device_type=DeviceType.UAV,
             )
 
+            usable = selection["usableDevices"]
+            if not usable:
+                logger.warning(
+                    "device_selection_no_usable_device",
+                    missing=selection["missingSensors"],
+                )
+
             logger.info(
                 "device_selection_completed",
-                selected_count=len(selected_devices),
+                selected_count=len(usable),
+                status=selection["status"],
             )
-            return {"selected_devices": selected_devices}
+            return {
+                "selected_devices": usable,
+                "device_selection_result": selection,
+            }
 
         # ========== 节点3: route_planning ==========
         async def route_planning(state: ScoutTacticalState) -> Dict[str, Any]:
@@ -430,14 +622,19 @@ class ScoutTacticalGraph:
             输入: state所有数据
             输出: state["ui_actions"], state["response_text"]
             """
+            plan = state.get("scout_plan")
+            selection = state.get("device_selection_result")
+            advice: Optional[Dict[str, Any]] = None
+            if plan and selection:
+                advice = self._build_execution_advice(selection)
+                plan["executionAdvice"] = advice
+
             # 生成UI动作
             ui_result = await prepare_ui_actions_task(state)
             ui_actions = ui_result.get("ui_actions", [])
 
-            # 生成响应文本
-            plan = state.get("scout_plan")
             if plan:
-                response_text = self._compose_response(plan)
+                response_text = self._compose_response(plan, advice)
             else:
                 response_text = "侦察计划生成失败"
 
@@ -575,7 +772,7 @@ class ScoutTacticalGraph:
             dsn=postgres_dsn,
             schema=checkpoint_schema,
             min_size=1,  # 最小连接数
-            max_size=5,  # 最大连接数
+            max_size=1,  # 最大连接数
         )
         instance._checkpointer = checkpointer
         instance._checkpoint_close = close_cb
@@ -718,12 +915,40 @@ class ScoutTacticalGraph:
             "riskHints": risk_hints,
         }
 
-    def _compose_response(self, plan: ScoutPlan) -> str:
+    def _compose_response(self, plan: ScoutPlan, advice: Optional[Dict[str, Any]] = None) -> str:
         target_count = len(plan.get("targets", []))
         high = plan["overview"].get("riskSummary", {}).get("highSeverity", 0)
-        return (
-            f"已整理 {target_count} 个侦察目标，其中 {high} 个高风险点。已列出优先检查清单。"
-        )
+        base_text = f"已整理 {target_count} 个侦察目标，其中 {high} 个高风险点。已列出优先检查清单。"
+        if not advice:
+            return base_text
+
+        status = advice.get("status")
+        missing = advice.get("missingSensors", [])
+        if status == "none":
+            if missing:
+                return f"当前无可执行侦察设备，需要尽快补充：{_sensor_display(missing)}。"
+            return "当前无可执行侦察设备，请检查设备状态。"
+        if status == "partial" and missing:
+            return f"已生成基础侦察方案，但仍缺少：{_sensor_display(missing)}。请指挥员确认最小化执行并安排补充。"
+        return base_text
+
+    def _build_execution_advice(self, selection: DeviceSelectionOutcome) -> Dict[str, Any]:
+        status = selection["status"]
+        missing = selection["missingSensors"]
+        coverage = selection["coverageSensors"]
+        usable_ids = [device["device_id"] for device in selection["usableDevices"]]
+        advice: Dict[str, Any] = {
+            "status": status,
+            "missingSensors": missing,
+            "missingDisplay": _sensor_display(missing) if missing else "",
+            "coverageSensors": coverage,
+            "usableDevices": usable_ids,
+        }
+        if status != "full" and missing:
+            advice["recommendations"] = [
+                f"补充具备 { _sensor_display(missing) } 能力的侦察设备"
+            ]
+        return advice
 
     def _build_intel_requirements(
         self,
@@ -797,89 +1022,14 @@ def select_devices_for_recon_task(
     device_directory: DeviceDirectory,
     required_sensors: List[str],
     prefer_device_type: Optional[DeviceType] = None,
-) -> List[SelectedDevice]:
-    """设备选择任务 - 查询设备目录并按传感器需求筛选
+) -> DeviceSelectionOutcome:
+    """设备选择任务 - 查询设备目录并按传感器需求筛选。"""
 
-    这是一个带@task装饰器的幂等函数,用于:
-    1. 从设备目录查询所有可用设备
-    2. 按设备类型筛选(如只选UAV)
-    3. 根据传感器需求匹配设备能力
-
-    Args:
-        device_directory: 设备目录查询服务
-        required_sensors: 所需传感器列表(如['gas_detector','visible_light_camera'])
-        prefer_device_type: 优先设备类型(如DeviceType.UAV,可选)
-
-    Returns:
-        List[SelectedDevice]: 选中的设备列表(包含设备ID、名称、类型、能力)
-
-    幂等性保证: @task装饰器确保相同输入返回相同结果
-    """
-    # 从设备目录获取所有设备
-    all_devices = list(device_directory.list_entries())
-    logger.info(
-        "device_selection_started",
-        total_devices=len(all_devices),
+    return _evaluate_device_selection(
+        device_directory=device_directory,
         required_sensors=required_sensors,
-        prefer_type=prefer_device_type.value if prefer_device_type else None,
+        prefer_device_type=prefer_device_type,
     )
-
-    # 按设备类型筛选
-    candidates: List[DeviceEntry] = []
-    if prefer_device_type:
-        candidates = [
-            dev for dev in all_devices
-            if dev.device_type == prefer_device_type
-        ]
-        logger.info(
-            "device_selection_filtered_by_type",
-            prefer_type=prefer_device_type.value,
-            filtered_count=len(candidates),
-        )
-    else:
-        candidates = all_devices
-
-    # 如果没有设备,返回空列表
-    if not candidates:
-        logger.warning("device_selection_no_candidates", required_sensors=required_sensors)
-        return []
-
-    # 简化实现:暂时返回所有候选设备
-    # TODO: 未来可根据required_sensors精确匹配设备能力字段
-    selected: List[SelectedDevice] = []
-    for dev in candidates:
-        selected_dev: SelectedDevice = {
-            "device_id": dev.device_id,
-            "name": dev.name,
-            "device_type": dev.device_type.value if dev.device_type else "unknown",
-        }
-        if dev.vendor:
-            selected_dev["vendor"] = dev.vendor
-
-        # 根据设备类型推断能力(基于现有业务逻辑)
-        capabilities: List[str] = []
-        if dev.device_type == DeviceType.UAV:
-            capabilities.extend(["flight", "camera", "gps"])
-            if "gas" in " ".join(required_sensors).lower():
-                capabilities.append("gas_detector")
-        elif dev.device_type == DeviceType.ROBOTDOG:
-            capabilities.extend(["ground_movement", "camera", "thermal_imaging"])
-        elif dev.device_type == DeviceType.UGV:
-            capabilities.extend(["ground_movement", "camera"])
-        elif dev.device_type == DeviceType.USV:
-            capabilities.extend(["water_surface", "sonar", "camera"])
-
-        if capabilities:
-            selected_dev["capabilities"] = capabilities
-
-        selected.append(selected_dev)
-
-    logger.info(
-        "device_selection_completed",
-        selected_count=len(selected),
-        device_ids=[d["device_id"] for d in selected],
-    )
-    return selected
 
 
 @task
@@ -1365,6 +1515,16 @@ def prepare_ui_actions_task(
             "action": "show_risk_hints",
             "data": {
                 "hints": plan["riskHints"],
+            },
+        })
+    if plan and plan.get("executionAdvice"):
+        advice = plan["executionAdvice"]
+        ui_actions.append({
+            "action": "show_device_advice",
+            "data": {
+                "status": advice.get("status"),
+                "missingSensors": advice.get("missingSensors", []),
+                "recommendations": advice.get("recommendations", []),
             },
         })
 

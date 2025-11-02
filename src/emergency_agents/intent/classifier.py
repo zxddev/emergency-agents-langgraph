@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Any, Callable, Dict
 
 import structlog
 
@@ -140,8 +140,20 @@ def build_intent_classifier_runtime(
     cfg: AppConfig,
     llm_client,
     llm_model: str,
+    device_map_getter: Callable[[], Dict[str, str]] | None = None,
 ) -> IntentClassifierRuntime:
-    provider, fallback, thresholds = build_providers(cfg, llm_client, llm_model)
+    """构建意图分类运行时
+
+    Args:
+        cfg: 应用配置
+        llm_client: LLM客户端
+        llm_model: LLM模型名称
+        device_map_getter: 设备映射获取函数（可选），用于将设备名称解析为设备ID
+
+    Returns:
+        IntentClassifierRuntime实例
+    """
+    provider, fallback, thresholds = build_providers(cfg, llm_client, llm_model, device_map_getter)
     return IntentClassifierRuntime(provider=provider, fallback=fallback, thresholds=thresholds)
 
 
@@ -153,8 +165,20 @@ def intent_classifier_node(
     llm_client=None,
     llm_model: str | None = None,
     runtime: IntentClassifierRuntime | None = None,
+    device_map_getter: Callable[[], Dict[str, str]] | None = None,
 ) -> Dict[str, Any]:
-    """意图分类入口。runtime 明确传入时优先使用，否则使用全局默认。"""
+    """意图分类入口。runtime 明确传入时优先使用，否则使用全局默认。
+
+    Args:
+        state: LangGraph状态
+        llm_client: LLM客户端（可选）
+        llm_model: LLM模型名称（可选）
+        runtime: 预先构建的runtime（可选）
+        device_map_getter: 设备映射获取函数（可选）
+
+    Returns:
+        更新后的状态
+    """
     global _default_runtime
     if runtime is not None:
         return runtime(state)
@@ -163,5 +187,5 @@ def intent_classifier_node(
         if llm_client is None or llm_model is None:
             raise ValueError("intent_classifier_node requires runtime or (llm_client, llm_model)")
         cfg = AppConfig.load_from_env()
-        _default_runtime = build_intent_classifier_runtime(cfg, llm_client, llm_model)
+        _default_runtime = build_intent_classifier_runtime(cfg, llm_client, llm_model, device_map_getter)
     return _default_runtime(state)

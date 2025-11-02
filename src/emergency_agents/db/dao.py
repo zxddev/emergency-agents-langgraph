@@ -241,6 +241,88 @@ class DeviceDAO:
         )
         return record
 
+    async def fetch_video_device_by_name(self, device_name: str) -> VideoDevice | None:
+        """根据设备名称查询视频设备信息
+
+        Args:
+            device_name: 设备名称（如 "无人机A"、"机器狗01"）
+
+        Returns:
+            VideoDevice对象（包含id、stream_url等），如果未找到则返回None
+
+        Note:
+            使用 ILIKE 实现不区分大小写的模糊匹配
+        """
+        start = time.perf_counter()
+        query = """
+            SELECT d.id::text AS id,
+                   d.device_type,
+                   d.name,
+                   dd.device_detail->>'stream_url' AS stream_url
+              FROM operational.device d
+              LEFT JOIN operational.device_detail dd
+                     ON dd.device_id = d.id
+             WHERE d.name ILIKE %(device_name)s
+        """
+        async with self._pool.connection() as conn:
+            async with conn.cursor(row_factory=class_row(VideoDevice)) as cur:
+                await cur.execute(query, {"device_name": device_name})
+                record = await cur.fetchone()
+
+        duration = time.perf_counter() - start
+        DAO_CALL_LATENCY.labels("device", "fetch_video_by_name").observe(duration)
+        DAO_CALL_TOTAL.labels("device", "fetch_video_by_name", "found" if record else "not_found").inc()
+        logger.info(
+            "dao_device_fetch_video_by_name",
+            duration_ms=duration * 1000,
+            device_name=device_name,
+            has_stream=bool(record and record.stream_url),
+        )
+        return record
+
+    async def get_all_device_name_to_id_map(self) -> dict[str, str]:
+        """获取所有设备的名称到ID的映射
+
+        Returns:
+            字典 {设备名称: 设备ID}，用于意图识别时的设备名称解析
+
+        Example:
+            {
+                "无人机A": "550e8400-e29b-41d4-a716-446655440000",
+                "机器狗01": "660e8400-e29b-41d4-a716-446655440001",
+                ...
+            }
+
+        Note:
+            此映射会被传递给LLM，用于将用户输入的设备名称转换为设备ID
+        """
+        start = time.perf_counter()
+        query = """
+            SELECT d.id::text AS id,
+                   d.name
+              FROM operational.device d
+             WHERE d.name IS NOT NULL
+               AND d.name != ''
+             ORDER BY d.name
+        """
+        async with self._pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(query)
+                records = await cur.fetchall()
+
+        # 构建映射字典
+        device_map = {row[1]: row[0] for row in records}  # {name: id}
+
+        duration = time.perf_counter() - start
+        DAO_CALL_LATENCY.labels("device", "get_name_id_map").observe(duration)
+        DAO_CALL_TOTAL.labels("device", "get_name_id_map", "success").inc()
+        logger.info(
+            "dao_device_get_name_id_map",
+            duration_ms=duration * 1000,
+            device_count=len(device_map),
+        )
+        return device_map
+
 
 class TaskDAO:
     """任务查询接口。"""
@@ -617,7 +699,8 @@ class IncidentDAO:
             " ORDER BY severity DESC, updated_at DESC"
         )
         start = time.perf_counter()
-        async with self._pool.connection() as conn:
+        # 显式设置获取连接的超时时间，避免默认30秒在高并发/路径受限时过早超时
+        async with self._pool.connection(timeout=60.0) as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
                 await cur.execute(query, {"now": now})
                 rows = await cur.fetchall()

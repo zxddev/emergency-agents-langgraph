@@ -208,7 +208,7 @@ async def build_intent_orchestrator_graph(
         dsn=cfg.postgres_dsn,
         schema="intent_checkpoint",
         min_size=1,
-        max_size=5,
+        max_size=1,
     )
     logger.info("intent_graph_checkpointer_ready", schema="intent_checkpoint")
     compiled = state_graph.compile(checkpointer=checkpointer)

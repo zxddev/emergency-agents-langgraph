@@ -18,9 +18,9 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def client():
-    """FastAPI测试客户端"""
+    """FastAPI测试客户端（模块级复用，避免Prometheus metrics重复注册）"""
     from emergency_agents.api.main import app
     return TestClient(app)
 
@@ -35,6 +35,10 @@ def test_mem0_search_called_on_intent_process(client, mocker):
 
     参考: tasks.md lines 124-151
     """
+    # Mock Graph依赖（TestClient不触发startup，graph未初始化）
+    mocker.patch('emergency_agents.api.main._require_intent_graph', return_value=MagicMock())
+    mocker.patch('emergency_agents.api.main._require_voice_control_graph', return_value=MagicMock())
+
     mock_mem = mocker.patch('emergency_agents.api.main._mem')
     mock_mem.search.return_value = [
         {"memory": "意图: rescue-task-generate, 槽位: {\"location\": \"汶川\"}"}
@@ -93,6 +97,10 @@ def test_mem0_add_after_valid_intent(client, mocker):
 
     参考: tasks.md lines 174-189
     """
+    # Mock Graph依赖（TestClient不触发startup，graph未初始化）
+    mocker.patch('emergency_agents.api.main._require_intent_graph', return_value=MagicMock())
+    mocker.patch('emergency_agents.api.main._require_voice_control_graph', return_value=MagicMock())
+
     mock_mem = mocker.patch('emergency_agents.api.main._mem')
     mock_mem.search.return_value = []
 
@@ -140,6 +148,10 @@ def test_mem0_metrics_recorded_on_search(client, mocker):
 
     参考: tasks.md lines 109-118
     """
+    # Mock Graph依赖（TestClient不触发startup，graph未初始化）
+    mocker.patch('emergency_agents.api.main._require_intent_graph', return_value=MagicMock())
+    mocker.patch('emergency_agents.api.main._require_voice_control_graph', return_value=MagicMock())
+
     mock_mem = mocker.patch('emergency_agents.api.main._mem')
     mock_mem.search.return_value = []
 
@@ -185,6 +197,10 @@ def test_mem0_metrics_recorded_on_add(client, mocker):
 
     参考: 基于search指标模式推导
     """
+    # Mock Graph依赖（TestClient不触发startup，graph未初始化）
+    mocker.patch('emergency_agents.api.main._require_intent_graph', return_value=MagicMock())
+    mocker.patch('emergency_agents.api.main._require_voice_control_graph', return_value=MagicMock())
+
     mock_mem = mocker.patch('emergency_agents.api.main._mem')
     mock_mem.search.return_value = []
 

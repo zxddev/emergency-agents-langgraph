@@ -23,13 +23,13 @@ class VideoAnalysisHandler(IntentHandler[VideoAnalysisSlots]):
         """视频分析意图处理 - 基于 GLM-4V 视觉大模型
 
         流程：
-        1. 查询设备信息和视频流地址
+        1. 使用device_id查询设备信息和视频流地址
         2. 从视频流截取当前帧
         3. 调用 GLM-4V 进行场景分析
         4. 返回自然语言描述 + 结构化数据
 
         Args:
-            slots: 视频分析槽位（设备ID、分析目标）
+            slots: 视频分析槽位（device_id由LLM根据设备名称映射解析得到）
             state: 会话状态
 
         Returns:
@@ -38,6 +38,9 @@ class VideoAnalysisHandler(IntentHandler[VideoAnalysisSlots]):
         Reference:
             - video/vision.py: VisionAnalyzer 视觉分析器
             - video/frame_capture.py: VideoFrameCapture 帧截取工具
+
+        Note:
+            device_id应该在意图识别阶段由LLM根据设备名称映射表解析得到
         """
         logger.info(
             "video_analysis_start",

@@ -16,9 +16,15 @@ from emergency_agents.intent.handlers.base import IntentHandler
 from emergency_agents.intent.schemas import ScoutTaskGenerationSlots
 from emergency_agents.risk.repository import RiskDataRepository
 from emergency_agents.risk.service import RiskCacheManager
-from emergency_agents.ui.actions import camera_fly_to, open_panel, serialize_actions, show_risk_warning, UIAction
+from emergency_agents.ui.actions import camera_fly_to, open_panel, serialize_actions, show_risk_warning, show_toast, UIAction
 
 logger = structlog.get_logger(__name__)
+
+
+def _format_missing(tokens: Optional[List[str]]) -> str:
+    if not tokens:
+        return ""
+    return "、".join(token.replace("_", " ") for token in tokens)
 
 
 @dataclass
@@ -126,4 +132,25 @@ class ScoutTaskGenerationHandler(IntentHandler[ScoutTaskGenerationSlots]):
         actions.append(open_panel(panel="scout_plan", params={"plan": plan}, metadata=metadata))
         for hint in plan.get("riskHints", []):
             actions.append(show_risk_warning(str(hint), metadata=metadata))
+        advice = plan.get("executionAdvice") or {}
+        status = advice.get("status")
+        missing_display = advice.get("missingDisplay") or _format_missing(advice.get("missingSensors"))
+        if status in ("partial", "none"):
+            message = "当前侦察设备不足，请补充：" + missing_display if missing_display else "当前侦察设备不足，请补充必要传感器。"
+            level = "danger" if status == "none" else "warning"
+            actions.append(
+                show_risk_warning(
+                    message,
+                    metadata=metadata,
+                    level=level,
+                )
+            )
+            actions.append(
+                show_toast(
+                    message,
+                    level=level,
+                    duration_ms=8000,
+                    metadata=metadata,
+                )
+            )
         return serialize_actions(actions)

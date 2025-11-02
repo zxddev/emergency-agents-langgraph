@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List
 
 import structlog
 
@@ -23,12 +23,34 @@ _DEFAULT_SYSTEM_PROMPT = (
 )
 
 
-def _build_prompt(text: str) -> str:
-    """构造与统一意图模板一致的提示内容。"""
+def _build_prompt(text: str, device_map: Dict[str, str] | None = None) -> str:
+    """构造与统一意图模板一致的提示内容。
+
+    Args:
+        text: 用户输入文本
+        device_map: 设备名称到ID的映射（可选），用于LLM解析设备名称
+
+    Returns:
+        构造好的prompt字符串
+    """
     intent_lines = "\n".join(
         f"- {display}（内部标识: {canonical})"
         for canonical, display in sorted(INTENT_DISPLAY_MAP.items(), key=lambda item: item[1])
     )
+
+    # 构建设备映射说明
+    device_mapping_section = ""
+    if device_map:
+        device_lines = "\n".join(
+            f"  - 「{name}」 → {device_id}"
+            for name, device_id in sorted(device_map.items())
+        )
+        device_mapping_section = (
+            "\n\n## 可用设备映射表\n"
+            "当用户提到设备名称时，请从以下映射中找到对应的设备ID填充到 `slots.device_id`：\n"
+            f"{device_lines}\n"
+            "**重要**：如果用户说的设备名称不在上述列表中，`device_id` 必须保持为 null，不得编造。\n"
+        )
     schema_example = {
         "intent_type": "RESCUE_TASK_GENERATION",
         "slots": {
@@ -70,7 +92,8 @@ def _build_prompt(text: str) -> str:
         "意图判定指引：\n"
         "- 语句中出现建筑/设施倒塌、人员被困、伤亡、请求支援、需要立即处置等表述，一律判定为 `RESCUE_TASK_GENERATION`，即便用户只是在汇报现象，也代表需要生成救援行动。\n"
         "- 仅在纯信息播报、无行动需求的情况下使用 `HAZARD_REPORT`。\n"
-        "- 当用户给出的描述过于笼统（只提到灾种或灾点，未说明人数、障碍、危险源等细节）时，将 `situation_summary` 置为 null，交由系统追问更具体细节；像“XX地震，建筑倒塌”这种单句概述也视为细节不足。\n\n"
+        "- 当用户给出的描述过于笼统（只提到灾种或灾点，未说明人数、障碍、危险源等细节）时，将 `situation_summary` 置为 null，交由系统追问更具体细节；像"XX地震，建筑倒塌"这种单句概述也视为细节不足。\n\n"
+        f"{device_mapping_section}"  # 插入设备映射说明
         f"示例结构：\n{json.dumps(schema_example, ensure_ascii=False, indent=2)}\n\n"
         f"指挥员输入：{text}\n"
         "请只返回JSON，不要附加解释。"
@@ -162,24 +185,46 @@ def _parse_prediction(raw_text: str) -> IntentPrediction:
 
 
 class LLMIntentProvider(IntentProvider):
-    """利用LLM直接完成意图识别。"""
+    """利用LLM直接完成意图识别。
+
+    支持动态设备映射，用于LLM将用户输入的设备名称解析为设备ID。
+    """
 
     def __init__(
         self,
         llm_client: LLMClientProtocol,
         model: str,
         system_prompt: str | None = None,
+        device_map_getter: Callable[[], Dict[str, str]] | None = None,
     ) -> None:
+        """初始化LLM意图识别器
+
+        Args:
+            llm_client: LLM客户端
+            model: 模型名称
+            system_prompt: 系统提示词（可选）
+            device_map_getter: 设备映射获取函数（可选），返回 {设备名称: 设备ID} 字典
+                            例如: lambda: {"无人机A": "uav-001", "机器狗01": "dog-001"}
+        """
         super().__init__("llm")
         self._llm_client = llm_client
         self._model = model
         self._system_prompt = system_prompt or _DEFAULT_SYSTEM_PROMPT
+        self._device_map_getter = device_map_getter
 
-    def _build_messages(self, text: str) -> list[dict[str, str]]:
-        """构造聊天消息。"""
+    def _build_messages(self, text: str, device_map: Dict[str, str] | None = None) -> list[dict[str, str]]:
+        """构造聊天消息。
+
+        Args:
+            text: 用户输入文本
+            device_map: 设备名称到ID的映射（可选）
+
+        Returns:
+            消息列表
+        """
         return [
             {"role": "system", "content": self._system_prompt},
-            {"role": "user", "content": _build_prompt(text)},
+            {"role": "user", "content": _build_prompt(text, device_map)},
         ]
 
     def predict(self, text: str) -> IntentPrediction:
@@ -187,7 +232,17 @@ class LLMIntentProvider(IntentProvider):
         if not text or not text.strip():
             raise ValueError("意图识别文本为空")
 
-        messages = self._build_messages(text)
+        # 获取设备映射（如果配置了）
+        device_map: Dict[str, str] | None = None
+        if self._device_map_getter:
+            try:
+                device_map = self._device_map_getter()
+                logger.debug("device_map_loaded", device_count=len(device_map) if device_map else 0)
+            except Exception as exc:
+                logger.warning("device_map_load_failed", error=str(exc))
+                # 映射加载失败不影响主流程，继续执行（LLM会提示用户设备ID为null）
+
+        messages = self._build_messages(text, device_map)
         logger.debug("llm_intent_request", model=self._model, message_preview=text[:80])
         response = self._llm_client.chat.completions.create(
             model=self._model,
