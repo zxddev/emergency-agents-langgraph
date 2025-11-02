@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 import importlib
@@ -64,8 +64,17 @@ async def test_scout_handler_generates_plan(
 
     # 创建 Mock 依赖（Handler 会懒加载 Graph）
     # 注意：DeviceDirectory使用真实fixture（集成测试）
-    mock_amap_client = Mock(spec=AmapClient)
-    mock_orchestrator = Mock(spec=OrchestratorClient)
+    # AmapClient是异步客户端，使用AsyncMock并配置返回值
+    mock_amap_client = AsyncMock()
+    mock_amap_client.direction.return_value = {
+        "distance_meters": 1500,
+        "duration_seconds": 180,
+        "steps": [],
+        "cache_hit": False,
+    }
+    # OrchestratorClient是同步客户端，使用Mock
+    mock_orchestrator = Mock()
+    mock_orchestrator.publish_scout_scenario.return_value = {"success": True}
 
     # 创建 Handler（使用新的懒加载模式）
     # 注意：postgres_dsn, pool, device_directory需要真实值以支持LangGraph graph构建
@@ -85,10 +94,11 @@ async def test_scout_handler_generates_plan(
     )
 
     # 准备状态字典
+    # 注意：incident_id必须是有效UUID（和integration测试一致）
     state: Dict[str, Any] = {
         "user_id": "u1",
-        "thread_id": "thread-1",
-        "conversation_context": {"incident_id": "incident-1"},
+        "thread_id": "thread-scout-handler-1",
+        "conversation_context": {"incident_id": "fef8469f-5f78-4dd4-8825-dbc915d1b630"},
     }
 
     # 执行 Handler（内部会懒加载 ScoutTacticalGraph）
