@@ -21,7 +21,7 @@ ON CONFLICT (id) DO UPDATE SET
 INSERT INTO operational.device (id, name, device_type, env_type, model, vendor, is_virtual, is_recon, deleted_at)
 VALUES
     ('TEST-UGV-001', '测试宇树Go2', 'ROBOTDOG', 'land', 'Go2', 'Unitree', 0, true, NULL),
-    ('TEST-UGV-002', '测试波士顿动力Spot', 'ROBOTDOG', 'land', 'Spot', 'Boston Dynamics', 0, false, NULL)
+    ('TEST-UGV-002', '测试波士顿动力Spot', 'ROBOTDOG', 'land', 'Spot', 'BostonDyn', 0, false, NULL)
 ON CONFLICT (id) DO UPDATE SET
     name = EXCLUDED.name,
     device_type = EXCLUDED.device_type,

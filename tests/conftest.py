@@ -110,9 +110,22 @@ def empty_risk_repository():
                     zone_name="测试化工园区",
                     hazard_type="chemical_leak",
                     severity=4,
-                    center_lat=30.2741,
-                    center_lng=120.1551,
-                    radius_meters=500,
+                    description="化工泄漏风险区域",
+                    geometry_geojson={
+                        "type": "Polygon",
+                        "coordinates": [
+                            [
+                                [120.1551, 30.2741],
+                                [120.1551, 30.2796],
+                                [120.1606, 30.2796],
+                                [120.1606, 30.2741],
+                                [120.1551, 30.2741],
+                            ]
+                        ],
+                    },
+                    properties={},
+                    valid_from=now,
+                    valid_until=None,
                     created_at=now,
                     updated_at=now,
                 )

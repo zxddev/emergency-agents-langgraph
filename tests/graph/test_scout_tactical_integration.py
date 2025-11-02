@@ -44,10 +44,12 @@ logger = logging.getLogger(__name__)
 
 def _create_test_state_minimal() -> ScoutTacticalState:
     """创建最小化测试状态(仅包含 Required 字段)"""
+    import uuid
+
     return ScoutTacticalState(
         incident_id="test-incident-001",
         user_id="test-user",
-        thread_id="test-thread-001",
+        thread_id=f"test-thread-{uuid.uuid4().hex[:8]}",  # 使用唯一ID避免checkpoint冲突
     )
 
 
@@ -89,8 +91,15 @@ async def test_device_selection_with_real_db(
     _prepare_test_devices(postgres_pool)
 
     # 创建测试所需的依赖（Mock 未测试的组件）
-    mock_amap_client = Mock(spec=AmapClient)  # 不测试路线规划，使用 Mock
-    mock_orchestrator = Mock(spec=OrchestratorClient)  # 不测试后端通知，使用 Mock
+    from unittest.mock import AsyncMock
+
+    # Mock AmapClient（允许任意方法调用，返回 None 触发降级逻辑）
+    mock_amap_client = AsyncMock()
+
+    # Mock OrchestratorClient（不验证后端通知）
+    mock_orchestrator = AsyncMock()
+    mock_orchestrator.publish_scout_scenario.return_value = {"success": True}
+
     task_repository = RescueTaskRepository.create(postgres_pool)
     postgres_dsn = os.getenv("POSTGRES_DSN", "postgresql://rescue:rescue_password@localhost:5432/rescue_system")
 
@@ -162,7 +171,12 @@ async def test_route_planning_with_real_amap(
     _prepare_test_devices(postgres_pool)
 
     # 创建测试所需的依赖（Mock 未测试的组件）
-    mock_orchestrator = Mock(spec=OrchestratorClient)  # 不测试后端通知，使用 Mock
+    from unittest.mock import AsyncMock
+
+    # Mock OrchestratorClient（不验证后端通知）
+    mock_orchestrator = AsyncMock()
+    mock_orchestrator.publish_scout_scenario.return_value = {"success": True}
+
     task_repository = RescueTaskRepository.create(postgres_pool)
     postgres_dsn = os.getenv("POSTGRES_DSN", "postgresql://rescue:rescue_password@localhost:5432/rescue_system")
 
