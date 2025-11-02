@@ -15,6 +15,7 @@ from emergency_agents.external.orchestrator_client import OrchestratorClient
 from emergency_agents.graph.kg_service import KGService
 from emergency_agents.intent.handlers import (
     DeviceControlHandler,
+    RobotDogControlHandler,
     LocationPositioningHandler,
     RescueSimulationHandler,
     RescueTaskGenerationHandler,
@@ -89,10 +90,14 @@ class IntentHandlerRegistry:
             pool=pool,
         )
 
+        robotdog_control = RobotDogControlHandler(adapter_client, default_robotdog_id)
+
         handlers: Dict[str, Any] = {
             "task-progress-query": TaskProgressQueryHandler(task_dao),
             "location-positioning": LocationPositioningHandler(location_dao, amap_client),
             "device-control": DeviceControlHandler(device_dao, adapter_client, default_robotdog_id),
+            "device-control-robotdog": robotdog_control,
+            "device_control_robotdog": robotdog_control,
             "video-analysis": VideoAnalysisHandler(device_dao, video_stream_map, vllm_url),
             "rescue-task-generate": rescue_generation,
             "rescue_task_generate": rescue_generation,

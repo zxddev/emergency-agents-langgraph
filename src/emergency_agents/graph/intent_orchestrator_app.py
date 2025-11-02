@@ -6,7 +6,7 @@ import time
 from typing import Any, Callable, Dict, Literal, Optional
 
 import structlog
-from typing_extensions import Annotated, TypedDict
+from typing_extensions import Annotated, NotRequired, Required, TypedDict
 
 from langgraph.graph import StateGraph
 from langgraph.graph.message import add_messages
@@ -18,26 +18,39 @@ from emergency_agents.graph.checkpoint_utils import create_async_postgres_checkp
 logger = structlog.get_logger(__name__)
 
 
-class IntentOrchestratorState(TypedDict, total=False):
-    """意图编排状态。"""
+class IntentOrchestratorState(TypedDict):
+    """意图编排状态。
 
-    thread_id: str
-    user_id: str
-    channel: Literal["voice", "text", "system"]
-    incident_id: str
-    raw_text: str
-    metadata: Dict[str, Any]
-    messages: Annotated[list[Dict[str, Any]], add_messages]
-    intent: Dict[str, Any]
-    intent_prediction: Dict[str, Any]
-    validation_status: Literal["valid", "invalid", "failed"]
-    missing_fields: list[str]
-    prompt: Optional[str]
-    validation_attempt: int
-    memory_hits: list[Dict[str, Any]]
-    router_next: str
-    router_payload: Dict[str, Any]
-    audit_log: list[Dict[str, Any]]
+    核心标识字段（Required）：thread_id, user_id, channel, raw_text
+    其他字段（NotRequired）：在图执行过程中逐步填充
+    """
+
+    # 核心标识字段（必填）
+    thread_id: Required[str]
+    user_id: Required[str]
+    channel: Required[Literal["voice", "text", "system"]]
+    raw_text: Required[str]
+
+    # 业务字段（可选）
+    incident_id: NotRequired[str]
+    metadata: NotRequired[Dict[str, Any]]
+    messages: NotRequired[Annotated[list[Dict[str, Any]], add_messages]]
+
+    # 意图识别流程字段（可选）
+    intent: NotRequired[Dict[str, Any]]
+    intent_prediction: NotRequired[Dict[str, Any]]
+    validation_status: NotRequired[Literal["valid", "invalid", "failed"]]
+    missing_fields: NotRequired[list[str]]
+    prompt: NotRequired[Optional[str]]
+    validation_attempt: NotRequired[int]
+    memory_hits: NotRequired[list[Dict[str, Any]]]
+
+    # 路由字段（可选）
+    router_next: NotRequired[str]
+    router_payload: NotRequired[Dict[str, Any]]
+
+    # 审计字段（可选）
+    audit_log: NotRequired[list[Dict[str, Any]]]
 
 
 async def build_intent_orchestrator_graph(
@@ -150,6 +163,7 @@ async def build_intent_orchestrator_graph(
             "task-progress-query": "task-progress-query",
             "location-positioning": "location-positioning",
             "video-analysis": "video-analysis",
+            "video-analyze": "video-analysis",
             "ui-camera-flyto": "ui_camera_flyto",
             "ui-toggle-layer": "ui_toggle_layer",
         }

@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import TypedDict, Literal
+from typing import Literal
+from typing_extensions import NotRequired, Required, TypedDict
 
 import structlog
 
@@ -39,48 +40,61 @@ class Status(str, Enum):
     ERROR = "error"
 
 
-class RescueState(TypedDict, total=False):
-    rescue_id: str
-    user_id: str
-    status: Literal["init", "awaiting_approval", "running", "completed", "error"]
-    messages: list
-    error_count: int
-    max_steps: int
-    last_error: dict
-    
-    raw_report: str
-    situation: dict
-    primary_disaster: dict
-    secondary_disasters: list
-    predicted_risks: list
-    timeline: list
-    compound_risks: list
-    available_resources: dict
-    blocked_roads: list
-    
-    proposals: list
-    approved_ids: list
-    executed_actions: list
-    
-    plan: dict
-    plan_approved: bool
-    alternative_plans: list
-    
-    equipment_recommendations: list
-    risk_level: int
-    hazards: list
-    
-    pending_memories: list
-    committed_memories: list
-    
-    uav_tracks: list
-    fleet_position: dict
-    integration_logs: list
-    pending_entities: list
-    pending_events: list
-    pending_annotations: list
-    annotations: list
-    tasks: list
+class RescueState(TypedDict):
+    """救援主流程状态定义。
+
+    核心标识字段（Required）：rescue_id, user_id, raw_report
+    其他字段（NotRequired）：在图执行过程中逐步填充
+    """
+
+    # 核心标识字段（必填）
+    rescue_id: Required[str]
+    user_id: Required[str]
+    raw_report: Required[str]
+
+    # 流程控制字段（可选）
+    status: NotRequired[Literal["init", "awaiting_approval", "running", "completed", "error"]]
+    messages: NotRequired[list]
+    error_count: NotRequired[int]
+    max_steps: NotRequired[int]
+    last_error: NotRequired[dict]
+
+    # 态势感知字段（可选）
+    situation: NotRequired[dict]
+    primary_disaster: NotRequired[dict]
+    secondary_disasters: NotRequired[list]
+    predicted_risks: NotRequired[list]
+    timeline: NotRequired[list]
+    compound_risks: NotRequired[list]
+    available_resources: NotRequired[dict]
+    blocked_roads: NotRequired[list]
+
+    # 方案生成字段（可选）
+    proposals: NotRequired[list]
+    approved_ids: NotRequired[list]
+    executed_actions: NotRequired[list]
+    plan: NotRequired[dict]
+    plan_approved: NotRequired[bool]
+    alternative_plans: NotRequired[list]
+
+    # 装备推荐字段（可选）
+    equipment_recommendations: NotRequired[list]
+    risk_level: NotRequired[int]
+    hazards: NotRequired[list]
+
+    # 记忆管理字段（可选）
+    pending_memories: NotRequired[list]
+    committed_memories: NotRequired[list]
+
+    # 集成字段（可选）
+    uav_tracks: NotRequired[list]
+    fleet_position: NotRequired[dict]
+    integration_logs: NotRequired[list]
+    pending_entities: NotRequired[list]
+    pending_events: NotRequired[list]
+    pending_annotations: NotRequired[list]
+    annotations: NotRequired[list]
+    tasks: NotRequired[list]
 
 
 async def build_app(sqlite_path: str = "./checkpoints.sqlite3", postgres_dsn: str | None = None):
