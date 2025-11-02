@@ -383,8 +383,9 @@ async def generate_rescue_assessment(payload: RescueAssessmentInput) -> RescueAs
     llm_start = time.perf_counter()
 
     try:
+        # 使用 glm-4.6 模型生成报告（专用于救援评估报告生成）
         completion = llm_client.chat.completions.create(
-            model=cfg.llm_model,
+            model="glm-4.6",
             temperature=0.2,
             max_tokens=2000,
             presence_penalty=0,
