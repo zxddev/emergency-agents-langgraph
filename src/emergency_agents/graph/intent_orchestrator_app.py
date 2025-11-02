@@ -143,6 +143,8 @@ async def build_intent_orchestrator_graph(
             "rescue-task-generate": "rescue-task-generate",
             "rescue-task-generation": "rescue-task-generate",
             "rescue-simulation": "rescue-simulation",
+            "scout-task-generate": "scout-task-generate",
+            "scout-task-generation": "scout-task-generate",  # 兼容性别名
             "device-control": "device-control",
             "device-control-robotdog": "device_control_robotdog",
             "task-progress-query": "task-progress-query",
@@ -152,6 +154,25 @@ async def build_intent_orchestrator_graph(
             "ui-toggle-layer": "ui_toggle_layer",
         }
         router_next = route_map.get(normalized, "unknown")
+
+        # 结构化日志：记录路由决策过程
+        logger.info(
+            "intent_routing",
+            raw_intent=intent_type,
+            normalized_intent=normalized,
+            router_target=router_next,
+            thread_id=state.get("thread_id"),
+            user_id=state.get("user_id"),
+        )
+
+        # Scout任务额外日志（用于监控侦察任务流量）
+        if router_next == "scout-task-generate":
+            logger.info(
+                "scout_task_routed",
+                thread_id=state.get("thread_id"),
+                incident_id=state.get("incident_id"),
+                slots=intent.get("slots", {}),
+            )
 
         audit = _append_audit(
             state,
