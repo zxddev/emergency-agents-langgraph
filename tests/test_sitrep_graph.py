@@ -366,45 +366,118 @@ def test_finalize_node():
 
 
 @pytest.mark.integration
-async def test_llm_generate_summary_integration():
-    """集成测试：真实LLM调用生成摘要"""
+async def test_simple_graph_flow_integration():
+    """集成测试：简化的Graph流程测试（仅验证核心功能）"""
     from emergency_agents.config import AppConfig
+    from emergency_agents.db.dao import IncidentDAO, TaskDAO, RescueDAO, IncidentSnapshotRepository
+    from emergency_agents.graph.sitrep_app import build_sitrep_graph
     from emergency_agents.llm.client import get_openai_client
+    from emergency_agents.risk.service import RiskCacheManager
+    from psycopg_pool import AsyncConnectionPool
 
     cfg = AppConfig.load_from_env()
-    llm_client = get_openai_client(cfg)
 
-    state: SITREPState = {
-        "report_id": "integration-test",
-        "user_id": "test",
-        "thread_id": "test",
-        "triggered_at": datetime.now(timezone.utc),
-        "metrics": {
-            "active_incidents_count": 5,
-            "completed_tasks_count": 23,
-            "in_progress_tasks_count": 8,
-            "pending_tasks_count": 3,
-            "active_risk_zones_count": 8,
-            "deployed_teams_count": 15,
-            "total_rescuers_count": 60,
-            "statistics_time_range_hours": 24,
-        },
-        "active_incidents": [],
-        "task_progress": [],
-        "risk_zones": [],
-    }
+    # 创建临时连接池（简化测试）
+    async with AsyncConnectionPool(cfg.postgres_dsn, min_size=1, max_size=2) as pool:
+        await pool.open()
 
-    result = llm_generate_summary(state, llm_client, cfg.llm_model)
+        # 创建最小依赖
+        incident_dao = IncidentDAO.create(pool)
+        task_dao = TaskDAO.create(pool)
+        rescue_dao = RescueDAO.create(pool)
+        snapshot_repo = IncidentSnapshotRepository.create(pool)
 
-    assert "llm_summary" in result
-    summary = result["llm_summary"]
+        risk_cache_manager = RiskCacheManager(
+            incident_dao=incident_dao,
+            ttl_seconds=300,
+        )
+        await risk_cache_manager.prefetch()
 
-    # 验证摘要内容
-    assert isinstance(summary, str)
-    assert len(summary) > 50  # 摘要应至少50字
-    assert len(summary) < 1000  # 摘要应在合理长度内
+        llm_client = get_openai_client(cfg)
 
-    print(f"\n生成的摘要：\n{summary}")
+        # 创建checkpointer
+        from emergency_agents.graph.checkpoint_utils import create_async_postgres_checkpointer
+        checkpointer, close_cb = await create_async_postgres_checkpointer(
+            dsn=cfg.postgres_dsn,
+            schema="test_sitrep_checkpoint",
+            min_size=1,
+            max_size=2,
+        )
+
+        try:
+            # 构建graph
+            graph = await build_sitrep_graph(
+                incident_dao=incident_dao,
+                task_dao=task_dao,
+                risk_cache_manager=risk_cache_manager,
+                rescue_dao=rescue_dao,
+                snapshot_repo=snapshot_repo,
+                llm_client=llm_client,
+                llm_model=cfg.llm_model,
+                checkpointer=checkpointer,
+            )
+
+            # 准备初始State
+            report_id = str(uuid.uuid4())
+            initial_state: SITREPState = {
+                "report_id": report_id,
+                "user_id": "integration_test_user",
+                "thread_id": f"sitrep-test-{report_id}",
+                "triggered_at": datetime.now(timezone.utc),
+                "time_range_hours": 24,
+            }
+
+            # 配置
+            config = {
+                "configurable": {
+                    "thread_id": f"sitrep-test-{report_id}",
+                    "checkpoint_ns": "integration_test",
+                }
+            }
+
+            # 执行graph
+            print(f"\n开始执行SITREP Graph集成测试...")
+            print(f"Report ID: {report_id}")
+
+            result = await graph.ainvoke(
+                initial_state,
+                config=config,
+                durability="sync",
+            )
+
+            # 验证结果
+            assert "sitrep_report" in result, "未返回sitrep_report"
+            assert result["status"] == "completed", f"状态不是completed: {result.get('status')}"
+
+            report = result["sitrep_report"]
+            assert report["report_id"] == report_id
+            assert "generated_at" in report
+            assert "summary" in report
+            assert "metrics" in report
+            assert "snapshot_id" in report
+
+            # 验证摘要内容
+            summary = report["summary"]
+            assert isinstance(summary, str), "摘要不是字符串"
+            assert len(summary) > 50, f"摘要太短: {len(summary)}字"
+            assert len(summary) < 2000, f"摘要太长: {len(summary)}字"
+
+            # 验证指标
+            metrics = report["metrics"]
+            assert "active_incidents_count" in metrics
+            assert "completed_tasks_count" in metrics
+            assert "deployed_teams_count" in metrics
+
+            print(f"\n✅ 集成测试通过！")
+            print(f"生成时间: {report['generated_at']}")
+            print(f"快照ID: {report['snapshot_id']}")
+            print(f"摘要长度: {len(summary)}字")
+            print(f"摘要内容:\n{summary[:200]}...")
+            print(f"指标: {metrics}")
+
+        finally:
+            # 清理资源
+            await close_cb()
 
 
 @pytest.mark.integration

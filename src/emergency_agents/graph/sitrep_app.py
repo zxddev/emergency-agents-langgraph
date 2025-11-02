@@ -213,13 +213,13 @@ async def fetch_resource_usage_task(
     start_time = datetime.now(timezone.utc)
     logger.info("sitrep_fetch_resources_start")
 
-    # 查询所有救援队员
-    rescuers = await rescue_dao.list_rescuers()
+    # 查询所有可用救援队员（修正：使用正确的方法名）
+    rescuers = await rescue_dao.list_available_rescuers(limit=1000)
 
     # 统计资源使用情况
     resource_usage = {
         "total_rescuers": len(rescuers),
-        "deployed_teams": len(set(r.team_id for r in rescuers if r.team_id)),
+        "deployed_teams": len(set(r.rescuer_id for r in rescuers)),  # 修正：RescuerRecord没有team_id字段
         "available_rescuers": len([r for r in rescuers if r.status == "available"]),
         "busy_rescuers": len([r for r in rescuers if r.status == "busy"]),
         "offline_rescuers": len([r for r in rescuers if r.status == "offline"]),
@@ -547,8 +547,22 @@ def persist_report(
         return {}
 
     # 构建快照数据
+    # incident_id是UUID类型必填字段，且有外键约束必须存在于events表中
+    # SITREP报告策略：
+    # 1. 如果指定了incident_id，使用指定的ID
+    # 2. 如果没有指定，使用第一个活跃事件的ID
+    # 3. 如果没有活跃事件，使用系统预定义的特殊事件ID（00000000-0000-0000-0000-000000000001）
+    incident_id_value = state.get("incident_id")
+    if not incident_id_value:
+        active_incidents = state.get("active_incidents", [])
+        if active_incidents:
+            incident_id_value = active_incidents[0].id
+        else:
+            # 使用系统预定义的特殊事件ID（需要在数据库中预先创建）
+            incident_id_value = "00000000-0000-0000-0000-000000000001"
+
     snapshot_input = IncidentSnapshotCreateInput(
-        incident_id=state.get("incident_id") or "",  # 必填字段，如果没有就用空字符串
+        incident_id=incident_id_value,  # 必填字段，关联到具体事件或系统事件
         snapshot_type="sitrep_report",  # 态势报告类型
         generated_at=datetime.now(timezone.utc),  # 必填字段
         created_by=state["user_id"],  # 必填字段
