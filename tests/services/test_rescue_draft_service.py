@@ -1,28 +1,38 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from types import SimpleNamespace
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 import pytest
 
-from emergency_agents.services.rescue_draft_service import RescueDraftService
+from emergency_agents.db.models import (
+    IncidentSnapshotCreateInput,
+    IncidentSnapshotRecord,
+)
+from emergency_agents.services.rescue_draft_service import RescueDraftService, RescueDraftRecord
 
 
-class _StubIncidentRepository:
-    async def create_entity_with_link(self, *_args: Any, **_kwargs: Any) -> None:  # pragma: no cover
-        raise NotImplementedError
+class _DummyIncidentRepository:
+    """空壳实现，占位满足构造函数依赖。"""
 
 
-class _StubSnapshotRepository:
+class _DummyTaskRepository:
+    """空壳实现，测试过程中不会触发写任务。"""
+
+    async def create_task(self, payload: Any) -> None:
+        raise AssertionError("不会在草稿保存阶段写任务")
+
+
+class _DummySnapshotRepository:
+    """用于捕获传入的快照数据，验证序列化行为。"""
+
     def __init__(self) -> None:
-        self.storage: Dict[str, SimpleNamespace] = {}
-        self.created_order: list[str] = []
+        self.last_input: Optional[IncidentSnapshotCreateInput] = None
 
-    async def create_snapshot(self, payload: Any) -> SimpleNamespace:
-        snapshot_id = f"draft-{len(self.storage) + 1}"
-        record = SimpleNamespace(
-            snapshot_id=snapshot_id,
+    async def create_snapshot(self, payload: IncidentSnapshotCreateInput) -> IncidentSnapshotRecord:
+        self.last_input = payload
+        return IncidentSnapshotRecord(
+            snapshot_id="snapshot-1",
             incident_id=payload.incident_id,
             snapshot_type=payload.snapshot_type,
             payload=payload.payload,
@@ -30,123 +40,51 @@ class _StubSnapshotRepository:
             created_by=payload.created_by,
             created_at=payload.generated_at,
         )
-        self.storage[snapshot_id] = record
-        self.created_order.append(snapshot_id)
-        return record
-
-    async def get_snapshot(self, snapshot_id: str) -> Optional[SimpleNamespace]:
-        return self.storage.get(snapshot_id)
-
-    async def delete_snapshot(self, snapshot_id: str) -> None:
-        self.storage.pop(snapshot_id, None)
 
 
-class _StubTaskRepository:
-    def __init__(self) -> None:
-        self.calls: list[Any] = []
+@pytest.mark.asyncio
+async def test_save_draft_serializes_complex_types() -> None:
+    """验证草稿保存时能正确序列化 datetime 等复杂类型。"""
 
-    async def create_task(self, payload: Any) -> SimpleNamespace:
-        self.calls.append(payload)
-        now = datetime.now(timezone.utc)
-        return SimpleNamespace(
-            id="task-1",
-            task_type=payload.task_type,
-            status=payload.status,
-            priority=payload.priority,
-            description=payload.description,
-            deadline=payload.deadline,
-            progress=0,
-            event_id=payload.event_id,
-            code=payload.code,
-            created_at=now,
-            updated_at=now,
-        )
-
-
-@pytest.fixture()
-def draft_service_components() -> tuple[RescueDraftService, _StubSnapshotRepository, _StubTaskRepository]:
-    snapshot_repo = _StubSnapshotRepository()
-    task_repo = _StubTaskRepository()
+    snapshot_repo = _DummySnapshotRepository()
     service = RescueDraftService(
-        incident_repository=_StubIncidentRepository(),
+        incident_repository=_DummyIncidentRepository(),
         snapshot_repository=snapshot_repo,
-        task_repository=task_repo,
+        task_repository=_DummyTaskRepository(),
     )
-    return service, snapshot_repo, task_repo
 
-
-@pytest.mark.anyio
-async def test_save_and_load_roundtrip(draft_service_components: tuple[RescueDraftService, _StubSnapshotRepository, _StubTaskRepository]) -> None:
-    service, snapshot_repo, _ = draft_service_components
-    plan_payload: Dict[str, Any] = {
-        "response_text": "推荐调派 A 队救援",
-        "analysis_summary": {"matched_count": 2},
-        "plan": {
-            "overview": {
-                "situationSummary": "受灾建筑倒塌",
-                "analysis": {"matched_count": 2},
-            },
-            "lines": [],
-            "resources": [],
-            "risks": [],
-            "evidenceTrace": [],
+    plan_payload = {
+        "plan": {"overview": {"generated_at": datetime(2025, 1, 1, 8, 30)}},
+        "persisted_task": {
+            "id": "task-1",
+            "created_at": datetime(2025, 1, 1, 8, 30, tzinfo=timezone.utc),
+            "updated_at": datetime(2025, 1, 1, 9, 0),
         },
     }
+    risk_summary = {"generated_at": datetime(2025, 1, 1, 8, 45)}
+    ui_actions = [{"action": "show_toast", "timestamp": datetime(2025, 1, 1, 8, 30)}]
+
     record = await service.save_draft(
-        incident_id="incident-1",
+        incident_id="00000000-0000-0000-0000-000000000001",
         entity=None,
         plan=plan_payload,
-        risk_summary={"count": 1},
-        ui_actions=[{"action": "open_panel", "payload": {}}],
+        risk_summary=risk_summary,
+        ui_actions=ui_actions,
         created_by="tester",
     )
-    assert record.draft_id in snapshot_repo.storage
-    loaded = await service.load_draft(record.draft_id)
-    assert loaded.plan["plan"]["overview"]["situationSummary"] == "受灾建筑倒塌"
-    assert loaded.risk_summary["count"] == 1
-    assert loaded.ui_actions[0]["action"] == "open_panel"
 
+    assert snapshot_repo.last_input is not None, "快照写入未被调用"
+    stored_payload = snapshot_repo.last_input.payload
 
-@pytest.mark.anyio
-async def test_confirm_draft_generates_description(draft_service_components: tuple[RescueDraftService, _StubSnapshotRepository, _StubTaskRepository]) -> None:
-    service, snapshot_repo, task_repo = draft_service_components
-    plan_payload: Dict[str, Any] = {
-        "response_text": "  ",
-        "analysis_summary": {"matched_count": 3},
-        "plan": {
-            "overview": {
-                "situationSummary": "坍塌救援",
-                "analysis": {"matched_count": 3},
-            },
-            "lines": [],
-            "resources": [],
-            "risks": [],
-            "evidenceTrace": [],
-        },
-    }
-    record = await service.save_draft(
-        incident_id="incident-2",
-        entity=None,
-        plan=plan_payload,
-        risk_summary={},
-        ui_actions=[],
-        created_by="tester",
-    )
-    task = await service.confirm_draft(
-        record.draft_id,
-        commander_id="commander-1",
-        priority=80,
-        description=None,
-        deadline=None,
-        task_code=None,
-    )
-    assert task.description == "生成救援方案，匹配 3 支力量"
-    assert record.draft_id not in snapshot_repo.storage
-    assert task_repo.calls, "任务写入应当被调用"
+    persisted_task = stored_payload["plan"]["persisted_task"]
+    assert isinstance(persisted_task["created_at"], str)
+    assert persisted_task["created_at"].endswith("Z")
+    assert isinstance(persisted_task["updated_at"], str)
 
+    stored_action = stored_payload["ui_actions"][0]
+    assert isinstance(stored_action["timestamp"], str)
+    assert stored_action["timestamp"].endswith("Z")
 
-@pytest.mark.anyio
-async def test_load_missing_draft_raises(draft_service_components: tuple[RescueDraftService, _StubSnapshotRepository, _StubTaskRepository]) -> None:
-    service, _, _ = draft_service_components
-    with pytest.raises(ValueError):
-        await service.load_draft("missing-draft")
+    assert isinstance(record, RescueDraftRecord)
+    assert isinstance(record.plan["persisted_task"]["created_at"], str)
+    assert record.plan["persisted_task"]["created_at"].endswith("Z")

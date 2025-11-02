@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import asdict, dataclass, is_dataclass
+from datetime import date, datetime, time, timezone, timedelta
+from decimal import Decimal
+from enum import Enum
 from typing import Any, Mapping, Optional, Sequence
+from uuid import UUID
 
 import structlog
 
@@ -68,10 +71,11 @@ class RescueDraftService:
             "ui_actions": list(ui_actions),
             "entity": self._serialize_entity(entity),
         }
+        sanitized_payload = self._sanitize_for_json(payload)
         snapshot_input = IncidentSnapshotCreateInput(
             incident_id=incident_id,
             snapshot_type="rescue_plan_draft",
-            payload=self._ensure_mapping(payload),
+            payload=self._ensure_mapping(sanitized_payload),
             generated_at=datetime.now(timezone.utc),
             created_by=created_by,
         )
@@ -81,14 +85,20 @@ class RescueDraftService:
             incident_id=incident_id,
             draft_id=snapshot.snapshot_id,
         )
-        entity_id = payload["entity"].get("entity_id") if payload.get("entity") else None
+        sanitized_plan = self._ensure_mapping(sanitized_payload.get("plan"))
+        sanitized_risk_summary = self._ensure_mapping(sanitized_payload.get("risk_summary"))
+        sanitized_actions = [
+            self._ensure_mapping(item) for item in sanitized_payload.get("ui_actions", [])
+        ]
+        entity_payload = sanitized_payload.get("entity")
+        entity_id = entity_payload.get("entity_id") if isinstance(entity_payload, Mapping) else None
         return RescueDraftRecord(
             draft_id=snapshot.snapshot_id,
             incident_id=snapshot.incident_id,
             entity_id=entity_id,
-            plan=plan,
-            risk_summary=risk_summary,
-            ui_actions=ui_actions,
+            plan=sanitized_plan,
+            risk_summary=sanitized_risk_summary,
+            ui_actions=sanitized_actions,
             created_at=snapshot.created_at,
             created_by=snapshot.created_by,
         )
@@ -200,3 +210,47 @@ class RescueDraftService:
         if isinstance(value, Mapping):
             return dict(value)
         raise TypeError(f"payload 必须是 Mapping，收到: {type(value)!r}")
+
+    def _sanitize_for_json(self, value: Any) -> Any:
+        """将任意嵌套结构转换为 JSON 可序列化形式，兼容 datetime、UUID 等类型。"""
+        # None 按照 JSON 语义直接返回
+        if value is None:
+            return None
+        # 基本标量原样保留
+        if isinstance(value, (str, int, float, bool)):
+            return value
+        # datetime 统一转为 UTC ISO 字符串
+        if isinstance(value, datetime):
+            dt = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+            iso_value = dt.astimezone(timezone.utc).isoformat()
+            return iso_value.replace("+00:00", "Z")
+        # date/time 直接输出 ISO 字符串
+        if isinstance(value, date):
+            return value.isoformat()
+        if isinstance(value, time):
+            if value.tzinfo:
+                return value.isoformat()
+            return value.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+        # timedelta 折算为秒值，便于前端展示
+        if isinstance(value, timedelta):
+            return value.total_seconds()
+        # UUID/Decimal/Enum 均转成字符串或基础数值
+        if isinstance(value, UUID):
+            return str(value)
+        if isinstance(value, Decimal):
+            return float(value)
+        if isinstance(value, Enum):
+            return self._sanitize_for_json(value.value)
+        # dataclass 使用 asdict 展开再递归
+        if is_dataclass(value):
+            return self._sanitize_for_json(asdict(value))
+        # 映射与序列逐项递归处理
+        if isinstance(value, Mapping):
+            return {str(key): self._sanitize_for_json(val) for key, val in value.items()}
+        if isinstance(value, (list, tuple, set)):
+            return [self._sanitize_for_json(item) for item in value]
+        # bytes 转为 UTF-8 字符串，无法解码则忽略非法字节
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="ignore")
+        # 兜底使用字符串表示，保证一定可序列化
+        return str(value)
