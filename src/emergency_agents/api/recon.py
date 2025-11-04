@@ -54,12 +54,26 @@ async def create_recon_plan(payload: ReconPlanRequest, request: Request) -> Reco
             "event_id": str(payload.event_id),
             "command_text": payload.command_text,
         }
-        return graph.invoke(
-            init_state,
-            config={"durability": "sync"},  # 长流程（侦察规划），同步保存checkpoint确保高可靠性
-        )
+        # 构造 LangGraph 配置（checkpointer 需要 thread_id）
+        config = {
+            "configurable": {
+                "thread_id": f"recon-{payload.event_id}"
+            }
+        }
+        return graph.invoke(init_state, config=config)
 
-    state = await to_thread.run_sync(_invoke)
+    try:
+        state = await to_thread.run_sync(_invoke)
+    except Exception as exc:  # 将常见的业务性失败转为明确提示
+        msg = str(exc)
+        # 无可用装备/无任务蓝图 → 返回400并提示“当前没有合适的装备”
+        if "无可用侦察装备" in msg or "LLM 未提供任何侦察任务" in msg or "no_suitable_equipment" in msg:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                detail=f"no_suitable_equipment: {msg}"
+            )
+        # 其它错误维持500（不兜底，透明暴露）
+        raise
     plan = state.get("plan")
     draft: ReconPlanDraft | None = state.get("draft")
     if plan is None or draft is None:

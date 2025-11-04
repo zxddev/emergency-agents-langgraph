@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import dataclass, asdict, field
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
@@ -12,6 +13,7 @@ from emergency_agents.graph.intent_orchestrator_app import IntentOrchestratorSta
 from emergency_agents.intent.registry import IntentHandlerRegistry
 from emergency_agents.intent.schemas import INTENT_SLOT_TYPES, BaseSlots
 from emergency_agents.memory.conversation_manager import ConversationManager, MessageRecord
+from emergency_agents.context.service import ContextService
 from emergency_agents.memory.mem0_facade import MemoryFacade
 from emergency_agents.ui.actions import serialize_actions
 
@@ -251,6 +253,7 @@ async def process_intent_core(
     build_history: Callable[[List[MessageRecord]], List[Dict[str, Any]]],
     mem0_metrics: Mem0Metrics,
     channel: str = "text",
+    context_service: ContextService | None = None,
 ) -> IntentProcessResult:
     """统一意图处理核心逻辑。"""
     if not message or not message.strip():
@@ -274,21 +277,24 @@ async def process_intent_core(
     history_payload = build_history(history_records)
 
     memory_hits: List[Dict[str, Any]] = []
-    try:
-        t0 = time.perf_counter()
-        memory_hits = mem.search(
-            query=message,
-            user_id=user_id,
-            run_id=thread_id,
-            top_k=3,
-        )
-        duration = max(time.perf_counter() - t0, 0.0)
-        mem0_metrics.inc_search_success()
-        mem0_metrics.observe_search_duration(duration)
-    except Exception as exc:  # noqa: BLE001
-        reason = exc.__class__.__name__
-        mem0_metrics.inc_search_failure(reason)
-        raise
+    enable_mem0 = os.getenv("ENABLE_MEM0", "false").lower() == "true"
+    if enable_mem0:
+        try:
+            t0 = time.perf_counter()
+            memory_hits = mem.search(
+                query=message,
+                user_id=user_id,
+                run_id=thread_id,
+                top_k=3,
+            )
+            duration = max(time.perf_counter() - t0, 0.0)
+            mem0_metrics.inc_search_success()
+            mem0_metrics.observe_search_duration(duration)
+        except Exception as exc:  # noqa: BLE001
+            reason = exc.__class__.__name__
+            mem0_metrics.inc_search_failure(reason)
+            # 配置启用但搜索失败：直接抛出，遵循不兜底原则
+            raise
 
     conversation_context = {"incident_id": incident_id} | _extract_context_from_memories(memory_hits)
 
@@ -356,25 +362,132 @@ async def process_intent_core(
 
     if validation_status == "invalid":
         response_text = prompt_text or "请补充缺失信息以便继续处理。"
-        saved = await _persist_assistant_message(response_text, intent.get("intent_type"))
-        history_records.append(saved)
-        logger.info(
-            "intent_process_result_needs_input",
-            intent_type=intent.get("intent_type"),
-            missing_fields=graph_state.get("missing_fields") or [],
-            thread_id=thread_id,
-        )
-        return IntentProcessResult(
-            status="needs_input",
-            intent=intent,
-            result={
-                "response_text": response_text,
-                "missing_fields": graph_state.get("missing_fields") or [],
-            },
-            history=build_history(history_records),
-            memory_hits=memory_hits,
-            audit_log=graph_state.get("audit_log") or [],
-        )
+        ui_actions_payload: list[Dict[str, Any]] = []
+
+        # 1) 谨慎自动策略：若缺失项全部可由会话上下文补齐，则直接补齐并视为有效
+        try:
+            itype_raw = str((intent.get("intent_type") or "").strip()).lower()
+            itype_norm = itype_raw.replace(" ", "").replace("_", "-")
+            missing_fields: List[str] = list(graph_state.get("missing_fields") or [])
+
+            policy_task = os.getenv("AUTO_BINDING_POLICY_TASK", "strict").strip().lower()
+            policy_incident = os.getenv("AUTO_BINDING_POLICY_INCIDENT", "strict").strip().lower()
+
+            ctx: SessionContextRecord | None = None
+            if context_service is not None:
+                try:
+                    ctx = await context_service.get(thread_id)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("session_context_lookup_failed", error=str(exc))
+
+            can_autofill = True if missing_fields else False
+            new_slots = dict((intent.get("slots") or {}))
+            applied: dict[str, Any] = {}
+            for field in missing_fields:
+                if field == "incident_id" and policy_incident == "cautious" and ctx and ctx.get("last_incident_id"):
+                    new_slots["incident_id"] = ctx["last_incident_id"]  # type: ignore[index]
+                    applied[field] = new_slots["incident_id"]
+                    continue
+                if field in ("task_id", "task_code") and policy_task == "cautious" and ctx and (ctx.get("last_task_id") or ctx.get("last_task_code")):
+                    if field == "task_id" and ctx.get("last_task_id"):
+                        new_slots["task_id"] = ctx["last_task_id"]  # type: ignore[index]
+                        applied[field] = new_slots["task_id"]
+                    elif field == "task_code" and ctx.get("last_task_code"):
+                        new_slots["task_code"] = ctx["last_task_code"]  # type: ignore[index]
+                        applied[field] = new_slots["task_code"]
+                    else:
+                        can_autofill = False
+                    continue
+                # 其它缺失字段不可由上下文自动填
+                can_autofill = False
+
+            if missing_fields and can_autofill and applied:
+                logger.info(
+                    "context_autofill_applied",
+                    intent_type=itype_norm,
+                    fields=list(applied.keys()),
+                    thread_id=thread_id,
+                )
+                intent = dict(intent or {})
+                intent["slots"] = new_slots
+                validation_status = "valid"
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("context_autofill_decision_failed", error=str(exc))
+
+        # 2) 若仍无效，构造结构化澄清（设备严格策略A；任务/事件未能全量自动填时亦走澄清）
+        if validation_status == "invalid":
+            try:
+                itype_raw = str((intent.get("intent_type") or "").strip()).lower()
+                itype_norm = itype_raw.replace(" ", "").replace("_", "-")
+                missing_fields2 = graph_state.get("missing_fields") or []
+                if itype_norm in ("video-analysis", "video-analyze") and ("device_name" in missing_fields2 or not (intent.get("slots") or {}).get("device_name")):
+                    import psycopg
+                    options: list[Dict[str, Any]] = []
+                    # recent device
+                    recent_label: str | None = None
+                    recent_value: str | None = None
+                    if context_service is not None:
+                        try:
+                            ctx2 = await context_service.get(thread_id)
+                            if ctx2 and ctx2.get("last_device_name"):
+                                recent_label = str(ctx2["last_device_name"])  # type: ignore[index]
+                                last_id2 = ctx2.get("last_device_id")
+                                recent_value = str(last_id2) if isinstance(last_id2, str) else None
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning("session_context_lookup_failed", error=str(exc))
+                    sql = (
+                        "WITH candidates AS (\n"
+                        "  SELECT d.id::text AS id, d.name AS name\n"
+                        "    FROM operational.device d\n"
+                        "    JOIN operational.device_video_link dvl ON dvl.id = d.id\n"
+                        "   WHERE COALESCE(NULLIF(dvl.video_link, ''), '') <> ''\n"
+                        "  UNION ALL\n"
+                        "  SELECT d.id::text AS id, d.name AS name\n"
+                        "    FROM operational.device d\n"
+                        "    JOIN operational.device_detail dd ON dd.device_id = d.id\n"
+                        "   WHERE COALESCE(NULLIF(dd.device_detail->>'stream_url', ''), '') <> ''\n"
+                        ") SELECT id, name FROM candidates GROUP BY id, name ORDER BY name ASC LIMIT 10"
+                    )
+                    with psycopg.connect(os.getenv("POSTGRES_DSN")) as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(sql)
+                            for dev_id, name in cur.fetchall():
+                                options.append({"label": name or dev_id, "device_id": dev_id})
+                    if recent_label:
+                        already = any(o.get("label") == recent_label for o in options)
+                        if not already:
+                            options.insert(0, {"label": recent_label, "device_id": recent_value or recent_label})
+                    clarify = {
+                        "type": "clarify",
+                        "slot": "device_name",
+                        "options": options,
+                        "reason": "视频分析需指定设备名称",
+                        "default_index": 0 if options else None,
+                    }
+                    ui_actions_payload = [clarify]
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("build_clarify_ui_actions_failed", error=str(exc))
+
+            saved = await _persist_assistant_message(response_text, intent.get("intent_type"))
+            history_records.append(saved)
+            logger.info(
+                "intent_process_result_needs_input",
+                intent_type=intent.get("intent_type"),
+                missing_fields=graph_state.get("missing_fields") or [],
+                thread_id=thread_id,
+            )
+            return IntentProcessResult(
+                status="needs_input",
+                intent=intent,
+                result={
+                    "response_text": response_text,
+                    "missing_fields": graph_state.get("missing_fields") or [],
+                },
+                history=build_history(history_records),
+                memory_hits=memory_hits,
+                audit_log=graph_state.get("audit_log") or [],
+                ui_actions=ui_actions_payload,
+            )
 
     if validation_status == "failed":
         missing_fields = graph_state.get("missing_fields") or []
@@ -548,6 +661,46 @@ async def process_intent_core(
         reason = exc.__class__.__name__
         mem0_metrics.inc_add_failure(reason)
         raise
+
+    # 会话记忆写回（事件与任务，谨慎且安全）
+    try:
+        if context_service is not None:
+            # 事件：使用本次 incident_id 作为最近事件
+            await context_service.set_last_incident(
+                thread_id=thread_id,
+                incident_id=incident_id,
+                intent_type=intent.get("intent_type"),
+            )
+            # 任务：若此次槽位携带了 task_id/task_code，则写回。
+            slots_for_write = intent.get("slots") or {}
+            task_id_val = slots_for_write.get("task_id") if isinstance(slots_for_write, dict) else None
+            task_code_val = slots_for_write.get("task_code") if isinstance(slots_for_write, dict) else None
+            if isinstance(task_id_val, str) or isinstance(task_code_val, str):
+                await context_service.set_last_task(
+                    thread_id=thread_id,
+                    task_id=task_id_val if isinstance(task_id_val, str) else None,
+                    task_code=task_code_val if isinstance(task_code_val, str) else None,
+                    intent_type=intent.get("intent_type"),
+                )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("session_context_write_failed", error=str(exc))
+
+    # 会话记忆写回：视频分析成功后记录最近设备
+    if context_service is not None and intent.get("intent_type") in ("video-analysis",):
+        try:
+            vi = None
+            if isinstance(handler_result, Mapping):
+                vi = handler_result.get("video_analysis")
+            if isinstance(vi, Mapping) and str(vi.get("status")) == "success":
+                await context_service.set_last_device(
+                    thread_id=thread_id,
+                    device_id=vi.get("device_id") if isinstance(vi.get("device_id"), str) else None,
+                    device_name=vi.get("device_name") if isinstance(vi.get("device_name"), str) else None,
+                    device_type=None,
+                    intent_type="video-analysis",
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("session_context_write_failed", error=str(exc))
 
     return IntentProcessResult(
         status="success",

@@ -35,7 +35,7 @@ class ReconLLMConfig:
     base_url: str
     api_key: str
     temperature: float = 0.2
-    timeout_seconds: float = 300.0
+    timeout_seconds: float = 600.0  # 10分钟超时
 
 
 class LLMTaskBlueprint(BaseModel):
@@ -102,20 +102,21 @@ class OpenAIReconLLMEngine(ReconLLMEngine):
             '{"objectives":["..."],'
             '"tasks":[{"title":"","objective":"","mission_phase":"","priority":"","recommended_device":"","target_points":[{"lon":0.0,"lat":0.0}],"required_capabilities":[],"duration_minutes":0,"safety_notes":"","dependencies":[]}],'
             '"justification":{"summary":"","reasoning_chain":[],"risk_warnings":[]}}。'
-            "所有值需替换为实际内容，禁止返回示例文字或多余字段；"
-            "mission_phase 只能取 \"recon\"、\"alert\"、\"rescue\"、\"logistics\" 之一；"
-            "priority 只能取 \"critical\"、\"high\"、\"medium\"、\"low\" 之一；"
-            "objectives 数量不超过 3 条，若有更多请合并；"
-            "target_points 每个任务最多保留 3 个关键坐标。"
+            "严格要求：仅使用上下文提供的数据（设备ID/坐标/队伍/受阻道路/已有任务/设备capabilities），禁止臆造；"
+            "mission_phase ∈ {recon, alert, rescue, logistics}；priority ∈ {critical, high, medium, low}；"
+            "objectives ≤ 3；每个任务 target_points ≤ 3（WGS84，经度lon、纬度lat，度单位）；"
+            "所有 recommended_device 必须来自 available_devices.device_id，且其 capabilities 能满足任务；"
+            "灾情→设备能力匹配示例：洪水/水域→water_recon/usv/sonar；化工泄漏→hazmat_detection/gas_detection/robot_dog；火灾/高温→thermal_imaging；近距观察→robot_dog；空域巡检→uav；"
+            "若无任何设备满足本次灾情能力需求：tasks 数组须为空，并在 justification.summary 写明 no_suitable_equipment，risk_warnings 给出原因；不得编造替代设备。"
         )
         messages = [
             {
                 "role": "system",
                 "content": (
-                    "你是应急指挥领域的侦察任务规划官。"
-                    "请基于提供的事件态势、可用装备和坐标，生成专业的侦察方案。"
-                    "必须使用提供的设备ID，任务数量限制在1到4之间。"
-                    "输出严格遵循指定的JSON结构，不得添加多余字段。"
+                    "你是基于 ICS/IAP 的侦察作战规划官（面向作战与计划岗位）。"
+                    "根据灾情类型与可用装备capabilities进行设备-任务匹配：水域/洪水优先USV，化工泄漏优先具备hazmat/gas检测的robot_dog，空域巡检优先UAV。"
+                    "如确无合适装备，必须返回空任务并明确 no_suitable_equipment 理由（不得臆造设备或坐标）。"
+                    "任务数量限制在1到4之间；输出严格为 JSON 结构，不得添加未定义字段或自然语言说明。"
                 ),
             },
             {

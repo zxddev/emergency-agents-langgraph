@@ -1,0 +1,174 @@
+{
+  "disaster_overview": {
+    "disaster_type": "地震灾害",
+    "disaster_name": "雅安7.0级地震",
+    "occurrence_time": "2025-04-20T08:02:00",
+    "end_time": "2025-05-05T18:00:00",
+    "location": "四川省雅安市芦山县",
+    "disaster_scale": "7.0级，震源深度13公里",
+    "affected_area_km2": 12500.0,
+    "final_deaths": 196,
+    "final_injured": 11826,
+    "affected_population": 2308000,
+    "economic_loss_billion": 86.8
+  },
+  "response_activation": {
+    "response_level": "一级响应",
+    "activation_time": "2025-04-20T08:35:00",
+    "command_center": "国务院抗震救灾指挥部",
+    "leading_unit": "应急管理部",
+    "participating_departments": [
+      "应急管理部",
+      "国家消防救援局",
+      "中央军委联合参谋部",
+      "国家卫生健康委",
+      "交通运输部",
+      "工业和信息化部",
+      "财政部",
+      "自然资源部",
+      "住房城乡建设部",
+      "水利部",
+      "中国地震局"
+    ],
+    "legal_basis": "《国家地震应急预案》（2024年修订）"
+  },
+  "timeline": [
+    {
+      "time": "2025-04-20T08:02:00",
+      "event_type": "灾害发生",
+      "description": "雅安市芦山县发生7.0级地震",
+      "significance": "震中位于人口密集区，灾情严重"
+    },
+    {
+      "time": "2025-04-20T08:35:00",
+      "event_type": "响应启动",
+      "description": "国务院启动一级应急响应",
+      "significance": "33分钟内完成响应启动决策"
+    },
+    {
+      "time": "2025-04-20T09:20:00",
+      "event_type": "首支队伍到达",
+      "description": "四川消防救援总队首支力量到达震中",
+      "significance": "距地震发生78分钟"
+    },
+    {
+      "time": "2025-04-20T12:00:00",
+      "event_type": "国家力量集结",
+      "description": "国家综合性消防救援队伍1200人到达",
+      "significance": "形成初步救援力量规模"
+    },
+    {
+      "time": "2025-04-21T08:00:00",
+      "event_type": "黄金72小时救援",
+      "description": "全力开展生命搜救，成功救出389人",
+      "significance": "把握黄金救援时间窗口"
+    },
+    {
+      "time": "2025-04-23T20:00:00",
+      "event_type": "搜救阶段结束",
+      "description": "现场搜救基本结束，转入安置和恢复重建",
+      "significance": "黄金72小时救援窗口关闭"
+    },
+    {
+      "time": "2025-05-05T18:00:00",
+      "event_type": "响应终止",
+      "description": "国家一级响应终止，转入恢复重建阶段",
+      "significance": "应急响应持续15天"
+    }
+  ],
+  "forces_deployed": [
+    {
+      "force_type": "国家综合性消防救援队伍",
+      "force_name": "国家地震灾害紧急救援队",
+      "personnel": 480,
+      "arrival_time": "2025-04-20T11:30:00",
+      "main_equipment": "生命探测仪12台、破拆工具组50套、医疗急救设备15套、搜救犬20只",
+      "assigned_tasks": "震中核心区域重点建筑搜救",
+      "rescued_people": 127,
+      "completed_tasks": "成功搜救127人，其中生还112人，处置危险建筑38栋"
+    },
+    {
+      "force_type": "国家综合性消防救援队伍",
+      "force_name": "四川省消防救援总队",
+      "personnel": 3200,
+      "arrival_time": "2025-04-20T09:20:00",
+      "main_equipment": "重型救援车辆80辆、挖掘机15台、生命探测仪40台",
+      "assigned_tasks": "全域搜救、道路抢通、群众疏散",
+      "rescued_people": 543,
+      "completed_tasks": "搜救543人，抢通道路120公里，疏散转移群众5.8万人"
+    },
+    {
+      "force_type": "解放军和武警部队",
+      "force_name": "西部战区某集团军工兵团",
+      "personnel": 2500,
+      "arrival_time": "2025-04-20T13:00:00",
+      "main_equipment": "工程机械120台、舟桥设备、应急通信装备",
+      "assigned_tasks": "道路桥梁抢修、堰塞湖处置、搜救支援",
+      "rescued_people": 89,
+      "completed_tasks": "抢修道路95公里，架设应急桥梁3座，处置堰塞湖隐患2处"
+    },
+    {
+      "force_type": "医疗救援队伍",
+      "force_name": "国家卫生应急队伍（四川）",
+      "personnel": 480,
+      "arrival_time": "2025-04-20T12:30:00",
+      "main_equipment": "野战医疗车15辆、手术设备3套、医疗药品5吨",
+      "assigned_tasks": "伤员救治、卫生防疫、心理疏导",
+      "completed_tasks": "救治伤员11826人次，实施手术168例，无疫情发生"
+    },
+    {
+      "force_type": "社会救援力量",
+      "force_name": "蓝天救援队等15支社会组织",
+      "personnel": 680,
+      "arrival_time": "2025-04-20T16:00:00",
+      "main_equipment": "无人机20架、搜救设备、后勤保障物资",
+      "assigned_tasks": "搜救协助、物资发放、志愿服务",
+      "rescued_people": 23,
+      "completed_tasks": "协助搜救23人，发放物资8000份，服务群众2万人次"
+    }
+  ],
+  "rescue_statistics": {
+    "total_rescued": 782,
+    "rescued_alive": 698,
+    "evacuated_people": 230800,
+    "resettled_people": 156000,
+    "treated_patients": 11826,
+    "transferred_critical": 238,
+    "relief_materials_distributed": "帐篷5.2万顶、棉被15万床、食品1200吨、饮用水800吨",
+    "roads_reopened_km": 215.0,
+    "power_restored_households": 45000,
+    "water_restored_households": 38000
+  },
+  "coordination": {
+    "government_agencies": "省市县三级政府高效联动，建立扁平化指挥体系，重大事项30分钟内决策",
+    "military_cooperation": "军地联合指挥部运行顺畅，军队力量第一时间响应，实现无缝衔接",
+    "social_forces": "首次建立社会救援力量统一调度平台，15支队伍纳入指挥体系，发挥积极作用",
+    "inter_regional": "启动跨省应急联动机制，重庆、云南等5省市支援力量快速到位",
+    "information_sharing": "建立灾情信息一小时报送机制，首次实现多部门数据实时共享",
+    "coordination_effectiveness": "总体协调高效有序，但社会力量管理仍需规范，信息系统互联互通有待加强"
+  },
+  "challenges": {
+    "access_difficulties": "震后道路中断120余处，最严重的宝兴县完全成为孤岛，空中救援受天气影响大",
+    "communication_issues": "震区通信基站损毁率达65%，前48小时通信基本中断，依靠卫星通信和北斗短报文",
+    "equipment_shortages": "生命探测仪、大型破拆设备不足，部分偏远乡镇搜救工具主要靠人工",
+    "personnel_issues": "专业医疗救护人员不足，心理干预队伍缺乏，语言不通（羌族聚居区）影响救援效率",
+    "weather_impact": "震后连续3天降雨，影响空中救援和道路抢通，增加次生灾害风险",
+    "secondary_disasters": "发现堰塞湖隐患12处，其中2处威胁下游10万人安全，余震频繁影响救援作业",
+    "coordination_problems": "社会救援力量初期管理混乱，15支队伍未经统一调度自行进入震区，一度造成交通拥堵",
+    "other_challenges": "灾民安置点物资分配不均，个别地方出现哄抢现象；信息发布不及时导致谣言传播"
+  },
+  "resource_utilization": {
+    "total_personnel": 8540,
+    "total_vehicles": 1200,
+    "aircraft_sorties": 186,
+    "relief_tents": 52000,
+    "relief_quilts": 150000,
+    "food_tons": 1200.0,
+    "water_tons": 800.0,
+    "total_funds_million": 3500.0,
+    "central_funds_million": 2000.0,
+    "local_funds_million": 1500.0
+  },
+  "lessons_learned": "首次建立社会力量统一调度平台效果显著；卫星通信和北斗短报文在通信中断情况下发挥关键作用；扁平化指挥体系提升决策效率",
+  "improvement_suggestions": "建议修订预案增加社会力量管理章节；加强基层应急通信装备配置；建立跨区域装备物资共享机制"
+}

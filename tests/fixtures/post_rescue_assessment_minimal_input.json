@@ -1,0 +1,52 @@
+{
+  "disaster_overview": {
+    "disaster_type": "地震灾害",
+    "disaster_name": "简化测试地震",
+    "occurrence_time": "2025-01-02T14:28:00",
+    "end_time": "2025-01-10T18:00:00",
+    "location": "四川省",
+    "disaster_scale": "6.0级",
+    "final_deaths": 50,
+    "final_injured": 200,
+    "affected_population": 10000
+  },
+  "response_activation": {
+    "response_level": "三级响应",
+    "activation_time": "2025-01-02T15:00:00",
+    "command_center": "省应急指挥中心",
+    "leading_unit": "省应急管理厅",
+    "participating_departments": ["消防救援", "卫生健康", "交通运输"]
+  },
+  "timeline": [
+    {
+      "time": "2025-01-02T14:28:00",
+      "event_type": "灾害发生",
+      "description": "地震发生"
+    },
+    {
+      "time": "2025-01-02T15:00:00",
+      "event_type": "响应启动",
+      "description": "启动三级响应"
+    }
+  ],
+  "forces_deployed": [
+    {
+      "force_type": "消防救援",
+      "force_name": "省消防救援总队",
+      "personnel": 200,
+      "assigned_tasks": "搜救被困人员"
+    }
+  ],
+  "rescue_statistics": {
+    "total_rescued": 100,
+    "rescued_alive": 80,
+    "evacuated_people": 5000,
+    "resettled_people": 3000,
+    "treated_patients": 150
+  },
+  "coordination": {},
+  "challenges": {},
+  "resource_utilization": {
+    "total_personnel": 500
+  }
+}

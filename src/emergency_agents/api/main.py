@@ -23,8 +23,13 @@ from emergency_agents.config import AppConfig
 from emergency_agents.logging import configure_logging, set_trace_id, clear_trace_id  # 统一日志配置
 from emergency_agents.api.voice_chat import handle_voice_chat, voice_chat_handler
 from emergency_agents.api import rescue as rescue_api
+from emergency_agents.api import plan as plan_api
+from emergency_agents.api import overall_rescue as overall_rescue_api
+from emergency_agents.api import recon_priority as recon_priority_api
+from emergency_agents.api import recon_batch_weather as recon_batch_weather_api
 from emergency_agents.api import sitrep as sitrep_api
 from emergency_agents.api import reports as reports_api
+from emergency_agents.api import recon as recon_api
 from emergency_agents.external.adapter_client import AdapterHubClient
 from emergency_agents.external.amap_client import AmapClient
 from emergency_agents.external.orchestrator_client import OrchestratorClient
@@ -256,6 +261,10 @@ _risk_predict_task: asyncio.Task[None] | None = None
 app.include_router(rescue_api.router)
 app.include_router(sitrep_api.router, prefix="/sitrep", tags=["sitrep"])
 app.include_router(reports_api.router)
+app.include_router(recon_api.router)
+app.include_router(overall_rescue_api.router)
+app.include_router(recon_priority_api.router)
+app.include_router(recon_batch_weather_api.router)
 
 
 def _classifier_wrapper(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -502,6 +511,15 @@ async def startup_event():
         _risk_predictor.run_periodic(refresh_interval)
     )
 
+    # 绑定 /ai/plan 路由（战略/救援方案）
+    # 依赖注入: 供 /ai/plan/from-progress 使用
+    plan_api._pg_pool_async = _pg_pool  # type: ignore[assignment]
+    app.include_router(plan_api.router)
+    # 绑定 /ai/rescue 路由（整体救援方案）
+    overall_rescue_api._pg_pool_async = _pg_pool  # type: ignore[assignment]
+    recon_priority_api._pg_pool_async = _pg_pool  # type: ignore[assignment]
+    recon_batch_weather_api._pg_pool_async = _pg_pool  # type: ignore[assignment]
+
     # ========== 初始化SITREP子图 ==========
     task_dao = TaskDAO.create(_pg_pool)
     rescue_dao = RescueDAO.create(_pg_pool)
@@ -565,9 +583,10 @@ async def startup_event():
     )
     recon_gateway = PostgresReconGateway(_recon_sync_pool)
 
+    # 按需固定侦察LLM模型（接口明确要求固定使用 glm4.6）
     recon_llm = OpenAIReconLLMEngine(
         config=ReconLLMConfig(
-            model=_cfg.recon_llm_model,
+            model="glm-4.6",
             base_url=_cfg.recon_llm_base_url,
             api_key=_cfg.recon_llm_api_key,
             temperature=0.2,
@@ -584,6 +603,8 @@ async def startup_event():
     )
     _register_graph_close(_recon_graph)
     app.state.recon_graph = _recon_graph
+    app.state.recon_gateway = recon_gateway
+    plan_api._recon_gateway = recon_gateway  # type: ignore[assignment]
     logger.info("api_graph_ready", graph="recon")
 
 

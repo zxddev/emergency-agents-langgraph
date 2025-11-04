@@ -5,10 +5,15 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 from emergency_agents.db.dao import DeviceDAO, serialize_dataclass
+from emergency_agents.db.device_resolver import (
+    DeviceResolver,
+    DeviceNotFoundError,
+    AmbiguousDeviceNameError,
+)
 from emergency_agents.intent.handlers.base import IntentHandler
 from emergency_agents.intent.schemas import VideoAnalysisSlots
 from emergency_agents.video.frame_capture import VideoFrameCapture
-from emergency_agents.video.vision import VisionAnalyzer, DangerLevel
+from emergency_agents.vehicle.vision import VisionAnalyzer, DangerLevel
 
 logger = logging.getLogger(__name__)
 
@@ -51,12 +56,31 @@ class VideoAnalysisHandler(IntentHandler[VideoAnalysisSlots]):
             },
         )
 
-        # 1. 根据设备名称查询设备信息
-        device = await self.device_dao.fetch_video_device_by_name(slots.device_name)
-        if device is None:
+        # 1. 根据设备名称解析唯一设备（严格：命中唯一，不猜测）
+        resolver = DeviceResolver(self.device_dao)
+        try:
+            device = await resolver.resolve_by_name(slots.device_name)
+        except DeviceNotFoundError as e:
             return {
-                "response_text": f"未找到设备「{slots.device_name}」，请检查设备名称是否正确。",
-                "video_analysis": {"status": "device_not_found"},
+                "response_text": f"未找到设备「{slots.device_name}」。请检查名称或选择候选："
+                + ("、".join(f"{s.name or s.id}" for s in e.suggestions) if e.suggestions else "无候选"),
+                "video_analysis": {
+                    "status": "device_not_found",
+                    "query": slots.device_name,
+                    "candidates": [
+                        serialize_dataclass(c) for c in (e.suggestions or [])
+                    ],
+                },
+            }
+        except AmbiguousDeviceNameError as e:
+            return {
+                "response_text": f"设备名称「{slots.device_name}」存在歧义，请从候选中明确指定："
+                + "、".join(f"{c.name or c.id}" for c in e.candidates),
+                "video_analysis": {
+                    "status": "ambiguous_device_name",
+                    "query": slots.device_name,
+                    "candidates": [serialize_dataclass(c) for c in e.candidates],
+                },
             }
 
         # 2. 获取视频流地址

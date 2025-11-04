@@ -1,0 +1,11 @@
+- [ ] 执行 SQL `sql/operational_session_context.sql`
+- [ ] 新增 `ContextService`（异步、强类型）
+- [ ] API 注入 `ContextService` → `process_intent_core`
+- [ ] invalid 分支构建 ClarifyRequest 时读取最近设备并置顶
+- [ ] `video-analysis` 成功后写回最近设备
+- [ ] 单测：
+  - [ ] 澄清返回 options+default_index
+  - [ ] 最近设备置顶（无重复）
+  - [ ] 成功后写回会话上下文
+  - [ ] 无 SQL 表时回退为普通澄清
+- [ ] 文档：`docs/新业务逻辑md/new_0.2/意图澄清与记忆增强设计.md`

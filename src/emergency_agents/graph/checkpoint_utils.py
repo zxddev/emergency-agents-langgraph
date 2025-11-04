@@ -47,33 +47,34 @@ async def create_async_postgres_checkpointer(
     finally:
         await admin_conn.close()
 
-    # 第二步：创建 autocommit 连接池用于执行 setup()（避免并发索引创建失败）
+    # 第二步：创建 autocommit 连接用于执行 setup()
     # LangGraph 的迁移6/7/8使用 CREATE INDEX CONCURRENTLY，必须在 autocommit 模式下执行
-    setup_pool = AsyncConnectionPool(
-        conninfo=normalized_dsn,
-        min_size=1,
-        max_size=1,
-        kwargs={
-            "options": f"-c search_path={schema}",
-            "autocommit": True,  # 关键：启用 autocommit 避免事务冲突
-        },
-        open=False,
+    # 注意：使用 AsyncConnection 而不是 Pool，以便设置 search_path
+    setup_conn = await AsyncConnection.connect(
+        normalized_dsn,
+        autocommit=True,  # 关键：启用 autocommit 避免事务冲突
     )
-    await setup_pool.open()
 
     try:
-        setup_saver = AsyncPostgresSaver(setup_pool)
+        # 设置 search_path 到自定义 schema
+        await setup_conn.execute(f"SET search_path TO {schema}")
+
+        # AsyncPostgresSaver 会在当前 search_path 的 schema 中创建表
+        setup_saver = AsyncPostgresSaver(setup_conn)
         await setup_saver.setup()
         logger.info("async_postgres_checkpointer_schema_initialized", schema=schema)
     finally:
-        await setup_pool.close()
+        await setup_conn.close()
 
     # 第三步：创建正常的连接池（用于运行时 checkpoint 操作）
+    # 重要：通过 kwargs 的 options 参数设置 search_path
     pool = AsyncConnectionPool(
         conninfo=normalized_dsn,
         min_size=min_size,
         max_size=max_size,
-        kwargs={"options": f"-c search_path={schema}"},
+        kwargs={
+            "options": f"-c search_path={schema}",  # 在每个连接中设置 search_path
+        },
         open=False,
     )
     logger.info(
@@ -85,6 +86,7 @@ async def create_async_postgres_checkpointer(
     await pool.open()
 
     # 第四步：创建运行时 checkpointer（schema 已初始化，无需再次 setup）
+    # 注意：新版本不再支持 schema_name 参数，改用 search_path
     saver = AsyncPostgresSaver(pool)
     logger.info("async_postgres_checkpointer_ready", schema=schema)
 

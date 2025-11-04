@@ -16,14 +16,14 @@
 技术栈：
 - FastAPI: RESTful API
 - AsyncConnectionPool[DictRow]: PostgreSQL异步查询
-- OpenAI: LLM调用（glm-4.6）
+- OpenAI: LLM调用（glm-4-flash）
 - structlog: 结构化日志
 - Pydantic: 强类型请求/响应模型
 """
 
 from typing import List, Dict, Any, Optional
 from datetime import datetime
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Response
 from pydantic import BaseModel, Field
 from psycopg_pool import AsyncConnectionPool
 from psycopg.rows import DictRow, dict_row
@@ -140,7 +140,7 @@ class BatchWeatherPlanRequest(BaseModel):
 
 
 class BatchWeatherPlanResponse(BaseModel):
-    """批次天气计划响应"""
+    """批次天气计划响应（JSON格式 - 保留用于向后兼容）"""
 
     success: bool = Field(..., description="是否成功生成计划")
     batches: Optional[List[Batch]] = Field(None, description="批次列表（设备足够时）")
@@ -151,33 +151,56 @@ class BatchWeatherPlanResponse(BaseModel):
     estimated_total_hours: Optional[float] = Field(None, description="预计总完成时间（小时）")
 
 
+class BatchWeatherPlanMarkdownResponse(BaseModel):
+    """批次天气计划响应（Markdown格式 - 用于人类审阅）"""
+
+    markdown: str = Field(..., description="人类可读的Markdown格式报告")
+    raw_json: Dict[str, Any] = Field(..., description="原始JSON数据（审核通过后用于保存到数据库）")
+    summary: Dict[str, Any] = Field(..., description="方案摘要统计")
+
+
 # ============ API端点 ============
 
 
-@router.post("/batch-weather-plan", response_model=BatchWeatherPlanResponse)
-async def create_batch_weather_plan(
-    req: BatchWeatherPlanRequest,
-) -> BatchWeatherPlanResponse:
+@router.post("/batch-weather-plan")
+async def create_batch_weather_plan() -> Response:
     """
-    创建批次侦察天气计划
+    生成侦察方案的Markdown文档（供人类审阅和修改）
 
-    完整流程：
+    ⚠️ 演示接口：参数已写死为四川茂县7.5级地震场景
+    - 灾害类型：earthquake（地震）
+    - 严重等级：critical（最高级）
+    - 震中坐标：四川省阿坝藏族羌族自治州茂县 (103.85°E, 31.68°N)
+
+    工作流程：
     1. 计算灾害侦察半径（基于disaster_type）
     2. 查询范围内的优先目标（PostGIS距离查询）
     3. 查询可用侦察设备（is_recon=TRUE, in_task_use=0）
     4. 调用LLM评估设备天气适应性
-    5. 如果设备足够：
-       - 调用round-robin算法分配批次
-       - 返回批次计划
-    6. 如果设备不足：
-       - 查询真实增援来源
-       - 调用LLM生成可解释的增援请求
-       - 返回增援建议
+    5. 调用round-robin算法分配批次
+    6. 调用LLM生成人类可读的Markdown报告
+
+    返回：纯Markdown文本（text/markdown）
+
+    使用说明：
+    1. 前端调用此接口获得Markdown文档
+    2. 展示给人类审阅，可能需要修改内容
+    3. 修改完成后调用 /ai/recon/markdown-to-json 接口转换为JSON
+    4. 最后调用 /ai/recon/save-plan 保存到数据库
 
     每个步骤都有详细日志记录，支持完整的决策追踪。
     """
     # 获取或生成 trace_id（用于日志追踪）
     trace_id = get_trace_id() or str(uuid.uuid4())
+
+    # 写死参数：四川茂县7.5级地震场景
+    req = BatchWeatherPlanRequest(
+        disaster_type="earthquake",
+        epicenter=GeoPoint(lon=103.85, lat=31.68),  # 四川省茂县坐标
+        severity="critical",  # 最高等级
+        weather=None,  # 使用默认天气
+        weather_scenario="normal"  # 正常天气场景
+    )
 
     if _pg_pool_async is None:
         raise HTTPException(
@@ -365,20 +388,257 @@ async def create_batch_weather_plan(
             disaster_info=disaster_info,
             command_center={"lon": req.epicenter.lon, "lat": req.epicenter.lat},
             llm_client=llm_client,  # 已在Step 5创建
-            llm_model="glm-4.6",
+            llm_model="glm-4.6",  # 使用glm-4.6模型
             trace_id=trace_id,
         )
 
         logger.info("详细侦察方案生成完成", trace_id=trace_id)
 
-        return BatchWeatherPlanResponse(
-            success=True,
-            batches=allocation["batches"],
-            detailed_plan=detailed_plan,
-            reinforcement_request=None,
-            total_targets=len(targets),
-            suitable_devices_count=len(suitable_devices),
-            estimated_total_hours=total_hours,
+        # 调用LLM生成Markdown格式报告
+        logger.info("开始生成Markdown格式报告", trace_id=trace_id)
+
+        # 准备给LLM的上下文信息
+        import json
+        context_info = {
+            "disaster_type": req.disaster_type,
+            "severity": req.severity,
+            "epicenter": {"lon": req.epicenter.lon, "lat": req.epicenter.lat},
+            "total_targets": len(targets),
+            "total_devices": len(suitable_devices),
+            "total_batches": len(allocation["batches"]),
+            "estimated_hours": total_hours,
+        }
+
+        prompt = f"""你是一名应急救援指挥专家，需要根据侦察方案数据生成人类可读的Markdown格式报告。
+
+**灾情信息：**
+- 灾害类型：{req.disaster_type}
+- 严重等级：{req.severity}
+- 震中坐标：({req.epicenter.lon}, {req.epicenter.lat})
+- 目标数量：{len(targets)}
+- 可用设备：{len(suitable_devices)}
+- 批次数量：{len(allocation["batches"])}
+- 预计总时长：{total_hours}小时
+
+**详细方案数据：**
+{str(detailed_plan)[:5000]}
+
+**注意**：以上是Python字典格式的方案摘要（已截断）
+
+**报告要求：**
+
+1. **标题和概述**：
+   - 灾害类型、等级、地点（从disaster_info提取）
+   - 指挥中心位置和到达时间（从command_center提取）
+   - 配备的设备和车辆（从batches中的device_name汇总）
+   - 整体任务目标（从各section的tasks中提取关键信息）
+
+2. **空中侦察方案**（如果有air_recon_section）：
+   - 以指挥中心为出发点
+   - 列出所有空中侦察任务（从air_recon_section.tasks中提取）
+   - 每个任务包含：
+     * 任务名称（task_name或task_type）
+     * 设备选择（device_names和key_capabilities）
+     * 侦察详情（from_location, to_location, route_waypoints, actions, start_time, end_time）
+     * 结果上报（expected_outputs）
+
+3. **地面侦察方案**（如果有ground_recon_section）：
+   - 列出所有地面侦察任务
+   - 格式同空中侦察
+
+4. **水上侦察方案**（如果有water_recon_section）：
+   - 列出所有水上侦察任务
+   - 格式同空中侦察
+
+5. **数据整合与通信**：
+   - 数据整合说明（从data_integration_desc提取）
+   - 任务时间线（earliest_start_time, latest_end_time, total_estimated_hours）
+   - 安全措施和优先级
+
+**关键规则：**
+- 如果一个设备执行多个任务，每个任务单独成段，使用数字编号（1. 2. 3.）
+- 时间格式统一为 HH:MM:SS 或 YYYY-MM-DD HH:MM:SS
+- 坐标格式统一为 (经度, 纬度)
+- 设备能力要详细描述（从key_capabilities提取）
+- 语言流畅自然，符合专业报告风格
+- 使用Markdown标题层级：一级标题（灾害名称），二级标题（空中/地面/水上），三级标题（具体任务编号）
+
+**输出格式：**
+直接输出Markdown文本，不要包含```markdown标记。
+
+**示例格式参考：**
+# 针对四川茂县7.5级地震智能侦察方案
+
+（概述段落）
+
+## 一、空中侦察方案
+
+（空中侦察总体说明）
+
+### 1. 重灾区扫图建模
+**设备选择**：扫图建模无人机（具备激光雷达和多光谱传感器）。
+**侦察详情**：
+从水西村起飞...（详细描述）
+**结果上报**：重灾区三维地图...
+
+### 2. 受困人员搜索
+...
+
+## 二、地面侦察方案
+...
+
+**开始生成报告：**
+"""
+
+        # 分段生成Markdown报告（避免超过glm-4.6的4096 token限制）
+        sections = []
+
+        # 第1段：标题和概述
+        logger.info("生成第1段：标题和概述", trace_id=trace_id)
+        section1_prompt = f"""你是应急救援指挥专家。根据以下数据生成侦察方案报告的**标题和概述部分**。
+
+**上下文数据：**
+- 灾害类型：{req.disaster_type}
+- 严重等级：{req.severity}
+- 震中坐标：({req.epicenter.lon}, {req.epicenter.lat})
+- 目标数量：{len(targets)}
+- 可用设备：{len(suitable_devices)}
+- 批次数量：{len(allocation["batches"])}
+- 预计总时长：{total_hours}小时
+
+**详细数据（前3000字符）：**
+{str(detailed_plan)[:3000]}
+
+**输出要求：**
+生成报告的开头部分，包括：
+1. 一级标题：灾害名称和侦察方案标题
+2. 概述段落：灾情信息、指挥中心位置、配备设备、整体任务目标
+
+**输出格式：**
+纯Markdown文本，不要包含```markdown标记。
+"""
+
+        section1_response = llm_client.chat.completions.create(
+            model="glm-4.6",
+            messages=[{"role": "user", "content": section1_prompt}],
+            temperature=0.3,
+            max_tokens=4000,
+        )
+        sections.append(section1_response.choices[0].message.content.strip())
+
+        # 第2段：空中侦察方案（如果有）
+        if detailed_plan.get("air_recon_section"):
+            logger.info("生成第2段：空中侦察方案", trace_id=trace_id)
+            air_section = detailed_plan["air_recon_section"]
+            section2_prompt = f"""你是应急救援指挥专家。生成侦察方案报告的**空中侦察方案**部分。
+
+**空中侦察数据：**
+{str(air_section)[:3000]}
+
+**输出要求：**
+生成 ## 一、空中侦察方案 章节，包括：
+- 章节总体说明
+- 列出所有空中侦察任务（每个任务一个### 三级标题）
+- 每个任务包含：设备选择、侦察详情、结果上报
+
+**输出格式：**
+纯Markdown文本，以 "## 一、空中侦察方案" 开头。
+"""
+            section2_response = llm_client.chat.completions.create(
+                model="glm-4.6",
+                messages=[{"role": "user", "content": section2_prompt}],
+                temperature=0.3,
+                max_tokens=4000,
+            )
+            sections.append(section2_response.choices[0].message.content.strip())
+
+        # 第3段：地面侦察方案（如果有）
+        if detailed_plan.get("ground_recon_section"):
+            logger.info("生成第3段：地面侦察方案", trace_id=trace_id)
+            ground_section = detailed_plan["ground_recon_section"]
+            section3_prompt = f"""你是应急救援指挥专家。生成侦察方案报告的**地面侦察方案**部分。
+
+**地面侦察数据：**
+{str(ground_section)[:3000]}
+
+**输出要求：**
+生成 ## 二、地面侦察方案 章节，格式同空中侦察。
+
+**输出格式：**
+纯Markdown文本，以 "## 二、地面侦察方案" 开头。
+"""
+            section3_response = llm_client.chat.completions.create(
+                model="glm-4.6",
+                messages=[{"role": "user", "content": section3_prompt}],
+                temperature=0.3,
+                max_tokens=4000,
+            )
+            sections.append(section3_response.choices[0].message.content.strip())
+
+        # 第4段：水上侦察方案（如果有）
+        if detailed_plan.get("water_recon_section"):
+            logger.info("生成第4段：水上侦察方案", trace_id=trace_id)
+            water_section = detailed_plan["water_recon_section"]
+            section4_prompt = f"""你是应急救援指挥专家。生成侦察方案报告的**水上侦察方案**部分。
+
+**水上侦察数据：**
+{str(water_section)[:3000]}
+
+**输出要求：**
+生成 ## 三、水上侦察方案 章节，格式同空中侦察。
+
+**输出格式：**
+纯Markdown文本，以 "## 三、水上侦察方案" 开头。
+"""
+            section4_response = llm_client.chat.completions.create(
+                model="glm-4.6",
+                messages=[{"role": "user", "content": section4_prompt}],
+                temperature=0.3,
+                max_tokens=4000,
+            )
+            sections.append(section4_response.choices[0].message.content.strip())
+
+        # 第5段：数据整合与通信
+        logger.info("生成第5段：数据整合与通信", trace_id=trace_id)
+        section5_prompt = f"""你是应急救援指挥专家。生成侦察方案报告的**数据整合与通信**部分。
+
+**时间线信息：**
+- 最早开始时间：{detailed_plan.get("earliest_start_time", "未知")}
+- 最晚结束时间：{detailed_plan.get("latest_end_time", "未知")}
+- 总预计时长：{detailed_plan.get("total_estimated_hours", total_hours)}小时
+
+**数据整合说明：**
+{detailed_plan.get("data_integration_desc", "集中回传至指挥中心")}
+
+**输出要求：**
+生成最后一个章节，包括：
+- 数据整合说明
+- 任务时间线
+- 安全措施和优先级
+
+**输出格式：**
+纯Markdown文本，以 "## 四、数据整合与通信" 开头（编号根据前面章节调整）。
+"""
+        section5_response = llm_client.chat.completions.create(
+            model="glm-4.6",
+            messages=[{"role": "user", "content": section5_prompt}],
+            temperature=0.3,
+            max_tokens=4000,
+        )
+        sections.append(section5_response.choices[0].message.content.strip())
+
+        # 拼接所有章节
+        markdown_text = "\n\n".join(sections)
+
+        logger.info("Markdown报告分段生成完成",
+                   sections_count=len(sections),
+                   total_length=len(markdown_text),
+                   trace_id=trace_id)
+
+        # 直接返回纯Markdown文本（供人类审阅和修改）
+        return Response(
+            content=markdown_text,
+            media_type="text/markdown; charset=utf-8",
         )
 
     # ============ 增援分析（已注释）============
@@ -1018,10 +1278,10 @@ async def format_plan_markdown(
 
         # 调用LLM生成Markdown
         response = client.chat.completions.create(
-            model="glm-4-plus",  # 使用更强大的模型以获得更好的格式化效果
+            model="glm-4.6",  # 使用glm-4.6模型
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,  # 保持一致性，但允许适当的语言变化
-            max_tokens=8000,  # Markdown报告可能较长
+            max_tokens=8000,  # GLM-4系列最大输出限制为8192
         )
 
         markdown_text = response.choices[0].message.content.strip()

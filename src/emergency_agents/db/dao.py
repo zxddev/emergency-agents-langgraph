@@ -241,6 +241,53 @@ class DeviceDAO:
         )
         return record
 
+    async def fetch_video_device_by_name_exact(self, device_name: str) -> VideoDevice | None:
+        """按名称精确匹配（大小写不敏感）查询视频设备。
+
+        约束：device.name 在数据库层已保证唯一（lower(name) 唯一）。
+        命中 0 条返回 None；命中 1 条返回 VideoDevice；若出现多条则属数据一致性问题，
+        交由上层感知（本方法不做静默选取）。
+        """
+        start = time.perf_counter()
+        query = """
+            SELECT d.id::text AS id,
+                   d.device_type,
+                   d.name,
+                   COALESCE(dvl.video_link, dd.device_detail->>'stream_url') AS stream_url
+              FROM operational.device d
+              LEFT JOIN operational.device_video_link dvl
+                     ON dvl.id = d.id
+              LEFT JOIN operational.device_detail dd
+                     ON dd.device_id = d.id
+             WHERE lower(d.name) = lower(%(device_name)s)
+        """
+        async with self._pool.connection() as conn:
+            async with conn.cursor(row_factory=class_row(VideoDevice)) as cur:
+                await cur.execute(query, {"device_name": device_name})
+                rows = await cur.fetchall()
+
+        duration = time.perf_counter() - start
+        DAO_CALL_LATENCY.labels("device", "fetch_video_by_name_exact").observe(duration)
+        DAO_CALL_TOTAL.labels(
+            "device", "fetch_video_by_name_exact", "found" if rows else "not_found"
+        ).inc()
+        logger.info(
+            "dao_device_fetch_video_by_name_exact",
+            duration_ms=duration * 1000,
+            device_name=device_name,
+            hit_count=len(rows),
+        )
+        if not rows:
+            return None
+        if len(rows) > 1:
+            # 多条命中应由上层视为数据一致性错误
+            logger.error(
+                "dao_device_fetch_video_by_name_exact_multiple",
+                device_name=device_name,
+                hit_count=len(rows),
+            )
+        return rows[0]
+
     async def fetch_video_device_by_name(self, device_name: str) -> VideoDevice | None:
         """根据设备名称查询视频设备信息
 
@@ -279,6 +326,138 @@ class DeviceDAO:
             has_stream=bool(record and record.stream_url),
         )
         return record
+
+    async def fetch_video_device_by_alias_exact(self, alias: str) -> VideoDevice | None:
+        """按别名精确匹配（大小写不敏感）查询视频设备。
+
+        依赖表：operational.device_alias(alias text, device_id uuid)。
+        命中 0 条返回 None；命中 1 条返回 VideoDevice。
+        """
+        start = time.perf_counter()
+        query = """
+            SELECT d.id::text AS id,
+                   d.device_type,
+                   d.name,
+                   COALESCE(dvl.video_link, dd.device_detail->>'stream_url') AS stream_url
+              FROM operational.device_alias a
+              JOIN operational.device d
+                ON d.id = a.device_id
+              LEFT JOIN operational.device_video_link dvl
+                ON dvl.id = d.id
+              LEFT JOIN operational.device_detail dd
+                ON dd.device_id = d.id
+             WHERE lower(a.alias) = lower(%(alias)s)
+        """
+        async with self._pool.connection() as conn:
+            async with conn.cursor(row_factory=class_row(VideoDevice)) as cur:
+                await cur.execute(query, {"alias": alias})
+                rows = await cur.fetchall()
+        duration = time.perf_counter() - start
+        DAO_CALL_LATENCY.labels("device", "fetch_video_by_alias_exact").observe(duration)
+        DAO_CALL_TOTAL.labels(
+            "device", "fetch_video_by_alias_exact", "found" if rows else "not_found"
+        ).inc()
+        logger.info(
+            "dao_device_fetch_video_by_alias_exact",
+            duration_ms=duration * 1000,
+            alias=alias,
+            hit_count=len(rows),
+        )
+        if not rows:
+            return None
+        if len(rows) > 1:
+            logger.error(
+                "dao_device_fetch_video_by_alias_exact_multiple",
+                alias=alias,
+                hit_count=len(rows),
+            )
+        return rows[0]
+
+    async def suggest_devices_by_name_or_alias(
+        self, query_text: str, limit: int = 5
+    ) -> list[DeviceSummary]:
+        """基于名称或别名给出候选设备（仅用于错误提示，不用于自动命中）。
+
+        使用 ILIKE 提供包含匹配；若部署启用 pg_trgm 可改用相似度排序。
+        """
+        start = time.perf_counter()
+        sql = """
+            WITH candidates AS (
+                SELECT d.id::text   AS id,
+                       d.device_type AS device_type,
+                       d.name       AS name
+                  FROM operational.device d
+                 WHERE d.name ILIKE %(pat)s
+                UNION ALL
+                SELECT d.id::text   AS id,
+                       d.device_type AS device_type,
+                       d.name       AS name
+                  FROM operational.device_alias a
+                  JOIN operational.device d ON d.id = a.device_id
+                 WHERE a.alias ILIKE %(pat)s
+            )
+            SELECT id, device_type, name
+              FROM candidates
+             GROUP BY id, device_type, name
+             ORDER BY name ASC
+             LIMIT %(limit)s
+        """
+        pat = f"%{query_text}%"
+        async with self._pool.connection() as conn:
+            async with conn.cursor(row_factory=class_row(DeviceSummary)) as cur:
+                await cur.execute(sql, {"pat": pat, "limit": limit})
+                rows = await cur.fetchall()
+                result = list(rows)
+        duration = time.perf_counter() - start
+        DAO_CALL_LATENCY.labels("device", "suggest_by_name_or_alias").observe(duration)
+        DAO_CALL_TOTAL.labels("device", "suggest_by_name_or_alias", "success").inc()
+        logger.info(
+            "dao_device_suggest_by_name_or_alias",
+            duration_ms=duration * 1000,
+            query=query_text,
+            count=len(result),
+        )
+        return result
+
+    async def list_video_capable_devices(self, limit: int = 10) -> list[DeviceSummary]:
+        """列出具备视频链接的设备（用于澄清候选）。
+
+        优先依据 device_video_link.video_link 过滤；其次依据 device_detail.stream_url。
+        返回去重后的设备摘要，按名称排序。
+        """
+        start = time.perf_counter()
+        sql = """
+            WITH candidates AS (
+                SELECT d.id::text AS id, d.device_type, d.name
+                  FROM operational.device d
+                  JOIN operational.device_video_link dvl ON dvl.id = d.id
+                 WHERE COALESCE(NULLIF(dvl.video_link, ''), '') <> ''
+                UNION ALL
+                SELECT d.id::text AS id, d.device_type, d.name
+                  FROM operational.device d
+                  JOIN operational.device_detail dd ON dd.device_id = d.id
+                 WHERE COALESCE(NULLIF(dd.device_detail->>'stream_url', ''), '') <> ''
+            )
+            SELECT id, device_type, name
+              FROM candidates
+             GROUP BY id, device_type, name
+             ORDER BY name ASC
+             LIMIT %(limit)s
+        """
+        async with self._pool.connection() as conn:
+            async with conn.cursor(row_factory=class_row(DeviceSummary)) as cur:
+                await cur.execute(sql, {"limit": limit})
+                rows = await cur.fetchall()
+                result = list(rows)
+        duration = time.perf_counter() - start
+        DAO_CALL_LATENCY.labels("device", "list_video_capable").observe(duration)
+        DAO_CALL_TOTAL.labels("device", "list_video_capable", "success").inc()
+        logger.info(
+            "dao_device_list_video_capable",
+            duration_ms=duration * 1000,
+            count=len(result),
+        )
+        return result
 
     async def get_all_device_name_to_id_map(self) -> dict[str, str]:
         """获取所有设备的名称到ID的映射
@@ -463,6 +642,49 @@ class TaskDAO:
         logger.info(
             "dao_task_list_recent_tasks",
             duration_ms=duration * 1000,
+            hours=hours,
+            count=len(result),
+        )
+        return result
+
+    async def list_tasks_by_event(self, event_id: str, hours: int = 24) -> list[TaskSummary]:
+        """按事件过滤最近N小时任务列表。
+
+        Args:
+            event_id: 事件ID(UUID)
+            hours: 时间范围(小时)
+
+        Returns:
+            指定事件的任务列表,按创建时间倒序。
+        """
+        if not event_id:
+            raise ValueError("event_id 不能为空")
+        query = (
+            "SELECT id::text AS id, "
+            "       code, "
+            "       description, "
+            "       status, "
+            "       progress, "
+            "       updated_at "
+            "  FROM operational.tasks "
+            " WHERE event_id = %(event_id)s::uuid "
+            "   AND created_at >= NOW() - make_interval(hours => %(hours)s) "
+            "   AND deleted_at IS NULL "
+            " ORDER BY created_at DESC"
+        )
+        start = time.perf_counter()
+        async with self._pool.connection() as conn:
+            async with conn.cursor(row_factory=class_row(TaskSummary)) as cur:
+                await cur.execute(query, {"event_id": event_id, "hours": hours})
+                rows = await cur.fetchall()
+                result = list(rows)
+        duration = time.perf_counter() - start
+        DAO_CALL_LATENCY.labels("task", "list_tasks_by_event").observe(duration)
+        DAO_CALL_TOTAL.labels("task", "list_tasks_by_event", "success").inc()
+        logger.info(
+            "dao_task_list_tasks_by_event",
+            duration_ms=duration * 1000,
+            event_id=event_id,
             hours=hours,
             count=len(result),
         )

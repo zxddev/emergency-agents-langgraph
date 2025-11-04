@@ -108,6 +108,14 @@ def _enforce_required_fields(intent_type: Optional[str], slots: Dict[str, Any]) 
         if not _has_location(slots):
             missing.append("location")
 
+    if canonical == "task-progress-query":
+        # 任务进度查询：task_id 与 task_code 至少一项
+        tid = slots.get("task_id")
+        tcode = slots.get("task_code")
+        if not (_has_non_empty_text(str(tid) if tid is not None else "") or _has_non_empty_text(str(tcode) if tcode is not None else "")):
+            # 用 task_id 作为缺失标记，后续由会话上下文谨慎自动绑定或走澄清
+            missing.append("task_id")
+
     return missing
 
 
@@ -153,6 +161,12 @@ def validate_and_prompt_node(state: Dict[str, Any], llm_client, llm_model: str) 
     """
     intent = state.get("intent") or {}
     intent_type = intent.get("intent_type")
+    # 兼容别名：将 video_analyze / video-analysis / video_analysis 等归并为 video-analysis
+    if isinstance(intent_type, str):
+        normalized = intent_type.strip().replace(" ", "").lower()
+        if normalized in {"video_analyze", "videoanalyze", "video-analysis", "video_analysis"}:
+            intent_type = "video-analysis"
+            intent = intent | {"intent_type": intent_type}
     slots = intent.get("slots") or {}
 
     from emergency_agents.intent.schemas import INTENT_SCHEMAS

@@ -256,6 +256,24 @@ class VideoAnalysisSlots(BaseSlots):
 
 # ===== UI 控制最小槽位 =====
 
+# ===== 通用澄清交互结构 =====
+from typing import TypedDict, NotRequired
+
+
+class ClarifyOption(TypedDict):
+    """澄清选项（强类型）。"""
+    label: str
+    device_id: str
+
+
+class ClarifyRequest(TypedDict):
+    """澄清请求（用于 interrupt 与前端 UI）。"""
+    type: str  # 固定为 "clarify"
+    slot: str  # 例如 "device_name"
+    options: List[ClarifyOption]
+    reason: NotRequired[str]
+    default_index: NotRequired[int]
+
 @dataclass
 class UICameraFlytoSlots(BaseSlots):
     """UI 镜头飞行槽位。"""

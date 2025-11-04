@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field, NonNegativeFloat, NonNegativeInt, Positiv
 from emergency_agents.config import AppConfig
 from emergency_agents.llm.client import get_openai_client
 from emergency_agents.llm.prompts.rescue_assessment import build_rescue_assessment_prompt
+from emergency_agents.llm.prompts.post_rescue_assessment import build_post_rescue_assessment_prompt
 
 logger = structlog.get_logger(__name__)
 
@@ -387,7 +388,7 @@ async def generate_rescue_assessment(payload: RescueAssessmentInput) -> RescueAs
         completion = llm_client.chat.completions.create(
             model="glm-4.6",
             temperature=0.2,
-            max_tokens=2000,
+            max_tokens=8000,  # 提升至8000以支持完整的9章节报告生成
             presence_penalty=0,
             frequency_penalty=0,
             messages=[
@@ -701,4 +702,531 @@ def _calculate_confidence_score(
     )
 
     return round(confidence, 3)
+
+
+# ============================================================================
+# 救援评估报告（Post-Rescue Assessment）数据模型
+# 用于救灾结束后的总结性评估报告生成
+# ============================================================================
+
+
+class ResponseLevel(str, Enum):
+    """应急响应级别"""
+    LEVEL_I = "一级响应"  # 特别重大
+    LEVEL_II = "二级响应"  # 重大
+    LEVEL_III = "三级响应"  # 较大
+    LEVEL_IV = "四级响应"  # 一般
+
+
+class DisasterOverview(BaseModel):
+    """灾害基本概况"""
+    disaster_type: DisasterType = Field(..., description="灾害类型")
+    disaster_name: str = Field(..., description="灾害事件名称，如'汶川8.0级地震'")
+    occurrence_time: datetime = Field(..., description="灾害发生时间")
+    end_time: datetime = Field(..., description="救援结束时间")
+    location: str = Field(..., description="主要影响区域")
+    disaster_scale: str = Field(..., description="灾害规模描述（如震级、洪峰流量等）")
+    affected_area_km2: Optional[NonNegativeFloat] = Field(None, description="受灾面积（平方公里）")
+
+    # 灾情统计（最终统计）
+    final_deaths: NonNegativeInt = Field(..., description="最终死亡人数（含失踪）")
+    final_injured: NonNegativeInt = Field(..., description="最终受伤人数")
+    affected_population: NonNegativeInt = Field(..., description="受灾人口")
+    economic_loss_billion: Optional[NonNegativeFloat] = Field(None, description="直接经济损失（亿元）")
+
+
+class ResponseActivation(BaseModel):
+    """应急响应启动信息"""
+    response_level: ResponseLevel = Field(..., description="启动的应急响应级别")
+    activation_time: datetime = Field(..., description="响应启动时间")
+    command_center: str = Field(..., description="指挥机构名称")
+    leading_unit: str = Field(..., description="牵头单位")
+    participating_departments: List[str] = Field(
+        default_factory=list,
+        description="参与部门列表"
+    )
+    legal_basis: Optional[str] = Field(None, description="启动依据（预案名称）")
+
+
+class TimelineEvent(BaseModel):
+    """关键时间节点"""
+    time: datetime = Field(..., description="事件发生时间")
+    event_type: str = Field(..., description="事件类型（如'灾害发生'、'响应启动'、'首支队伍到达'）")
+    description: str = Field(..., description="事件描述")
+    significance: Optional[str] = Field(None, description="该节点的重要意义")
+
+
+class DeployedForce(BaseModel):
+    """投入救援力量详情"""
+    force_type: str = Field(..., description="力量类型（如'消防救援'、'武警部队'、'医疗队伍'）")
+    force_name: str = Field(..., description="具体单位名称")
+    personnel: PositiveInt = Field(..., description="投入人数")
+    arrival_time: Optional[datetime] = Field(None, description="到位时间")
+    main_equipment: Optional[str] = Field(None, description="主要装备")
+    assigned_tasks: str = Field(..., description="承担的主要任务")
+
+    # 成效统计
+    rescued_people: Optional[NonNegativeInt] = Field(None, description="搜救人数")
+    completed_tasks: Optional[str] = Field(None, description="完成任务情况")
+
+
+class RescueStatistics(BaseModel):
+    """救援成效统计"""
+    # 人员搜救
+    total_rescued: NonNegativeInt = Field(..., description="累计搜救人数")
+    rescued_alive: NonNegativeInt = Field(..., description="成功救出生还者人数")
+
+    # 转移安置
+    evacuated_people: NonNegativeInt = Field(..., description="紧急转移人数")
+    resettled_people: NonNegativeInt = Field(..., description="安置人数")
+
+    # 医疗救治
+    treated_patients: NonNegativeInt = Field(..., description="累计救治伤员人数")
+    transferred_critical: Optional[NonNegativeInt] = Field(None, description="转运重伤员人数")
+
+    # 物资发放
+    relief_materials_distributed: Optional[str] = Field(None, description="发放救灾物资情况")
+
+    # 基础设施抢通
+    roads_reopened_km: Optional[NonNegativeFloat] = Field(None, description="抢通道路里程（公里）")
+    power_restored_households: Optional[NonNegativeInt] = Field(None, description="恢复供电户数")
+    water_restored_households: Optional[NonNegativeInt] = Field(None, description="恢复供水户数")
+
+
+class CoordinationInfo(BaseModel):
+    """协同配合情况"""
+    government_agencies: Optional[str] = Field(None, description="政府部门协同情况")
+    military_cooperation: Optional[str] = Field(None, description="军地协同情况")
+    social_forces: Optional[str] = Field(None, description="社会力量参与情况")
+    inter_regional: Optional[str] = Field(None, description="跨区域协作情况")
+    information_sharing: Optional[str] = Field(None, description="信息共享机制运行情况")
+    coordination_effectiveness: Optional[str] = Field(
+        None,
+        description="协同配合效果总体评价"
+    )
+
+
+class ChallengesEncountered(BaseModel):
+    """遇到的困难和问题"""
+    access_difficulties: Optional[str] = Field(None, description="交通受阻、通达困难")
+    communication_issues: Optional[str] = Field(None, description="通信中断、信息不畅")
+    equipment_shortages: Optional[str] = Field(None, description="装备不足或不适用")
+    personnel_issues: Optional[str] = Field(None, description="人员配置、专业能力不足")
+    weather_impact: Optional[str] = Field(None, description="恶劣天气影响")
+    secondary_disasters: Optional[str] = Field(None, description="次生灾害威胁")
+    coordination_problems: Optional[str] = Field(None, description="协调配合方面的问题")
+    other_challenges: Optional[str] = Field(None, description="其他困难和挑战")
+
+
+class ResourceUtilization(BaseModel):
+    """资源投入与消耗统计"""
+    total_personnel: PositiveInt = Field(..., description="累计投入救援人员总数")
+    total_vehicles: Optional[NonNegativeInt] = Field(None, description="投入车辆总数")
+    aircraft_sorties: Optional[NonNegativeInt] = Field(None, description="航空器出动架次")
+
+    # 物资消耗
+    relief_tents: Optional[NonNegativeInt] = Field(None, description="发放帐篷（顶）")
+    relief_quilts: Optional[NonNegativeInt] = Field(None, description="发放棉被（床）")
+    food_tons: Optional[NonNegativeFloat] = Field(None, description="发放食品（吨）")
+    water_tons: Optional[NonNegativeFloat] = Field(None, description="发放饮用水（吨）")
+
+    # 资金投入
+    total_funds_million: Optional[NonNegativeFloat] = Field(
+        None,
+        description="累计投入资金（百万元）"
+    )
+    central_funds_million: Optional[NonNegativeFloat] = Field(
+        None,
+        description="中央财政资金（百万元）"
+    )
+    local_funds_million: Optional[NonNegativeFloat] = Field(
+        None,
+        description="地方财政资金（百万元）"
+    )
+
+
+class PostRescueAssessmentInput(BaseModel):
+    """救援评估报告输入数据（救灾结束后）"""
+    disaster_overview: DisasterOverview = Field(..., description="灾害基本概况")
+    response_activation: ResponseActivation = Field(..., description="应急响应启动信息")
+    timeline: List[TimelineEvent] = Field(
+        default_factory=list,
+        description="关键时间节点（按时间顺序）"
+    )
+    forces_deployed: List[DeployedForce] = Field(
+        default_factory=list,
+        description="投入救援力量详情"
+    )
+    rescue_statistics: RescueStatistics = Field(..., description="救援成效统计")
+    coordination: CoordinationInfo = Field(..., description="协同配合情况")
+    challenges: ChallengesEncountered = Field(..., description="遇到的困难和问题")
+    resource_utilization: ResourceUtilization = Field(..., description="资源投入与消耗")
+
+    # 可选字段：经验教训和改进建议可由LLM基于数据生成
+    lessons_learned: Optional[str] = Field(
+        None,
+        description="（可选）已识别的经验教训总结"
+    )
+    improvement_suggestions: Optional[str] = Field(
+        None,
+        description="（可选）已识别的改进建议"
+    )
+
+
+class PostRescueAssessmentResponse(BaseModel):
+    """救援评估报告响应（事后总结）"""
+    report_text: str = Field(..., description="完整的救援评估报告，Markdown格式")
+    key_metrics: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="关键量化指标（响应及时性、救援成功率、资源利用效率等）"
+    )
+    data_sources: List[str] = Field(
+        default_factory=list,
+        description="报告生成使用的数据来源"
+    )
+    confidence_score: float = Field(
+        ...,
+        ge=0.0,
+        le=1.0,
+        description="报告置信度评分（0-1），基于数据完整性评估"
+    )
+    referenced_specs: List[str] = Field(
+        default_factory=list,
+        description="引用的评估标准和规范文档"
+    )
+    referenced_cases: List[str] = Field(
+        default_factory=list,
+        description="引用的历史案例用于对比分析"
+    )
+    errors: List[str] = Field(
+        default_factory=list,
+        description="数据获取过程中的错误或警告"
+    )
+
+
+@router.post("/post-rescue-assessment", response_model=PostRescueAssessmentResponse)
+async def generate_post_rescue_assessment(
+    payload: PostRescueAssessmentInput
+) -> PostRescueAssessmentResponse:
+    """生成救援评估报告（事后总结）。
+
+    本接口用于救灾结束后的总结性评估，重点在于：
+    1. 客观评估救援成效
+    2. 量化关键指标（响应及时性、救援成功率、资源利用效率）
+    3. 对比分析（与预案要求、历史案例对比）
+    4. 问题总结与改进建议
+
+    流程：
+    1. 计算关键量化指标
+    2. 调用KG检索历史案例用于对比
+    3. 调用RAG检索评估标准和规范
+    4. 构造评估报告prompt（包含对比分析要求）
+    5. 调用LLM生成报告
+    6. 计算置信度评分
+    """
+    total_start = time.perf_counter()
+    cfg = AppConfig.load_from_env()
+
+    disaster_name = payload.disaster_overview.disaster_name
+    disaster_type = payload.disaster_overview.disaster_type.value
+
+    logger.info(
+        "post_rescue_assessment_start",
+        disaster_name=disaster_name,
+        disaster_type=disaster_type,
+        response_level=payload.response_activation.response_level.value,
+    )
+
+    data_sources: List[str] = []
+    errors: List[str] = []
+    spec_titles: List[str] = []
+    case_titles: List[str] = []
+    reference_materials: List[str] = []
+
+    # ============ 计算关键量化指标 ============
+    key_metrics = {}
+
+    try:
+        # 响应及时性（秒）
+        response_time_delta = (
+            payload.response_activation.activation_time
+            - payload.disaster_overview.occurrence_time
+        )
+        key_metrics["response_time_seconds"] = response_time_delta.total_seconds()
+        key_metrics["response_time_hours"] = round(response_time_delta.total_seconds() / 3600, 2)
+
+        # 救援持续时间（天）
+        rescue_duration = (
+            payload.disaster_overview.end_time
+            - payload.disaster_overview.occurrence_time
+        )
+        key_metrics["rescue_duration_days"] = round(rescue_duration.total_seconds() / 86400, 2)
+
+        # 救援成功率
+        if payload.rescue_statistics.total_rescued > 0:
+            success_rate = (
+                payload.rescue_statistics.rescued_alive
+                / payload.rescue_statistics.total_rescued
+            )
+            key_metrics["rescue_success_rate"] = round(success_rate, 4)
+
+        # 人均救援人数
+        if payload.resource_utilization.total_personnel > 0:
+            per_capita = (
+                payload.rescue_statistics.total_rescued
+                / payload.resource_utilization.total_personnel
+            )
+            key_metrics["per_capita_rescued"] = round(per_capita, 2)
+
+        logger.info(
+            "key_metrics_calculated",
+            **key_metrics
+        )
+
+    except Exception as e:
+        logger.warning(
+            "key_metrics_calculation_failed",
+            error=str(e)
+        )
+        errors.append(f"关键指标计算失败: {str(e)}")
+
+    # ============ KG：检索历史案例 ============
+    kg_start = time.perf_counter()
+    try:
+        if _kg_service is None:
+            raise RuntimeError("KG Service 未初始化")
+
+        logger.info(
+            "kg_search_cases_start",
+            disaster_type=disaster_type,
+        )
+
+        # KGService.search_cases的参数是keywords(str)和top_k
+        # 拼接灾害类型和地点作为关键词
+        search_keywords = f"{disaster_type} {payload.disaster_overview.location}"
+        kg_cases = _kg_service.search_cases(
+            keywords=search_keywords,
+            top_k=3
+        )
+
+        kg_elapsed_ms = int((time.perf_counter() - kg_start) * 1000)
+        logger.info(
+            "kg_search_cases_success",
+            result_count=len(kg_cases),
+            latency_ms=kg_elapsed_ms,
+        )
+
+        if kg_cases:
+            data_sources.append("知识图谱-历史案例")
+            case_titles.extend([case["title"] for case in kg_cases])
+
+            case_summaries = []
+            for case in kg_cases:
+                summary = (
+                    f"【案例】{case['title']}\n"
+                    f"- 时间：{case.get('date', '未知')}\n"
+                    f"- 伤亡：{case.get('casualties', '未知')}\n"
+                    f"- 救援成效：{case.get('rescue_outcome', '未知')}\n"
+                    f"- 经验教训：{case.get('lessons', '未知')}"
+                )
+                case_summaries.append(summary)
+
+            if case_summaries:
+                reference_materials.append(
+                    "## 历史案例对比\n" + "\n\n".join(case_summaries)
+                )
+
+    except Exception as exc:
+        kg_elapsed_ms = int((time.perf_counter() - kg_start) * 1000)
+        logger.warning(
+            "kg_search_cases_failed",
+            error=str(exc),
+            latency_ms=kg_elapsed_ms,
+        )
+        errors.append(f"历史案例检索失败: {str(exc)}")
+
+    # ============ RAG：检索评估标准规范 ============
+    rag_start = time.perf_counter()
+    try:
+        if _rag_pipeline is None:
+            raise RuntimeError("RAG Pipeline 未初始化")
+
+        query_text = (
+            f"{disaster_type}救援评估标准 应急响应效果评估 "
+            f"救援成效评估指标 地震灾害调查评估规范"
+        )
+
+        logger.info(
+            "rag_query_start",
+            query=query_text,
+        )
+
+        # RagPipeline.query的参数是question(str)、domain和top_k
+        rag_results = _rag_pipeline.query(
+            question=query_text,
+            domain="规范",
+            top_k=3
+        )
+
+        rag_elapsed_ms = int((time.perf_counter() - rag_start) * 1000)
+        logger.info(
+            "rag_query_success",
+            result_count=len(rag_results),
+            latency_ms=rag_elapsed_ms,
+        )
+
+        if rag_results:
+            data_sources.append("RAG规范库")
+            for doc in rag_results:
+                spec_titles.append(doc.get("title", "未知文档"))
+                ref_text = (
+                    f"【规范】{doc['title']}\n{doc.get('snippet', '')}"
+                )
+                reference_materials.append(ref_text)
+
+    except Exception as exc:
+        rag_elapsed_ms = int((time.perf_counter() - rag_start) * 1000)
+        logger.warning(
+            "rag_query_failed",
+            error=str(exc),
+            latency_ms=rag_elapsed_ms,
+        )
+        errors.append(f"评估标准检索失败: {str(exc)}")
+
+    # ============ 构造提示词 ============
+    payload_dict = payload.model_dump(mode="json")
+    prompt = build_post_rescue_assessment_prompt(
+        payload=payload_dict,
+        reference_materials=reference_materials if reference_materials else None
+    )
+
+    logger.info(
+        "prompt_built",
+        prompt_length=len(prompt),
+        reference_count=len(reference_materials),
+    )
+
+    # ============ LLM生成报告 ============
+    llm_client = get_openai_client(cfg)
+    llm_start = time.perf_counter()
+
+    try:
+        completion = llm_client.chat.completions.create(
+            model="glm-4.6",
+            temperature=0.2,
+            max_tokens=10000,  # 评估报告可能更长，需要详细分析
+            presence_penalty=0,
+            frequency_penalty=0,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "你是一名应急管理评估专家，擅长撰写客观、专业的救援评估报告。"
+                        "你必须严格基于提供的数据进行分析，不得虚构或夸大。"
+                        "你的报告将用于总结经验、查找不足、改进应急响应能力。"
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+        )
+    except Exception as exc:
+        llm_elapsed_ms = int((time.perf_counter() - llm_start) * 1000)
+        logger.exception(
+            "post_rescue_assessment_llm_failed",
+            latency_ms=llm_elapsed_ms,
+            disaster_name=disaster_name,
+        )
+        raise HTTPException(status_code=502, detail="模型生成失败，请稍后重试") from exc
+
+    llm_elapsed_ms = int((time.perf_counter() - llm_start) * 1000)
+    content = completion.choices[0].message.content if completion.choices else None
+
+    if not content:
+        logger.error(
+            "post_rescue_assessment_empty_response",
+            latency_ms=llm_elapsed_ms,
+            disaster_name=disaster_name,
+        )
+        raise HTTPException(status_code=502, detail="模型未返回有效内容")
+
+    logger.info(
+        "post_rescue_assessment_llm_success",
+        latency_ms=llm_elapsed_ms,
+        output_length=len(content),
+    )
+
+    # ============ 计算置信度评分 ============
+    input_completeness = _calculate_post_rescue_input_completeness(payload)
+    confidence_score = _calculate_confidence_score(
+        input_completeness=input_completeness,
+        spec_count=len(spec_titles),
+        case_count=len(case_titles),
+        equipment_count=0,  # 评估报告不涉及装备推荐
+    )
+
+    logger.info(
+        "confidence_score_calculated",
+        input_completeness=input_completeness,
+        spec_count=len(spec_titles),
+        case_count=len(case_titles),
+        confidence_score=confidence_score,
+    )
+
+    total_elapsed_ms = int((time.perf_counter() - total_start) * 1000)
+
+    logger.info(
+        "post_rescue_assessment_completed",
+        total_latency_ms=total_elapsed_ms,
+        disaster_name=disaster_name,
+        confidence_score=confidence_score,
+        data_sources_count=len(data_sources),
+        errors_count=len(errors),
+    )
+
+    return PostRescueAssessmentResponse(
+        report_text=content,
+        key_metrics=key_metrics,
+        data_sources=data_sources,
+        confidence_score=confidence_score,
+        referenced_specs=spec_titles,
+        referenced_cases=case_titles,
+        errors=errors,
+    )
+
+
+def _calculate_post_rescue_input_completeness(payload: PostRescueAssessmentInput) -> float:
+    """计算救援评估报告输入数据的完整性（0-1）。
+
+    评估维度：
+    1. 必填字段完整性（40%）
+    2. 时间轴数据（20%）
+    3. 救援力量详情（20%）
+    4. 资源消耗统计（20%）
+    """
+    scores = []
+
+    # 1. 必填字段（disaster_overview, response_activation, rescue_statistics, resource_utilization）
+    required_fields_score = 1.0  # 这些是必填的，Pydantic已验证
+    scores.append(required_fields_score * 0.4)
+
+    # 2. 时间轴完整性
+    timeline_score = min(len(payload.timeline) / 5.0, 1.0)  # 预期至少5个关键节点
+    scores.append(timeline_score * 0.2)
+
+    # 3. 救援力量详情
+    forces_score = min(len(payload.forces_deployed) / 5.0, 1.0)  # 预期至少5支队伍
+    scores.append(forces_score * 0.2)
+
+    # 4. 资源消耗统计
+    resource_fields = [
+        payload.resource_utilization.total_vehicles,
+        payload.resource_utilization.aircraft_sorties,
+        payload.resource_utilization.relief_tents,
+        payload.resource_utilization.total_funds_million,
+    ]
+    filled_count = sum(1 for field in resource_fields if field is not None)
+    resource_score = filled_count / len(resource_fields)
+    scores.append(resource_score * 0.2)
+
+    return round(sum(scores), 3)
 

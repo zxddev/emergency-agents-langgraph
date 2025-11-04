@@ -9,7 +9,10 @@ import time
 import itertools
 import logging
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
+from anyio import to_thread
+from psycopg_pool import AsyncConnectionPool
+from psycopg.rows import DictRow
 from pydantic import BaseModel, Field, ValidationError
 
 from emergency_agents.planner import (
@@ -24,6 +27,8 @@ from emergency_agents.planner.models import (
     ResourceCandidate,
     ResourcePlanningResult,
 )
+from emergency_agents.external.recon_gateway import PostgresReconGateway
+from emergency_agents.planner.recon_models import ReconDevice
 
 
 # =============================
@@ -111,6 +116,10 @@ logger = logging.getLogger(__name__)
 _HAZARD_LOADER = HazardPackLoader()
 _TASK_ENGINE = TaskTemplateEngine()
 _RESOURCE_MATCHER = ResourceMatcher()
+
+# 依赖注入: 由 main.py 在startup时写入
+_pg_pool_async: Optional[AsyncConnectionPool[DictRow]] = None
+_recon_gateway: Optional[PostgresReconGateway] = None
 
 
 # =============================
@@ -375,6 +384,178 @@ def recommend_plan(req: PlanRecommendRequest) -> PlanRecommendResponse:
     )
 
     return response
+
+
+# =============================
+# 基于任务进度生成救援方案(专业版)
+# =============================
+
+
+class FromProgressRequest(BaseModel):
+    incident_id: str = Field(..., description="事件ID (UUID)")
+    time_range_hours: int = Field(24, ge=1, le=168, description="统计范围(小时)")
+
+
+class OperationalPeriod(BaseModel):
+    start_iso: str
+    end_iso: str
+
+
+class FromProgressResponse(PlanRecommendResponse):
+    plan_summary: str
+    operational_period: OperationalPeriod
+
+
+def _centroid_from_geometry(geometry: Dict[str, Any]) -> GeoPoint:
+    """从GeoJSON几何计算近似中心点。"""
+    gtype = str(geometry.get("type") or "").lower()
+    if gtype == "point":
+        coords = geometry.get("coordinates") or []
+        if isinstance(coords, (list, tuple)) and len(coords) >= 2:
+            return GeoPoint(lon=float(coords[0]), lat=float(coords[1]))
+    coords_list: List[Tuple[float, float]] = []
+    if gtype in {"polygon", "multipolygon"}:
+        def _collect(o: Any) -> None:
+            if isinstance(o, (list, tuple)):
+                if len(o) == 2 and all(isinstance(v, (int, float)) for v in o):
+                    coords_list.append((float(o[0]), float(o[1])))
+                else:
+                    for item in o:
+                        _collect(item)
+        _collect(geometry.get("coordinates"))
+    if coords_list:
+        lon = sum(p[0] for p in coords_list) / len(coords_list)
+        lat = sum(p[1] for p in coords_list) / len(coords_list)
+        return GeoPoint(lon=lon, lat=lat)
+    raise ValueError("geometry 无法计算中心点")
+
+
+async def _incident_center(incident_id: str, pool: AsyncConnectionPool[DictRow]) -> GeoPoint:
+    from emergency_agents.db.dao import IncidentDAO
+    dao = IncidentDAO.create(pool)
+    details = await dao.list_entities_with_details(incident_id)
+    for item in details:
+        ent_type = (item.entity.entity_type or "").lower()
+        if ent_type in {"event_point", "event_range", "markup_point", "markup_polygon"}:
+            return _centroid_from_geometry(dict(item.entity.geometry_geojson))
+    raise ValueError("事件缺少几何实体(需要event_point或event_range)")
+
+
+def _map_device_to_unit(device: ReconDevice) -> UnitModel:
+    kind_map: Dict[str, str] = {
+        "uav": "uav",
+        "robot_dog": "robotic_dog",
+        "usv": "usv",
+        "sensor": "other",
+        "other": "other",
+    }
+    location = device.location or PlannerGeoPoint(lon=0.0, lat=0.0)
+    return UnitModel(
+        id=device.device_id,
+        name=device.name,
+        kind=kind_map.get(device.category, "other"),
+        capabilities=device.capabilities,
+        speed_kmh=None,
+        location=GeoPoint(lon=location.lon, lat=location.lat),
+        available=device.available,
+    )
+
+
+@router.post("/from-progress", response_model=FromProgressResponse)
+async def generate_plan_from_progress(req: FromProgressRequest, request: Request) -> FromProgressResponse:
+    """根据任务进度与可用资源,生成下一个作战周期的救援方案(专业版)。"""
+    if _pg_pool_async is None:
+        raise HTTPException(status_code=503, detail="pg pool unavailable")
+    if _recon_gateway is None:
+        raise HTTPException(status_code=503, detail="recon gateway unavailable")
+
+    # 1) 计算作战周期与事件中心
+    from datetime import datetime, timezone, timedelta
+    now = datetime.now(timezone.utc)
+    start_iso = (now).isoformat()
+    end_iso = (now + timedelta(hours=12)).isoformat()
+    logger.info(
+        "from_progress_start",
+        extra={
+            "incident_id": req.incident_id,
+            "time_range_hours": req.time_range_hours,
+        },
+    )
+    try:
+        center = await _incident_center(req.incident_id, _pg_pool_async)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"incident geometry missing: {exc}")
+
+    # 2) 加载任务进度(按事件)
+    from emergency_agents.db.dao import TaskDAO
+    task_dao = TaskDAO.create(_pg_pool_async)
+    try:
+        # 事件过滤查询(若无则抛400)
+        tasks = await task_dao.list_tasks_by_event(req.incident_id, req.time_range_hours)  # type: ignore[attr-defined]
+    except AttributeError:
+        # DAO版本不支持该方法
+        raise HTTPException(status_code=500, detail="TaskDAO.list_tasks_by_event 未实现")
+
+    if not tasks:
+        raise HTTPException(status_code=400, detail="事件无任务进度,无法生成救援方案")
+
+    # 3) 设备资源(基于事件上下文),避免阻塞事件循环,放入线程调用
+    try:
+        devices: List[ReconDevice] = await to_thread.run_sync(
+            lambda: _recon_gateway.fetch_available_devices(req.incident_id)  # type: ignore[union-attr]
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"设备加载失败: {exc}")
+    units: List[UnitModel] = [_map_device_to_unit(d) for d in devices if d.available]
+    if not units:
+        raise HTTPException(status_code=400, detail="无可用救援单元,无法生成救援方案")
+
+    # 4) 生成COA方案(复用已实现逻辑)
+    incident = IncidentModel(
+        id=req.incident_id,
+        type="rescue",
+        coords=center,
+        severity=None,
+        hazards=[],
+    )
+    rec_req = PlanRecommendRequest(
+        incident=incident,
+        units=units,
+        constraints=ConstraintsModel(),
+        max_teams=min(3, len(units)),
+    )
+    rec: PlanRecommendResponse = recommend_plan(rec_req)
+
+    # 5) 方案摘要(中文)
+    co = rec.coas.get(rec.recommend)
+    top_units = ", ".join(co.teams[:3]) if co else ""
+    in_progress = [t for t in tasks if (t.status or "").lower() in {"in_progress", "running"}]
+    blocked = [t for t in tasks if (t.status or "").lower() in {"blocked", "on_hold"}]
+    plan_summary = (
+        f"作战周期: {start_iso} → {end_iso}\n"
+        f"作战目标: 聚焦恢复进行中任务{len(in_progress)}个, 清理阻塞{len(blocked)}个; 建立安全/通信基线.\n"
+        f"建议投入: {top_units or '待定'}\n"
+        f"任务总览: 近{req.time_range_hours}小时内共{len(tasks)}个任务样本, 进行中{len(in_progress)}, 阻塞{len(blocked)}."
+    )
+
+    resp = FromProgressResponse(
+        coas=rec.coas,
+        recommend=rec.recommend,
+        justification=rec.justification,
+        constraints_applied=rec.constraints_applied,
+        explain_mode=rec.explain_mode,
+        plan_summary=plan_summary,
+        operational_period=OperationalPeriod(start_iso=start_iso, end_iso=end_iso),
+    )
+    logger.info(
+        "from_progress_completed",
+        extra={
+            "incident_id": req.incident_id,
+            "teams": len(rec.coas.get(rec.recommend).teams) if rec.coas.get(rec.recommend) else 0,
+            "tasks_total": len(tasks),
+        },
+    )
+    return resp
 
 
 # =============================

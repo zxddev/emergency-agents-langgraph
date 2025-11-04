@@ -311,7 +311,7 @@ NEO4J_PASSWORD=example-neo4j
 QDRANT_URL=http://8.147.130.215:6333
 
 # PostgreSQL（状态检查点 + 审计）
-POSTGRES_DSN=postgresql://rescue:rescue_password@8.147.130.215:19532/rescue_system
+POSTGRES_DSN=postgresql://postgres:postgres123@8.147.130.215:19532/emergency_agent
 
 # 本地SQLite检查点（开发环境）
 CHECKPOINT_SQLITE_PATH=./checkpoints.sqlite3

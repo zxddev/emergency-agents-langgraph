@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from langgraph.types import interrupt
+
+from emergency_agents.intent.schemas import ClarifyOption, ClarifyRequest
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +39,48 @@ def prompt_missing_slots_node(state: Dict[str, Any], llm_client, llm_model: str)
     logger.info("用户补充槽位: %s", 补充值)
     
     return {"intent": intent | {"slots": slots}}
+
+
+def prompt_missing_slots_enhanced(
+    state: Dict[str, Any],
+    llm_client,
+    llm_model: str,
+    *,
+    options: List[ClarifyOption] | None = None,
+) -> Dict[str, Any]:
+    """增强版缺槽追问：当视频分析缺少 device_name 时，提供结构化候选供澄清。
+
+    - 对 video-analysis：构造 ClarifyRequest（options 来源：Mem0 提示 + DB 有视频能力的设备）
+    - 否则退回到通用文本追问逻辑
+    """
+    intent: Dict[str, Any] = state.get("intent") or {}
+    intent_type = str((intent.get("intent_type") or "").strip()).lower()
+    slots = intent.get("slots") or {}
+    missing_fields: List[str] = list(state.get("missing_fields") or [])
+
+    # 仅对视频分析且缺少 device_name 的场景提供结构化澄清
+    if intent_type == "video-analysis" and (not slots.get("device_name") or "device_name" in missing_fields):
+        clarify_options: List[ClarifyOption] = list(options or [])
+
+        # 3) 组装 ClarifyRequest
+        payload: ClarifyRequest = {
+            "type": "clarify",
+            "slot": "device_name",
+            "options": clarify_options,
+            "reason": "视频分析需指定设备名称",
+        }
+        if clarify_options:
+            # 默认选中第一项（后续可用记忆精确排序与定位）
+            payload["default_index"] = 0
+
+        # 4) 发出中断（结构化）并携带 ui_actions 以便 API 直接展示
+        interrupt(payload)
+        ui_actions = [payload]  # 同步返回到 state，便于 API 端合并
+        logging.getLogger(__name__).info("video_analysis_clarify_emitted", option_count=len(clarify_options))
+        return {"ui_actions": ui_actions}
+
+    # 其它意图走原有文本澄清
+    return prompt_missing_slots_node(state, llm_client, llm_model)
 
 
 def _parse_user_补充(user_input: Any, missing_fields: list, llm_client, llm_model: str) -> Dict[str, Any]:
