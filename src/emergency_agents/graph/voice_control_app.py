@@ -41,13 +41,7 @@ async def build_voice_control_graph(
 ) -> Any:
     """构建语音控制子图并绑定异步持久化。"""
 
-    if not postgres_dsn:
-        raise ValueError("语音控制子图需要 POSTGRES_DSN，当前未配置。")
-
     _logger.info("voice_control_graph_init", schema=checkpoint_schema)
-
-    if not postgres_dsn:
-        raise ValueError("语音控制子图需要 POSTGRES_DSN，当前未配置。")
 
     graph = StateGraph(VoiceControlState)
 
@@ -104,7 +98,7 @@ async def build_voice_control_graph(
                     "action": intent.action,
                 }
             )
-            return {"status": "validated", "audit_trail": trail}
+            return {"status": "validated", "audit_trail": trail, "confirmation": True}
 
         decision = interrupt(
             {
@@ -137,6 +131,7 @@ async def build_voice_control_graph(
                 "status": "error",
                 "error_detail": "操作未确认",
                 "audit_trail": trail,
+                "confirmation": False,
             }
 
         trail.append(
@@ -147,91 +142,183 @@ async def build_voice_control_graph(
                 "action": intent.action,
             }
         )
-        return {"status": "validated", "audit_trail": trail}
+        return {"status": "validated", "audit_trail": trail, "confirmation": True}
 
     def _build_command(state: VoiceControlState) -> Dict[str, Any]:
+        # 非确认状态无需构造命令，直接透传状态供后续节点终止
+        if state.get("status") != "validated":
+            _logger.info("voice_control_skip_build", status=state.get("status"))
+            return {}
+
         intent: ControlIntent = state["normalized_intent"]
+        commands_payload: list[dict[str, Any]] = []
+
         if intent.device_type is DeviceType.ROBOTDOG:
-            payload = build_robotdog_move_command(intent.device_id, intent.action)
+            # 急停需要先停再急停，确保硬件完全制动
+            if intent.action == "forceStop":
+                commands_payload.append(
+                    build_robotdog_move_command(intent.device_id, "stop")
+                )
+                commands_payload.append(
+                    build_robotdog_move_command(intent.device_id, "forceStop")
+                )
+            else:
+                commands_payload.append(
+                    build_robotdog_move_command(intent.device_id, intent.action)
+                )
         else:
             raise VoiceControlError(f"暂不支持的设备类型: {intent.device_type.value}")
 
-        command = DeviceCommand(
-            device_id=payload["deviceId"],
-            device_vendor=payload["deviceVendor"],
-            command_type=payload["commandType"],
-            params=payload["params"],
-        )
+        commands: list[DeviceCommand] = [
+            DeviceCommand(
+                device_id=payload["deviceId"],
+                device_vendor=payload["deviceVendor"],
+                control_target=payload["controlTarget"],
+                command_type=payload["commandType"],
+                params=payload["params"],
+            )
+            for payload in commands_payload
+        ]
+
+        actions = [command.params.get("action") for command in commands]
         trail = _append_audit(
             state,
             {
                 "event": "voice_control_command_built",
-                "device_id": command.device_id,
-                "device_vendor": command.device_vendor,
-                "command_type": command.command_type,
-                "params": command.params,
+                "device_id": commands[-1].device_id,
+                "device_vendor": commands[-1].device_vendor,
+                "command_type": commands[-1].command_type,
+                "actions": actions,
             },
         )
-        return {"device_command": command, "audit_trail": trail}
+        return {
+            "device_command": commands[-1],
+            "device_commands": commands,
+            "audit_trail": trail,
+        }
 
     async def _dispatch(state: VoiceControlState) -> Dict[str, Any]:
-        command: DeviceCommand = state["device_command"]
-        payload = {
-            "deviceId": command.device_id,
-            "deviceVendor": command.device_vendor,
-            "commandType": command.command_type,
-            "params": command.params,
-        }
-        trail = list(state.get("audit_trail") or [])
-        try:
-            response = await adapter_client.send_device_command(payload)
-        except (AdapterHubConfigurationError, AdapterHubRequestError, AdapterHubResponseError) as exc:
-            _logger.error("voice_control_dispatch_failed", error=str(exc), device_id=command.device_id)
-            trail.append(
-                {
-                    "event": "voice_control_dispatch_failed",
-                    "device_id": command.device_id,
-                    "reason": str(exc),
-                }
-            )
-            failure: AdapterDispatchResult = {"status": "failed", "error": str(exc)}
-            return {
-                "status": "error",
-                "error_detail": str(exc),
-                "adapter_result": failure,
-                "audit_trail": trail,
-            }
-        except AdapterHubError as exc:
-            _logger.error("voice_control_dispatch_unknown", error=str(exc), device_id=command.device_id)
-            trail.append(
-                {
-                    "event": "voice_control_dispatch_failed",
-                    "device_id": command.device_id,
-                    "reason": str(exc),
-                }
-            )
-            failure = {"status": "failed", "error": str(exc)}
-            return {
-                "status": "error",
-                "error_detail": str(exc),
-                "adapter_result": failure,
-                "audit_trail": trail,
-            }
+        # 未通过确认的流程直接跳过派发，确保不会误触设备
+        if state.get("status") != "validated":
+            _logger.info("voice_control_skip_dispatch", status=state.get("status"))
+            return {"status": state.get("status", "error"), "audit_trail": list(state.get("audit_trail") or [])}
 
-        trail.append(
-            {
-                "event": "voice_control_dispatched",
-                "device_id": command.device_id,
-                "response": response,
+        commands: list[DeviceCommand] = list(state.get("device_commands") or [])
+        if not commands and state.get("device_command") is not None:
+            commands = [state["device_command"]]
+
+        if not commands:
+            _logger.error("voice_control_no_command", state=state)
+            raise VoiceControlError("缺少待派发的设备命令")
+
+        trail = list(state.get("audit_trail") or [])
+        dispatch_steps: list[dict[str, Any]] = []
+
+        for index, command in enumerate(commands, start=1):
+            payload = {
+                "deviceId": command.device_id,
+                "deviceVendor": command.device_vendor,
+                "controlTarget": command.control_target,
+                "commandType": command.command_type,
+                "params": command.params,
             }
-        )
-        success: AdapterDispatchResult = {"status": "success", "payload": dict(response)}
+            step_record: dict[str, Any] = {
+                "step": index,
+                "action": command.params.get("action"),
+                "payload": payload,
+            }
+            _logger.info(
+                "voice_control_dispatch_attempt",
+                step=index,
+                device_id=command.device_id,
+                vendor=command.device_vendor,
+                command_type=command.command_type,
+                action=command.params.get("action"),
+            )
+            try:
+                response = await adapter_client.send_device_command(payload)
+            except (AdapterHubConfigurationError, AdapterHubRequestError, AdapterHubResponseError) as exc:
+                _logger.error(
+                    "voice_control_dispatch_failed",
+                    error=str(exc),
+                    device_id=command.device_id,
+                    step=index,
+                )
+                step_record["error"] = str(exc)
+                dispatch_steps.append(step_record)
+                trail.append(
+                    {
+                        "event": "voice_control_dispatch_failed",
+                        "device_id": command.device_id,
+                        "step": index,
+                        "reason": str(exc),
+                    }
+                )
+                failure: AdapterDispatchResult = {
+                    "status": "failed",
+                    "error": "机器狗设备不在线，请联系工程师调试",
+                    "steps": dispatch_steps,
+                }
+                return {
+                    "status": "error",
+                    "error_detail": "机器狗设备不在线，请联系工程师调试",
+                    "adapter_result": failure,
+                    "audit_trail": trail,
+                }
+            except AdapterHubError as exc:
+                _logger.error(
+                    "voice_control_dispatch_unknown",
+                    error=str(exc),
+                    device_id=command.device_id,
+                    step=index,
+                )
+                step_record["error"] = str(exc)
+                dispatch_steps.append(step_record)
+                trail.append(
+                    {
+                        "event": "voice_control_dispatch_failed",
+                        "device_id": command.device_id,
+                        "step": index,
+                        "reason": str(exc),
+                    }
+                )
+                failure = {
+                    "status": "failed",
+                    "error": "机器狗设备不在线，请联系工程师调试",
+                    "steps": dispatch_steps,
+                }
+                return {
+                    "status": "error",
+                    "error_detail": "机器狗设备不在线，请联系工程师调试",
+                    "adapter_result": failure,
+                    "audit_trail": trail,
+                }
+
+            response_payload = dict(response)
+            step_record["response"] = response_payload
+            dispatch_steps.append(step_record)
+            trail.append(
+                {
+                    "event": "voice_control_dispatched",
+                    "device_id": command.device_id,
+                    "step": index,
+                    "response": response_payload,
+                }
+            )
+
+        final_command = commands[-1]
         _logger.info(
             "voice_control_dispatched",
-            device_id=command.device_id,
-            vendor=command.device_vendor,
-            command_type=command.command_type,
+            device_id=final_command.device_id,
+            vendor=final_command.device_vendor,
+            command_type=final_command.command_type,
+            actions=[cmd.params.get("action") for cmd in commands],
         )
+        success: AdapterDispatchResult = {
+            "status": "success",
+            "payload": dispatch_steps[-1]["response"],
+            "steps": dispatch_steps,
+        }
         return {
             "status": "dispatched",
             "adapter_result": success,

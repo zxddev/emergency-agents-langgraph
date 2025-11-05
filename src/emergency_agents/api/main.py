@@ -36,6 +36,8 @@ from emergency_agents.external.orchestrator_client import OrchestratorClient
 from emergency_agents.graph.app import build_app
 from emergency_agents.graph.intent_orchestrator_app import build_intent_orchestrator_graph
 from emergency_agents.graph.voice_control_app import build_voice_control_graph
+from emergency_agents.graph.simple_rescue_app import build_simple_rescue_graph
+from emergency_agents.graph.dialogue_app import build_dialogue_graph
 from emergency_agents.graph.sitrep_app import build_sitrep_graph
 from emergency_agents.graph.recon_app import build_recon_graph_async
 from emergency_agents.external.recon_gateway import PostgresReconGateway
@@ -67,7 +69,7 @@ from emergency_agents.intent.classifier import intent_classifier_node
 from emergency_agents.intent.prompt_missing import prompt_missing_slots_node
 from emergency_agents.intent.registry import IntentHandlerRegistry
 from emergency_agents.context.service import ContextService
-from emergency_agents.intent.validator import validate_and_prompt_node
+from emergency_agents.intent.validator import validate_and_prompt_node, set_default_robotdog_id
 from emergency_agents.api.intent_processor import (
     IntentProcessResult,
     Mem0Metrics,
@@ -91,9 +93,12 @@ app = FastAPI(title="AI Emergency Brain API")
 _cfg = AppConfig.load_from_env()
 if not _cfg.postgres_dsn:
     raise RuntimeError("POSTGRES_DSN 未配置，无法启动服务。")
+set_default_robotdog_id(_cfg.default_robotdog_id)
 _graph_app: Any | None = None
 _intent_graph: Any | None = None
 _voice_control_graph: Any | None = None
+_dialogue_graph: Any | None = None
+_simple_rescue_graph: Any | None = None
 _sitrep_graph: Any | None = None
 _recon_graph: Any | None = None
 _graph_closers: list[Callable[[], Awaitable[None]]] = []
@@ -283,6 +288,7 @@ def _validator_wrapper(state: Dict[str, Any], llm_client: Any, llm_model: str) -
     norm = itype_raw.replace(" ", "").replace("_", "-").lower()
     if norm in ("video-analysis", "video-analyze"):
         state = state | {"intent": intent | {"intent_type": "video-analysis"}}
+        state = _apply_video_analysis_defaults(state)
     if norm in ("task-progress-query", "taskprogressquery"):
         state = state | {"intent": intent | {"intent_type": "task-progress-query"}}
     return validate_and_prompt_node(state, llm_client, llm_model)
@@ -296,35 +302,82 @@ def _prompt_wrapper(state: Dict[str, Any], llm_client: Any, llm_model: str) -> D
         itype = str((intent.get("intent_type") or "").strip()).lower()
         itype_norm = itype.replace(" ", "").replace("_", "-")
         if itype_norm in ("video-analysis", "video-analyze"):
-            import psycopg
+            from emergency_agents.intent.handlers.video_analysis import VideoAnalysisHandler
             from emergency_agents.intent.prompt_missing import prompt_missing_slots_enhanced
             from emergency_agents.intent.schemas import ClarifyOption
 
             options: list[ClarifyOption] = []
-            # 同步查询：优先 device_video_link，其次 device_detail.stream_url
-            sql = (
-                "WITH candidates AS (\n"
-                "  SELECT d.id::text AS id, d.name AS name\n"
-                "    FROM operational.device d\n"
-                "    JOIN operational.device_video_link dvl ON dvl.id = d.id\n"
-                "   WHERE COALESCE(NULLIF(dvl.video_link, ''), '') <> ''\n"
-                "  UNION ALL\n"
-                "  SELECT d.id::text AS id, d.name AS name\n"
-                "    FROM operational.device d\n"
-                "    JOIN operational.device_detail dd ON dd.device_id = d.id\n"
-                "   WHERE COALESCE(NULLIF(dd.device_detail->>'stream_url', ''), '') <> ''\n"
-                ") SELECT id, name FROM candidates GROUP BY id, name ORDER BY name ASC LIMIT 10"
-            )
-            with psycopg.connect(_cfg.postgres_dsn) as conn:
-                with conn.cursor() as cur:
-                    cur.execute(sql)
-                    for dev_id, name in cur.fetchall():
-                        options.append({"label": name or dev_id, "device_id": dev_id})
-            return prompt_missing_slots_enhanced(state, llm_client, llm_model, options=options)
+            handler = None
+            if _intent_registry is not None:
+                try:
+                    handler_candidate = _intent_registry.get("video-analysis")
+                    if isinstance(handler_candidate, VideoAnalysisHandler):
+                        handler = handler_candidate
+                except Exception:
+                    handler = None
+            if handler is not None:
+                catalog_options = [entry.to_candidate() for entry in handler.stream_catalog]
+                options.extend(catalog_options)
+                if options:
+                    labels = "、".join(item["label"] for item in options)
+                    state = state | {
+                        "prompt": f"当前支持的机器狗视频源包括：{labels}，请指定设备名称。",
+                        "missing_fields": state.get("missing_fields") or ["device_name"],
+                    }
+                return prompt_missing_slots_enhanced(state, llm_client, llm_model, options=options)
     except Exception:
         pass
     # 其它意图退回通用文本澄清
     return prompt_missing_slots_node(state, llm_client, llm_model)
+
+
+def _apply_video_analysis_defaults(state: Dict[str, Any]) -> Dict[str, Any]:
+    """在进入验证前补齐视频分析缺失槽位，减少二次追问。"""
+    intent = state.get("intent") or {}
+    slots = dict(intent.get("slots") or {})
+
+    from emergency_agents.intent.handlers.video_analysis import VideoAnalysisHandler
+
+    handler: VideoAnalysisHandler | None = None
+    if _intent_registry is not None:
+        try:
+            candidate = _intent_registry.get("video-analysis")
+            if isinstance(candidate, VideoAnalysisHandler):
+                handler = candidate
+        except Exception:
+            handler = None
+
+    filled_keys: list[str] = []
+
+    if handler is not None:
+        catalog = handler.stream_catalog
+
+        if not slots.get("device_type"):
+            available_types = catalog.list_device_types()
+            if len(available_types) == 1:
+                slots["device_type"] = available_types[0]
+                filled_keys.append("device_type")
+
+        auto_entry = catalog.auto_select(device_type=slots.get("device_type"))
+        if auto_entry and not slots.get("device_name"):
+            slots["device_name"] = auto_entry.display_name or auto_entry.device_id
+            filled_keys.append("device_name")
+
+        if not slots.get("analysis_goal"):
+            slots["analysis_goal"] = "situation_assessment"
+            filled_keys.append("analysis_goal")
+
+        if filled_keys:
+            logger.info(
+                "video_analysis_slots_autofill",
+                extra={
+                    "filled": filled_keys,
+                    "device_type": slots.get("device_type"),
+                    "device_name": slots.get("device_name"),
+                },
+            )
+
+    return state | {"intent": intent | {"slots": slots}}
 
 
 _asr = ASRService()
@@ -361,6 +414,16 @@ def _require_voice_control_graph() -> Any:
             raise RuntimeError("语音控制子图未初始化")
         app.state.voice_control_graph = _voice_control_graph
         return _voice_control_graph
+    return graph
+
+
+def _require_dialogue_graph() -> Any:
+    graph = getattr(app.state, "dialogue_graph", None)
+    if graph is None:
+        if _dialogue_graph is None:
+            raise RuntimeError("对话子图未初始化")
+        app.state.dialogue_graph = _dialogue_graph
+        return _dialogue_graph
     return graph
 
 
@@ -407,6 +470,8 @@ async def startup_event():
     global _graph_app
     global _intent_graph
     global _voice_control_graph
+    global _dialogue_graph
+    global _simple_rescue_graph
     global _sitrep_graph
     global _graph_closers
     global _risk_cache_manager
@@ -438,10 +503,10 @@ async def startup_event():
         _device_directory = PostgresDeviceDirectory(_device_directory_pool)
         _voice_control_pipeline = VoiceControlPipeline(
             default_robotdog_id=_cfg.default_robotdog_id,
-            device_directory=_device_directory,
+            device_directory=None,  # 不查数据库，直接用默认机器狗ID
         )
 
-    # 初始化IntentHandlerRegistry（异步初始化，包含ScoutTaskGenerationHandler懒加载）
+    # 初始化IntentHandlerRegistry（简化侦察处理器已并入注册表）
     _intent_registry = await IntentHandlerRegistry.build(
         pool=_pg_pool,
         amap_client=_amap_client,
@@ -456,7 +521,9 @@ async def startup_event():
         orchestrator_client=_orchestrator_client,
         rag_timeout=_cfg.rag_analysis_timeout,
         postgres_dsn=_cfg.postgres_dsn,
-        vllm_url=_cfg.openai_base_url,  # GLM-4V 使用相同的 OpenAI 兼容端点
+        vllm_url=_cfg.video_vllm_url,
+        vllm_api_key=_cfg.video_vllm_api_key,
+        vllm_model=_cfg.video_vllm_model,
     )
     _intent_registry.attach_rescue_draft_service(_rescue_draft_service)
     logger.info("api_intent_registry_initialized")
@@ -491,6 +558,36 @@ async def startup_event():
     app.state.voice_control_graph = _voice_control_graph
     logger.info("api_graph_ready", graph="voice_control")
 
+    rescue_dao = RescueDAO.create(_pg_pool)
+    _simple_rescue_graph = await build_simple_rescue_graph(
+        rescue_dao=rescue_dao,
+    )
+    app.state.simple_rescue_graph = _simple_rescue_graph
+    if _intent_registry is not None:
+        _intent_registry.attach_simple_rescue_graph(_simple_rescue_graph)
+    logger.info("api_graph_ready", graph="simple_rescue")
+
+    _dialogue_graph = await build_dialogue_graph(
+        postgres_dsn=_cfg.postgres_dsn,
+    )
+    _register_graph_close(_dialogue_graph)
+    app.state.dialogue_graph = _dialogue_graph
+    logger.info("api_graph_ready", graph="dialogue")
+
+    # 注入统一意图管线到语音对话处理器
+    voice_chat_handler.set_intent_pipeline(
+        manager=_conversation_manager,
+        registry=_intent_registry,
+        orchestrator_graph=_intent_graph,
+        voice_control_graph=_voice_control_graph,
+        dialogue_graph=_dialogue_graph,
+        mem=_mem,
+        build_history=_build_history,
+        mem0_metrics_factory=_mem0_metrics_factory,
+        context_service=_context_service,
+    )
+    logger.info("voice_chat_intent_pipeline_injected")
+
     # 初始化RiskCacheManager（SITREP依赖它）
     incident_dao = IncidentDAO.create(_pg_pool)
     _risk_cache_manager = RiskCacheManager(
@@ -522,7 +619,6 @@ async def startup_event():
 
     # ========== 初始化SITREP子图 ==========
     task_dao = TaskDAO.create(_pg_pool)
-    rescue_dao = RescueDAO.create(_pg_pool)
     snapshot_repo = IncidentSnapshotRepository.create(_pg_pool)
 
     # 创建checkpointer（复用PostgreSQL连接池）
@@ -613,6 +709,8 @@ async def shutdown_event():
     global _graph_app
     global _intent_graph
     global _voice_control_graph
+    global _dialogue_graph
+    global _simple_rescue_graph
     global _sitrep_graph
     global _recon_graph
     global _graph_closers
@@ -631,13 +729,15 @@ async def shutdown_event():
         await close_cb()
     _graph_closers.clear()
     _graph_app_attr = _graph_app if _graph_app is not None else None
-    for resource in (_graph_app_attr, _intent_graph, _voice_control_graph, _sitrep_graph):
+    for resource in (_graph_app_attr, _intent_graph, _voice_control_graph, _dialogue_graph, _simple_rescue_graph, _sitrep_graph):
         if resource is not None and hasattr(resource, "_checkpoint_close"):
             setattr(resource, "_checkpoint_close", None)
     logger.info("api_shutdown_graphs_closed")
     _graph_app = None
     _intent_graph = None
     _voice_control_graph = None
+    _dialogue_graph = None
+    _simple_rescue_graph = None
     _sitrep_graph = None
     _recon_graph = None
 
@@ -946,6 +1046,7 @@ async def intent_process(req: IntentProcessRequest):
         registry=registry,
         orchestrator_graph=_require_intent_graph(),
         voice_control_graph=_require_voice_control_graph(),
+        dialogue_graph=_require_dialogue_graph(),
         mem=_mem,
         build_history=_build_history,
         mem0_metrics=_mem0_metrics_factory(),

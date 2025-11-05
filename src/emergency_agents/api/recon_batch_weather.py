@@ -23,7 +23,7 @@
 
 from typing import List, Dict, Any, Optional
 from datetime import datetime
-from fastapi import APIRouter, HTTPException, Response
+from fastapi import APIRouter, HTTPException, Response, Query
 from pydantic import BaseModel, Field
 from psycopg_pool import AsyncConnectionPool
 from psycopg.rows import DictRow, dict_row
@@ -31,6 +31,8 @@ from openai import OpenAI
 import httpx
 import structlog
 import uuid
+import os
+import json
 
 from emergency_agents.config import AppConfig
 from emergency_agents.logging import get_trace_id
@@ -66,6 +68,16 @@ from emergency_agents.planner.recon_llm_planner import (
     DisasterInfo as TaskDisasterInfo,
     DetailedReconPlan,
 )
+
+# 导入新的规则引擎和分组生成器
+from emergency_agents.planner.device_target_matcher import (
+    smart_allocate,
+    group_allocation_by_env_type,
+)
+from emergency_agents.planner.grouped_markdown_generator import GroupedMarkdownGenerator
+
+# 导入Markdown结构化提取工具
+from emergency_agents.utils.md_extractor import ReconPlanExtractor, TaskExtract
 
 logger = structlog.get_logger(__name__)
 
@@ -163,14 +175,21 @@ class BatchWeatherPlanMarkdownResponse(BaseModel):
 
 
 @router.post("/batch-weather-plan")
-async def create_batch_weather_plan() -> Response:
+async def create_batch_weather_plan(
+    format: str = Query("json", description="返回格式：json(默认，纯文本)|md(Markdown格式)")
+) -> Response:
     """
-    生成侦察方案的Markdown文档（供人类审阅和修改）
+    生成侦察方案（支持JSON纯文本或Markdown格式）
 
     ⚠️ 演示接口：参数已写死为四川茂县7.5级地震场景
     - 灾害类型：earthquake（地震）
     - 严重等级：critical（最高级）
     - 震中坐标：四川省阿坝藏族羌族自治州茂县 (103.85°E, 31.68°N)
+
+    **参数说明：**
+    - format: 返回格式选择
+      - "json" (默认): 返回纯文本格式（已移除Markdown格式符号）
+      - "md": 返回原始Markdown格式（供结构化提取使用）
 
     工作流程：
     1. 计算灾害侦察半径（基于disaster_type）
@@ -381,265 +400,229 @@ async def create_batch_weather_plan() -> Response:
             location_desc=f"({req.epicenter.lon}, {req.epicenter.lat})"
         )
 
-        # 调用LLM生成详细方案
-        detailed_plan = generate_recon_plan_with_llm(
-            devices=device_inputs,
-            targets=target_points,
+        # 使用规则引擎进行智能设备-目标分配（替代LLM调用）
+        logger.info("开始规则引擎智能分配",
+                   device_count=len(device_inputs),
+                   target_count=len(target_points),
+                   trace_id=trace_id)
+
+        # 转换设备和目标为规则引擎所需格式（Dict）
+        devices_dict = [
+            {
+                "id": d["id"],
+                "name": d["name"],
+                "device_type": d["device_type"],
+                "env_type": d["env_type"],
+                "capabilities": d["capabilities"],
+                "lon": req.epicenter.lon,  # 默认使用指挥中心位置
+                "lat": req.epicenter.lat,
+            }
+            for d in device_inputs
+        ]
+
+        targets_dict = [
+            {
+                "id": t["id"],
+                "name": t["name"],
+                "target_type": t["target_type"],
+                "hazard_level": t["hazard_level"],
+                "priority": t["priority"],
+                "lon": t["lon"],
+                "lat": t["lat"],
+            }
+            for t in target_points
+        ]
+
+        # 调用规则引擎进行智能分配
+        allocation_result = smart_allocate(
+            devices=devices_dict,
+            targets=targets_dict,
+            disaster_type=req.disaster_type,
+            command_center={"lon": req.epicenter.lon, "lat": req.epicenter.lat},
+            trace_id=trace_id
+        )
+
+        logger.info("规则引擎分配完成",
+                   allocated_devices=len(allocation_result),
+                   trace_id=trace_id)
+
+        # 使用分组Markdown生成器并行生成报告（替代LLM顺序调用）
+        logger.info("开始分组并行生成Markdown报告",
+                   device_count=len(devices_dict),
+                   target_count=len(targets_dict),
+                   trace_id=trace_id)
+
+        # 创建分组Markdown生成器
+        markdown_generator = GroupedMarkdownGenerator(llm_client, "glm-4.6")
+
+        # 调用并行生成（内部会自动分组为air/land/sea，并行调用LLM）
+        markdown_text = markdown_generator.generate(
+            allocation=allocation_result,
+            devices=devices_dict,
+            targets=targets_dict,
             disaster_info=disaster_info,
             command_center={"lon": req.epicenter.lon, "lat": req.epicenter.lat},
-            llm_client=llm_client,  # 已在Step 5创建
-            llm_model="glm-4.6",  # 使用glm-4.6模型
-            trace_id=trace_id,
+            trace_id=trace_id
         )
 
-        logger.info("详细侦察方案生成完成", trace_id=trace_id)
-
-        # 调用LLM生成Markdown格式报告
-        logger.info("开始生成Markdown格式报告", trace_id=trace_id)
-
-        # 准备给LLM的上下文信息
-        import json
-        context_info = {
-            "disaster_type": req.disaster_type,
-            "severity": req.severity,
-            "epicenter": {"lon": req.epicenter.lon, "lat": req.epicenter.lat},
-            "total_targets": len(targets),
-            "total_devices": len(suitable_devices),
-            "total_batches": len(allocation["batches"]),
-            "estimated_hours": total_hours,
-        }
-
-        prompt = f"""你是一名应急救援指挥专家，需要根据侦察方案数据生成人类可读的Markdown格式报告。
-
-**灾情信息：**
-- 灾害类型：{req.disaster_type}
-- 严重等级：{req.severity}
-- 震中坐标：({req.epicenter.lon}, {req.epicenter.lat})
-- 目标数量：{len(targets)}
-- 可用设备：{len(suitable_devices)}
-- 批次数量：{len(allocation["batches"])}
-- 预计总时长：{total_hours}小时
-
-**详细方案数据：**
-{str(detailed_plan)[:5000]}
-
-**注意**：以上是Python字典格式的方案摘要（已截断）
-
-**报告要求：**
-
-1. **标题和概述**：
-   - 灾害类型、等级、地点（从disaster_info提取）
-   - 指挥中心位置和到达时间（从command_center提取）
-   - 配备的设备和车辆（从batches中的device_name汇总）
-   - 整体任务目标（从各section的tasks中提取关键信息）
-
-2. **空中侦察方案**（如果有air_recon_section）：
-   - 以指挥中心为出发点
-   - 列出所有空中侦察任务（从air_recon_section.tasks中提取）
-   - 每个任务包含：
-     * 任务名称（task_name或task_type）
-     * 设备选择（device_names和key_capabilities）
-     * 侦察详情（from_location, to_location, route_waypoints, actions, start_time, end_time）
-     * 结果上报（expected_outputs）
-
-3. **地面侦察方案**（如果有ground_recon_section）：
-   - 列出所有地面侦察任务
-   - 格式同空中侦察
-
-4. **水上侦察方案**（如果有water_recon_section）：
-   - 列出所有水上侦察任务
-   - 格式同空中侦察
-
-5. **数据整合与通信**：
-   - 数据整合说明（从data_integration_desc提取）
-   - 任务时间线（earliest_start_time, latest_end_time, total_estimated_hours）
-   - 安全措施和优先级
-
-**关键规则：**
-- 如果一个设备执行多个任务，每个任务单独成段，使用数字编号（1. 2. 3.）
-- 时间格式统一为 HH:MM:SS 或 YYYY-MM-DD HH:MM:SS
-- 坐标格式统一为 (经度, 纬度)
-- 设备能力要详细描述（从key_capabilities提取）
-- 语言流畅自然，符合专业报告风格
-- 使用Markdown标题层级：一级标题（灾害名称），二级标题（空中/地面/水上），三级标题（具体任务编号）
-
-**输出格式：**
-直接输出Markdown文本，不要包含```markdown标记。
-
-**示例格式参考：**
-# 针对四川茂县7.5级地震智能侦察方案
-
-（概述段落）
-
-## 一、空中侦察方案
-
-（空中侦察总体说明）
-
-### 1. 重灾区扫图建模
-**设备选择**：扫图建模无人机（具备激光雷达和多光谱传感器）。
-**侦察详情**：
-从水西村起飞...（详细描述）
-**结果上报**：重灾区三维地图...
-
-### 2. 受困人员搜索
-...
-
-## 二、地面侦察方案
-...
-
-**开始生成报告：**
-"""
-
-        # 分段生成Markdown报告（避免超过glm-4.6的4096 token限制）
-        sections = []
-
-        # 第1段：标题和概述
-        logger.info("生成第1段：标题和概述", trace_id=trace_id)
-        section1_prompt = f"""你是应急救援指挥专家。根据以下数据生成侦察方案报告的**标题和概述部分**。
-
-**上下文数据：**
-- 灾害类型：{req.disaster_type}
-- 严重等级：{req.severity}
-- 震中坐标：({req.epicenter.lon}, {req.epicenter.lat})
-- 目标数量：{len(targets)}
-- 可用设备：{len(suitable_devices)}
-- 批次数量：{len(allocation["batches"])}
-- 预计总时长：{total_hours}小时
-
-**详细数据（前3000字符）：**
-{str(detailed_plan)[:3000]}
-
-**输出要求：**
-生成报告的开头部分，包括：
-1. 一级标题：灾害名称和侦察方案标题
-2. 概述段落：灾情信息、指挥中心位置、配备设备、整体任务目标
-
-**输出格式：**
-纯Markdown文本，不要包含```markdown标记。
-"""
-
-        section1_response = llm_client.chat.completions.create(
-            model="glm-4.6",
-            messages=[{"role": "user", "content": section1_prompt}],
-            temperature=0.3,
-            max_tokens=4000,
-        )
-        sections.append(section1_response.choices[0].message.content.strip())
-
-        # 第2段：空中侦察方案（如果有）
-        if detailed_plan.get("air_recon_section"):
-            logger.info("生成第2段：空中侦察方案", trace_id=trace_id)
-            air_section = detailed_plan["air_recon_section"]
-            section2_prompt = f"""你是应急救援指挥专家。生成侦察方案报告的**空中侦察方案**部分。
-
-**空中侦察数据：**
-{str(air_section)[:3000]}
-
-**输出要求：**
-生成 ## 一、空中侦察方案 章节，包括：
-- 章节总体说明
-- 列出所有空中侦察任务（每个任务一个### 三级标题）
-- 每个任务包含：设备选择、侦察详情、结果上报
-
-**输出格式：**
-纯Markdown文本，以 "## 一、空中侦察方案" 开头。
-"""
-            section2_response = llm_client.chat.completions.create(
-                model="glm-4.6",
-                messages=[{"role": "user", "content": section2_prompt}],
-                temperature=0.3,
-                max_tokens=4000,
-            )
-            sections.append(section2_response.choices[0].message.content.strip())
-
-        # 第3段：地面侦察方案（如果有）
-        if detailed_plan.get("ground_recon_section"):
-            logger.info("生成第3段：地面侦察方案", trace_id=trace_id)
-            ground_section = detailed_plan["ground_recon_section"]
-            section3_prompt = f"""你是应急救援指挥专家。生成侦察方案报告的**地面侦察方案**部分。
-
-**地面侦察数据：**
-{str(ground_section)[:3000]}
-
-**输出要求：**
-生成 ## 二、地面侦察方案 章节，格式同空中侦察。
-
-**输出格式：**
-纯Markdown文本，以 "## 二、地面侦察方案" 开头。
-"""
-            section3_response = llm_client.chat.completions.create(
-                model="glm-4.6",
-                messages=[{"role": "user", "content": section3_prompt}],
-                temperature=0.3,
-                max_tokens=4000,
-            )
-            sections.append(section3_response.choices[0].message.content.strip())
-
-        # 第4段：水上侦察方案（如果有）
-        if detailed_plan.get("water_recon_section"):
-            logger.info("生成第4段：水上侦察方案", trace_id=trace_id)
-            water_section = detailed_plan["water_recon_section"]
-            section4_prompt = f"""你是应急救援指挥专家。生成侦察方案报告的**水上侦察方案**部分。
-
-**水上侦察数据：**
-{str(water_section)[:3000]}
-
-**输出要求：**
-生成 ## 三、水上侦察方案 章节，格式同空中侦察。
-
-**输出格式：**
-纯Markdown文本，以 "## 三、水上侦察方案" 开头。
-"""
-            section4_response = llm_client.chat.completions.create(
-                model="glm-4.6",
-                messages=[{"role": "user", "content": section4_prompt}],
-                temperature=0.3,
-                max_tokens=4000,
-            )
-            sections.append(section4_response.choices[0].message.content.strip())
-
-        # 第5段：数据整合与通信
-        logger.info("生成第5段：数据整合与通信", trace_id=trace_id)
-        section5_prompt = f"""你是应急救援指挥专家。生成侦察方案报告的**数据整合与通信**部分。
-
-**时间线信息：**
-- 最早开始时间：{detailed_plan.get("earliest_start_time", "未知")}
-- 最晚结束时间：{detailed_plan.get("latest_end_time", "未知")}
-- 总预计时长：{detailed_plan.get("total_estimated_hours", total_hours)}小时
-
-**数据整合说明：**
-{detailed_plan.get("data_integration_desc", "集中回传至指挥中心")}
-
-**输出要求：**
-生成最后一个章节，包括：
-- 数据整合说明
-- 任务时间线
-- 安全措施和优先级
-
-**输出格式：**
-纯Markdown文本，以 "## 四、数据整合与通信" 开头（编号根据前面章节调整）。
-"""
-        section5_response = llm_client.chat.completions.create(
-            model="glm-4.6",
-            messages=[{"role": "user", "content": section5_prompt}],
-            temperature=0.3,
-            max_tokens=4000,
-        )
-        sections.append(section5_response.choices[0].message.content.strip())
-
-        # 拼接所有章节
-        markdown_text = "\n\n".join(sections)
-
-        logger.info("Markdown报告分段生成完成",
-                   sections_count=len(sections),
+        logger.info("分组Markdown报告生成完成",
                    total_length=len(markdown_text),
                    trace_id=trace_id)
 
-        # 直接返回纯Markdown文本（供人类审阅和修改）
-        return Response(
-            content=markdown_text,
-            media_type="text/markdown; charset=utf-8",
-        )
+        # 生成方案ID
+        plan_id = str(uuid.uuid4())
+
+        # 如果请求Markdown格式，直接返回
+        if format == "md":
+            logger.info("返回Markdown格式数据", plan_id=plan_id, trace_id=trace_id)
+            # 保存到数据库（使用Markdown原文）
+            try:
+                async with _pg_pool_async.connection() as conn:
+                    async with conn.cursor() as cur:
+                        await cur.execute(
+                            """
+                            INSERT INTO recon_plans (
+                                plan_id, incident_id, plan_type, plan_subtype,
+                                plan_title, plan_content, plan_data,
+                                disaster_type, disaster_location, severity,
+                                device_count, target_count,
+                                llm_model, status, created_by
+                            ) VALUES (
+                                %s, %s, %s, %s,
+                                %s, %s, %s,
+                                %s, %s, %s,
+                                %s, %s,
+                                %s, %s, %s
+                            )
+                            """,
+                            (
+                                plan_id,
+                                None,
+                                "recon",
+                                "batch_weather",
+                                f"{req.disaster_type}侦察方案(MD)",
+                                markdown_text,
+                                json.dumps({"format": "markdown"}, ensure_ascii=False),
+                                req.disaster_type,
+                                json.dumps({"lon": req.epicenter.lon, "lat": req.epicenter.lat}),
+                                req.severity,
+                                len(devices_dict),
+                                len(targets_dict),
+                                os.getenv("RECON_LLM_MODEL", "glm-4.6"),
+                                "draft",
+                                "system"
+                            )
+                        )
+                        await conn.commit()
+                logger.info("Markdown方案已保存到数据库", plan_id=plan_id, trace_id=trace_id)
+            except Exception as e:
+                logger.warning("数据库保存失败（不影响业务）", error=str(e), trace_id=trace_id)
+
+            return {
+                "code": 200,
+                "data": markdown_text,
+                "plan_id": plan_id
+            }
+
+        # 否则转换Markdown为纯文本（移除格式符号）
+        import re
+        plain_text = markdown_text
+
+        # 移除标题符号 (##, ###)
+        plain_text = re.sub(r'^#{1,6}\s+', '', plain_text, flags=re.MULTILINE)
+
+        # 移除加粗符号 (**)
+        plain_text = re.sub(r'\*\*(.*?)\*\*', r'\1', plain_text)
+
+        # 移除斜体符号 (*)
+        plain_text = re.sub(r'\*(.*?)\*', r'\1', plain_text)
+
+        # 移除代码块标记 (```)
+        plain_text = re.sub(r'```.*?\n', '', plain_text)
+        plain_text = re.sub(r'```', '', plain_text)
+
+        # 移除行内代码标记 (`)
+        plain_text = re.sub(r'`(.*?)`', r'\1', plain_text)
+
+        # 移除链接格式 [text](url) -> text
+        plain_text = re.sub(r'\[(.*?)\]\(.*?\)', r'\1', plain_text)
+
+        logger.info("Markdown转纯文本完成",
+                   original_length=len(markdown_text),
+                   plain_length=len(plain_text),
+                   trace_id=trace_id)
+
+        # 准备完整响应数据（plan_id已在前面生成）
+        response_data = {
+            "plan_id": plan_id,
+            "plan_content": plain_text,
+            "plan_type": "recon",
+            "plan_subtype": "batch_weather",
+            "disaster_type": req.disaster_type,
+            "epicenter": {"lon": req.epicenter.lon, "lat": req.epicenter.lat},
+            "severity": req.severity,
+            "device_count": len(devices_dict),
+            "target_count": len(targets_dict),
+            "llm_model": os.getenv("RECON_LLM_MODEL", "glm-4.6"),
+            "generated_at": datetime.utcnow().isoformat(),
+            "trace_id": trace_id
+        }
+
+        # 保存到PostgreSQL数据库（失败不阻塞）
+        try:
+            async with _pg_pool_async.connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        """
+                        INSERT INTO recon_plans (
+                            plan_id, incident_id, plan_type, plan_subtype,
+                            plan_title, plan_content, plan_data,
+                            disaster_type, disaster_location, severity,
+                            device_count, target_count,
+                            llm_model, status, created_by
+                        ) VALUES (
+                            %s, %s, %s, %s,
+                            %s, %s, %s,
+                            %s, %s, %s,
+                            %s, %s,
+                            %s, %s, %s
+                        )
+                        """,
+                        (
+                            plan_id,
+                            None,  # incident_id（可选，后续关联）
+                            "recon",
+                            "batch_weather",
+                            f"{req.disaster_type}侦察方案",
+                            plain_text,
+                            json.dumps(response_data, ensure_ascii=False),
+                            req.disaster_type,
+                            json.dumps({"lon": req.epicenter.lon, "lat": req.epicenter.lat}),
+                            req.severity,
+                            len(devices_dict),
+                            len(targets_dict),
+                            os.getenv("RECON_LLM_MODEL", "glm-4.6"),
+                            "draft",
+                            "system"
+                        )
+                    )
+                    await conn.commit()
+
+            logger.info("侦察方案已保存到数据库",
+                       plan_id=plan_id,
+                       trace_id=trace_id)
+
+        except Exception as e:
+            logger.warning("数据库保存失败（不影响业务）",
+                          error=str(e),
+                          trace_id=trace_id)
+
+        # 返回标准JSON格式
+        return {
+            "code": 200,
+            "data": plain_text,
+            "plan_id": plan_id
+        }
 
     # ============ 增援分析（已注释）============
     # 用户需求：跳过增援分析，即使设备不足也直接用现有设备生成方案
@@ -1334,4 +1317,203 @@ async def format_plan_markdown(
         raise HTTPException(
             status_code=500,
             detail=f"生成Markdown报告失败: {str(e)}",
+        )
+
+
+# ============================================================================
+# 侦察方案结构化提取API - 将用户修改后的文本转换为结构化JSON
+# ============================================================================
+
+
+class ExtractTasksRequest(BaseModel):
+    """提取任务请求"""
+
+    text: str = Field(..., description="侦察方案文本（支持Markdown或纯文本格式）")
+    format_hint: Optional[str] = Field(
+        default="auto",
+        description="格式提示：auto(自动识别)|md(Markdown)|plain(纯文本)，默认auto"
+    )
+
+
+class ExtractTasksResponse(BaseModel):
+    """提取任务响应"""
+
+    code: int = Field(default=200, description="响应状态码")
+    data: List[Dict[str, Any]] = Field(description="提取的任务列表")
+    total_tasks: int = Field(description="任务总数")
+    summary: Dict[str, Any] = Field(description="统计摘要（按类型分组）")
+    message: str = Field(default="提取成功", description="响应消息")
+
+
+@router.post("/extract-tasks", response_model=ExtractTasksResponse)
+async def extract_recon_tasks(
+    req: ExtractTasksRequest,
+) -> ExtractTasksResponse:
+    """
+    从侦察方案文本中提取结构化任务数据
+
+    **使用场景：**
+    1. 前端调用 `/ai/recon/batch-weather-plan?format=md` 获得Markdown文本
+    2. 展示给用户审阅，用户可能修改内容（删除任务、调整时长、修改设备等）
+    3. 前端调用本接口，传入用户修改后的文本
+    4. 后端使用Instructor库提取结构化JSON数据
+    5. 返回标准化的任务列表，供后续接口使用（如保存、执行）
+
+    **技术特点：**
+    - 使用Instructor库（11.7k⭐）进行LLM结构化输出
+    - 自动识别Markdown或纯文本格式
+    - 批量提取，减少LLM调用次数
+    - 容错处理，部分提取失败不影响整体
+
+    **输入示例：**
+    ```json
+    {
+        "text": "# 地震侦察方案\\n\\n## 一、空中侦察方案\\n\\n### 任务一\\n设备配置：无人机(ID: drone-10)\\n预计时长：90分钟\\n..."
+    }
+    ```
+
+    **输出示例：**
+    ```json
+    {
+        "code": 200,
+        "data": [
+            {
+                "task_id": "任务一",
+                "task_type": "air",
+                "device_name": "10号态势侦察无人机",
+                "device_id": "drone-10",
+                "duration_min": 90,
+                "targets": [...],
+                "details": "...",
+                "safety_tips": "..."
+            }
+        ],
+        "total_tasks": 15,
+        "summary": {
+            "air_tasks": 5,
+            "land_tasks": 7,
+            "sea_tasks": 3
+        },
+        "message": "成功提取15个任务"
+    }
+    ```
+
+    **错误处理：**
+    - 文本为空：返回400错误
+    - 提取失败：返回500错误，附带详细错误信息
+    - 部分提取：返回成功，summary中标注失败的章节
+    """
+    trace_id = get_trace_id() or str(uuid.uuid4())
+
+    # 验证输入
+    if not req.text or not req.text.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="文本内容不能为空",
+        )
+
+    logger.info(
+        "收到任务提取请求",
+        text_length=len(req.text),
+        format_hint=req.format_hint,
+        trace_id=trace_id,
+    )
+
+    try:
+        # 初始化提取器
+        config = AppConfig.load_from_env()
+        extractor = ReconPlanExtractor(config)
+
+        # 提取所有任务
+        tasks: List[TaskExtract] = extractor.extract_all_tasks(
+            markdown=req.text,
+            trace_id=trace_id
+        )
+
+        # 转换为字典（用于JSON序列化）
+        task_dicts = [task.model_dump() for task in tasks]
+
+        # 生成详细的任务-设备分配摘要
+        tasks_by_type = {"air": [], "land": [], "sea": [], "unknown": []}
+        devices_allocation = {}
+
+        for task in tasks:
+            # 按类型分组任务
+            task_summary = {
+                "task_id": task.task_id,
+                "device_id": task.device_id,
+                "device_name": task.device_name,
+                "duration_min": task.duration_min,
+            }
+            task_type = task.task_type if task.task_type in ["air", "land", "sea"] else "unknown"
+            tasks_by_type[task_type].append(task_summary)
+
+            # 构建设备分配映射（一个设备可能执行多个任务）
+            if task.device_id not in devices_allocation:
+                devices_allocation[task.device_id] = {
+                    "device_name": task.device_name,
+                    "tasks": [],
+                }
+            devices_allocation[task.device_id]["tasks"].append(task.task_id)
+
+        # 生成统计信息
+        air_count = len(tasks_by_type["air"])
+        land_count = len(tasks_by_type["land"])
+        sea_count = len(tasks_by_type["sea"])
+        unknown_count = len(tasks_by_type["unknown"])
+
+        summary = {
+            "tasks_by_type": tasks_by_type,
+            "devices_allocation": devices_allocation,
+            "statistics": {
+                "total_tasks": len(tasks),
+                "total_devices": len(devices_allocation),
+                "total_duration_min": sum(t.duration_min for t in tasks),
+                "air_task_count": air_count,
+                "land_task_count": land_count,
+                "sea_task_count": sea_count,
+                "unknown_task_count": unknown_count,
+            },
+        }
+
+        logger.info(
+            "任务提取成功",
+            total_tasks=len(tasks),
+            air=air_count,
+            land=land_count,
+            sea=sea_count,
+            trace_id=trace_id,
+        )
+
+        return ExtractTasksResponse(
+            code=200,
+            data=task_dicts,
+            total_tasks=len(tasks),
+            summary=summary,
+            message=f"成功提取{len(tasks)}个任务",
+        )
+
+    except ValueError as e:
+        # 提取逻辑错误（如格式不正确）
+        logger.warning(
+            "任务提取失败（格式错误）",
+            error=str(e),
+            trace_id=trace_id,
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=f"文本格式错误，无法提取任务: {str(e)}",
+        )
+
+    except Exception as e:
+        # 其他未预期错误
+        logger.error(
+            "任务提取失败（系统错误）",
+            error=str(e),
+            error_type=type(e).__name__,
+            trace_id=trace_id,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"任务提取失败: {str(e)}",
         )

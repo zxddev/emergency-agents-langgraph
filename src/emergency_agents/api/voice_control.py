@@ -39,6 +39,7 @@ class VoiceControlCommandModel(BaseModel):
 
     device_id: str
     device_vendor: str
+    control_target: str
     command_type: str
     params: Dict[str, Any]
 
@@ -82,6 +83,7 @@ def _serialize_command(command: Optional[DeviceCommand]) -> Optional[VoiceContro
     return VoiceControlCommandModel(
         device_id=command.device_id,
         device_vendor=command.device_vendor,
+        control_target=command.control_target,
         command_type=command.command_type,
         params=command.params,
     )

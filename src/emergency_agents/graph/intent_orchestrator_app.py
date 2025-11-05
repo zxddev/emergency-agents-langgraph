@@ -153,19 +153,28 @@ async def build_intent_orchestrator_graph(
         normalized = intent_type.replace(" ", "").replace("_", "-").lower()
 
         route_map: Dict[str, str] = {
+            # 战术救援 / 模拟
             "rescue-task-generate": "rescue-task-generate",
             "rescue-task-generation": "rescue-task-generate",
             "rescue-simulation": "rescue-simulation",
-            "scout-task-generate": "scout-task-generate",
-            "scout-task-generation": "scout-task-generate",  # 兼容性别名
+            # 侦察任务（默认转入简化调度）
+            "scout-task-simple": "scout-task-simple",
+            "scout-task-generation": "scout-task-simple",
+            "scout-task-generate": "scout-task-simple",
+            # 设备控制
             "device-control": "device-control",
             "device-control-robotdog": "device_control_robotdog",
+            # 任务状态查询
             "task-progress-query": "task-progress-query",
-            "location-positioning": "location-positioning",
+            # 视频分析
             "video-analysis": "video-analysis",
             "video-analyze": "video-analysis",
-            "ui-camera-flyto": "ui_camera_flyto",
-            "ui-toggle-layer": "ui_toggle_layer",
+            # 设备状态查询
+            "device-status-query": "device-status-query",
+            "device_status_query": "device-status-query",
+            # 态势研判，占位实现
+            "disaster-analysis": "disaster-analysis",
+            "situation-overview": "disaster-analysis",
         }
         router_next = route_map.get(normalized, "unknown")
 
@@ -180,7 +189,7 @@ async def build_intent_orchestrator_graph(
         )
 
         # Scout任务额外日志（用于监控侦察任务流量）
-        if router_next == "scout-task-generate":
+        if router_next == "scout-task-simple":
             logger.info(
                 "scout_task_routed",
                 thread_id=state.get("thread_id"),

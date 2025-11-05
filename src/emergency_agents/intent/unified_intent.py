@@ -84,6 +84,8 @@ INTENT_DISPLAY_OVERRIDES: Dict[str, str] = {
     "rescue-simulation": "RESCUE_SIMULATION",
     "hazard_report": "HAZARD_REPORT",
     "trapped_report": "TRAPPED_REPORT",
+    "scout_task_simple": "SCOUT_TASK_SIMPLE",
+    "scout-task-simple": "SCOUT_TASK_SIMPLE",
 }
 INTENT_DISPLAY_MAP: Dict[str, str] = {}
 DISPLAY_TO_CANONICAL: Dict[str, str] = {}
@@ -197,21 +199,14 @@ def _apply_required_field_validation(
         # 当模型给出态势摘要时才校验长度，未提供时视为可后续补充
         if summary_value is not None and not _has_detail_text(summary_value, min_len=15):
             mark_missing("situation_summary")
-
-        if not _has_location(slots):
-            mark_missing("location")
+    elif canonical_intent in {"scout_task_simple", "scout-task-simple"}:
+        if not _has_coordinates(slots):
+            mark_missing("coordinates")
+        if not _has_non_empty_text(slots.get("objective_summary")):
+            mark_missing("objective_summary")
 
         if missing_fields and not result.prompt:
-            prompt_items: List[str] = []
-            if "mission_type" in missing_fields:
-                prompt_items.append("任务类型")
-            if "coordinates" in missing_fields:
-                prompt_items.append("经纬度")
-            if "situation_summary" in missing_fields:
-                prompt_items.append("现场详细情况")
-            if "location" in missing_fields:
-                prompt_items.append("精确位置（地点名称或经纬度）")
-            result.prompt = f"请补充{'和'.join(prompt_items)}，以便生成救援任务。"
+            result.prompt = "请补充侦察目标定位与任务目的，才能派遣无人设备执行侦察。"
 
     if canonical_intent == "hazard_report":
         event_type = slots.get("event_type")

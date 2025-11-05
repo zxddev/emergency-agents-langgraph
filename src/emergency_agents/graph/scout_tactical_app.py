@@ -850,6 +850,20 @@ class ScoutTacticalGraph:
         if "durability" not in config:
             config["durability"] = "sync"
 
+        slots_obj = state.get("slots")
+        target_type = getattr(slots_obj, "target_type", None) if slots_obj else None
+        objective_summary = getattr(slots_obj, "objective_summary", None) if slots_obj else None
+        coordinates = getattr(slots_obj, "coordinates", None) if slots_obj else None
+        has_coordinates = isinstance(coordinates, dict) and {"lng", "lat"} <= coordinates.keys()
+        logger.info(
+            "scout_tactical_invoke_entry",
+            thread_id=config["configurable"].get("thread_id"),
+            incident_id=state.get("incident_id"),
+            target_type=target_type,
+            has_coordinates=has_coordinates,
+            summary_length=len(objective_summary) if isinstance(objective_summary, str) else 0,
+        )
+
         logger.info(
             "scout_tactical_invoke_start",
             thread_id=config["configurable"]["thread_id"],

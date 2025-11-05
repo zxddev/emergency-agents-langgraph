@@ -56,10 +56,25 @@ class AdapterHubClient:
 
     async def send_device_command(self, command: Mapping[str, Any]) -> Mapping[str, Any]:
         client = await self._get_async_client()
+        logger.info(
+            "adapter_hub_request",
+            extra={
+                "payload": dict(command),
+                "base_url": self._base_url,
+                "path": "/api/v3/device-access/control",
+            },
+        )
         try:
             response = await client.post("/api/v3/device-access/control", json=command)
         except httpx.HTTPError as exc:
             raise AdapterHubRequestError(f"adapter hub request failed: {exc}") from exc
+        logger.info(
+            "adapter_hub_response",
+            extra={
+                "status_code": response.status_code,
+                "text": response.text,
+            },
+        )
         return self._parse_response(response)
 
     @staticmethod
@@ -107,7 +122,8 @@ _ROBOTDOG_ACTION_MAP: dict[str, str] = {
     "右转": "turnRight",
     "stop": "stop",
     "停止": "stop",
-    "急停": "stop",
+    "急停": "forceStop",
+    "forcestop": "forceStop",
 }
 
 
@@ -124,14 +140,18 @@ def normalize_robotdog_action(action: str) -> str:
     return normalized
 
 
-def build_robotdog_move_command(device_id: str, action: str) -> dict[str, Any]:
+def build_robotdog_move_command(device_id: str, action: str, *, control_target: str = "main") -> dict[str, Any]:
     """构造鼎桥机器狗移动命令。"""
+    # 控制目标固定主控通道，避免缺少字段导致适配器拒绝请求
     normalized_action = normalize_robotdog_action(action)
     if not device_id:
         raise ValueError("device id is required for robotdog command")
+    if not control_target:
+        raise ValueError("control target is required for robotdog command")
     return {
         "deviceId": str(device_id),
         "deviceVendor": "dqDog",
+        "controlTarget": control_target,
         "commandType": "move",
         "params": {"action": normalized_action},
     }

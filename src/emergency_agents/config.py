@@ -14,13 +14,32 @@ DEFAULT_QDRANT_API_KEY = "qdrantzmkj123456"
 DEFAULT_QDRANT_URL = "http://192.168.1.40:6333"
 
 try:
+    # 说明：统一从 APP_ENV 选择性加载环境文件；默认回退到 dev.env，保持兼容
     from dotenv import load_dotenv
-    base_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-    load_dotenv(os.path.join(base_dir, 'config', 'llm_keys.env'), override=False)
-    load_dotenv(os.path.join(base_dir, 'config', 'dev.env'), override=True)
-except Exception:
-    # dotenv optional in runtime; ignore if missing
-    pass
+
+    base_dir: str = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+    config_dir: str = os.path.join(base_dir, 'config')
+
+    # 1) 通用密钥与共享配置（不覆盖已有环境变量）
+    load_dotenv(os.path.join(config_dir, 'llm_keys.env'), override=False)
+
+    # 2) 环境选择：APP_ENV ∈ {external, internal, h100}；未设置时回退到 dev.env
+    env_name: str = (os.getenv('APP_ENV') or '').strip().lower()
+    if env_name in {"external", "internal", "h100"}:
+        env_file: str = os.path.join(config_dir, f"env.{env_name}")
+    else:
+        env_file = os.path.join(config_dir, 'dev.env')
+
+    # 加载选定环境文件（允许覆盖上一层）
+    load_dotenv(env_file, override=True)
+    _logger.info("dotenv_env_selected", app_env=env_name or "(default:dev)", file=env_file)
+
+    # 3) 开发者本地覆盖层（可选，不存在时忽略）
+    # 注意：此层仅在上层未定义时补充（override=False），避免覆盖所选环境文件
+    load_dotenv(os.path.join(config_dir, 'dev.local.env'), override=False)
+except Exception as exc:
+    # dotenv 可选依赖；若加载失败不影响运行（保持现有环境变量）
+    _logger.warning("dotenv_load_skipped", error=str(exc))
 
 
 def _normalize_qdrant_url(url: str | None, api_key: str | None) -> str | None:
@@ -46,6 +65,9 @@ def _normalize_qdrant_url(url: str | None, api_key: str | None) -> str | None:
 class AppConfig:
     openai_base_url: str
     openai_api_key: str
+    video_vllm_url: str
+    video_vllm_api_key: str
+    video_vllm_model: str
     llm_model: str
     intent_llm_model: str
     embedding_model: str
@@ -64,7 +86,7 @@ class AppConfig:
     amap_base_url: str
     amap_connect_timeout: float
     amap_read_timeout: float
-    video_stream_map: dict[str, str]
+    video_stream_map: dict[str, object]
     kg_api_url: str | None
     kg_api_key: str | None
     rag_api_url: str | None
@@ -96,8 +118,15 @@ class AppConfig:
     def load_from_env() -> "AppConfig":
         stream_map_raw = os.getenv("VIDEO_STREAM_MAP", "{}")
         try:
-            stream_map = json.loads(stream_map_raw) if stream_map_raw else {}
+            parsed_stream_map = json.loads(stream_map_raw) if stream_map_raw else {}
         except json.JSONDecodeError:
+            _logger.warning("video_stream_map_parse_failed", raw=stream_map_raw)
+            parsed_stream_map = {}
+        stream_map: dict[str, object] = {}
+        if isinstance(parsed_stream_map, dict):
+            for key, value in parsed_stream_map.items():
+                stream_map[str(key)] = value
+        else:
             stream_map = {}
 
         kg_api_url = os.getenv("KG_API_URL")
@@ -105,6 +134,9 @@ class AppConfig:
 
         openai_base_url = os.getenv("OPENAI_BASE_URL", "http://192.168.1.40:8000/v1")
         openai_api_key = os.getenv("OPENAI_API_KEY", "dummy")
+        video_vllm_url = os.getenv("VIDEO_VLLM_URL", openai_base_url)
+        video_vllm_api_key = os.getenv("VIDEO_VLLM_API_KEY", openai_api_key)
+        video_vllm_model = os.getenv("VIDEO_VLLM_MODEL", "glm-4.5v")
         rag_openai_api_key = os.getenv("RAG_OPENAI_API_KEY", openai_api_key)
         intent_llm_model = os.getenv("INTENT_LLM_MODEL", os.getenv("LLM_MODEL", "glm-4-flash"))
         rag_analysis_timeout = float(os.getenv("RAG_ANALYSIS_TIMEOUT", "3"))
@@ -114,7 +146,7 @@ class AppConfig:
         qdrant_url = _normalize_qdrant_url(os.getenv("QDRANT_URL"), qdrant_api_key)
 
         try:
-            llm_max_concurrency = int(os.getenv("LLM_MAX_CONCURRENCY", "50"))
+            llm_max_concurrency = int(os.getenv("LLM_MAX_CONCURRENCY", "5"))
         except ValueError:
             llm_max_concurrency = 1000
         try:
@@ -205,6 +237,9 @@ class AppConfig:
         return AppConfig(
             openai_base_url=os.getenv("OPENAI_BASE_URL", "http://192.168.1.40:8000/v1"),
             openai_api_key=os.getenv("OPENAI_API_KEY", "dummy"),
+            video_vllm_url=video_vllm_url,
+            video_vllm_api_key=video_vllm_api_key,
+            video_vllm_model=video_vllm_model,
             llm_model=os.getenv("LLM_MODEL", "qwen2.5-7b-instruct"),
             intent_llm_model=intent_llm_model,
             embedding_model=os.getenv("EMBEDDING_MODEL", "bge-large-zh-v1.5"),
@@ -223,7 +258,7 @@ class AppConfig:
             amap_base_url=os.getenv("AMAP_API_URL", "https://restapi.amap.com"),
             amap_connect_timeout=float(os.getenv("AMAP_API_CONNECT_TIMEOUT", "10")),
             amap_read_timeout=float(os.getenv("AMAP_API_READ_TIMEOUT", "10")),
-            video_stream_map={str(k): str(v) for k, v in stream_map.items()},
+            video_stream_map=stream_map,
             kg_api_url=kg_api_url,
             kg_api_key=os.getenv("KG_API_KEY"),
             rag_api_url=rag_api_url,

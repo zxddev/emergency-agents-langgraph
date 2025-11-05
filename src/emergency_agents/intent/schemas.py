@@ -359,6 +359,8 @@ INTENT_SCHEMAS: Dict[str, Dict[str, Any]] = {
     "rescue_simulation": _dataclass_to_jsonschema(RescueTaskGenerationSlots),
     "rescue-task-generate": _dataclass_to_jsonschema(RescueTaskGenerationSlots),
     "rescue-simulation": _dataclass_to_jsonschema(RescueTaskGenerationSlots),
+    "scout_task_simple": _dataclass_to_jsonschema(ScoutTaskGenerationSlots),
+    "scout-task-simple": _dataclass_to_jsonschema(ScoutTaskGenerationSlots),
     "evidence_bookmark_playback": _dataclass_to_jsonschema(EvidenceBookmarkPlaybackSlots),
     "conversation_control": _dataclass_to_jsonschema(ConversationControlSlots),
     "task-progress-query": _dataclass_to_jsonschema(TaskProgressQuerySlots),
@@ -399,6 +401,8 @@ INTENT_SLOT_TYPES: Dict[str, type[BaseSlots]] = {
     "rescue_simulation": RescueTaskGenerationSlots,
     "rescue-task-generate": RescueTaskGenerationSlots,
     "rescue-simulation": RescueTaskGenerationSlots,
+    "scout_task_simple": ScoutTaskGenerationSlots,
+    "scout-task-simple": ScoutTaskGenerationSlots,
     "evidence_bookmark_playback": EvidenceBookmarkPlaybackSlots,
     "conversation_control": ConversationControlSlots,
     # UI 控制

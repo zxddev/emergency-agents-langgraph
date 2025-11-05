@@ -5,7 +5,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from emergency_agents.intent.validator import validate_and_prompt_node
+from emergency_agents.intent.validator import validate_and_prompt_node, set_default_robotdog_id
+
+set_default_robotdog_id(None)
 
 
 def _mock_llm(response_text: str) -> MagicMock:

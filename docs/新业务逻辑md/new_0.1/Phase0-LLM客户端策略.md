@@ -11,7 +11,7 @@
   - 内部缓存 `LLMEndpointManager`，保证同一作用域复用连接；
   - 作用域 → 端点映射来自 `AppConfig.llm_endpoint_groups`，若不存在则回落至 `llm_endpoints`。
 - `LLMEndpointManager` 新增 `from_endpoints()`，允许直接注入端点列表，`from_config()` 改为调用该工厂方法。
-- 默认并发阈值改为 `LLM_MAX_CONCURRENCY=50`（可通过环境变量覆盖），避免过高配置导致资源耗尽。
+- 默认并发阈值改为 `LLM_MAX_CONCURRENCY=5`（可通过环境变量覆盖），避免过高配置导致资源耗尽；内部 `env.h100` 环境保留 `LLM_MAX_CONCURRENCY=200` 以匹配本地 GPU 集群能力。
 - `AppConfig` 新增字段：
   - `llm_endpoint_groups`：`dict[str, tuple[LLMEndpointConfig, ...]]`；
   - `llm_max_concurrency`：整型并发上限（默认 1000）。
@@ -37,7 +37,8 @@ LLM_ENDPOINT_GROUPS={
   "intent":[{"name":"intent-primary","base_url":"https://open.bigmodel.cn/api/paas/v4","api_key":"<intent-key>","priority":150}],
   "strategic":[{"name":"strategic-primary","base_url":"https://open.bigmodel.cn/api/paas/v4","api_key":"<strategic-key>","priority":145}]
 }
-LLM_MAX_CONCURRENCY=50
+LLM_MAX_CONCURRENCY=5
+# env.h100 场景：LLM_MAX_CONCURRENCY=200
 ```
 - 若未配置 `LLM_ENDPOINT_GROUPS`，所有作用域回落到 `default`。
 

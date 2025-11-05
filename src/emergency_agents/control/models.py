@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, Literal, Optional, TypedDict
+from typing import Any, Dict, List, Literal, Optional, TypedDict
 
 
 class DeviceType(str, Enum):
@@ -37,6 +37,7 @@ class DeviceCommand:
 
     device_id: str
     device_vendor: str
+    control_target: str
     command_type: str
     params: Dict[str, Any]
 
@@ -47,6 +48,7 @@ class AdapterDispatchResult(TypedDict, total=False):
     status: Literal["success", "failed"]
     payload: Dict[str, Any]
     error: str
+    steps: List[Dict[str, Any]]
 
 
 class VoiceControlState(TypedDict, total=False):
@@ -60,6 +62,7 @@ class VoiceControlState(TypedDict, total=False):
     confirmation: bool
     normalized_intent: ControlIntent
     device_command: DeviceCommand
+    device_commands: List[DeviceCommand]
     adapter_result: AdapterDispatchResult
     status: Literal["init", "validated", "dispatched", "error"]
     error_detail: str

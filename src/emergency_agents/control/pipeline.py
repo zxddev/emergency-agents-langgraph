@@ -38,7 +38,8 @@ _ACTION_KEYWORDS: Dict[str, tuple[str, ...]] = {
     "turnRight": ("右转", "向右", "右拐", "turn right"),
     "up": ("起立", "站立", "抬起", "上升", "stand up"),
     "down": ("趴下", "坐下", "下降", "蹲下", "sit down"),
-    "stop": ("停止", "急停", "停下", "stop"),
+    "stop": ("停止", "停下", "stop"),
+    "forceStop": ("急停", "紧急停止", "force stop", "forceStop"),
 }
 
 

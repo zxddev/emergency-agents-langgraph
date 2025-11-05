@@ -1,3 +1,8 @@
+"""Legacy full scout handler。
+
+保留完整LangGraph流程供后续恢复，当前业务改走SimpleScoutDispatchHandler。
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -95,6 +100,17 @@ class ScoutTaskGenerationHandler(IntentHandler[ScoutTaskGenerationSlots]):
             "thread_id": str(state.get("thread_id")),
             "slots": slots,
         }
+
+        coordinates = getattr(slots, "coordinates", None)
+        has_coordinates = isinstance(coordinates, dict) and "lat" in coordinates and "lng" in coordinates
+        logger.info(
+            "scout_task_slots_prepared",
+            thread_id=state.get("thread_id"),
+            incident_id=incident_id,
+            target_type=getattr(slots, "target_type", None),
+            has_coordinates=has_coordinates,
+            summary_length=len(getattr(slots, "objective_summary", "") or ""),
+        )
 
         result = await graph.invoke(
             tactical_state,

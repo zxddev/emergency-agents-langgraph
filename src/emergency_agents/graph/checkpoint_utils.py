@@ -56,8 +56,8 @@ async def create_async_postgres_checkpointer(
     )
 
     try:
-        # 设置 search_path 到自定义 schema
-        await setup_conn.execute(f"SET search_path TO {schema}")
+        # 设置 search_path 到自定义 schema + public（必须包含public以访问PostGIS函数）
+        await setup_conn.execute(f"SET search_path TO {schema}, public")
 
         # AsyncPostgresSaver 会在当前 search_path 的 schema 中创建表
         setup_saver = AsyncPostgresSaver(setup_conn)
@@ -67,14 +67,12 @@ async def create_async_postgres_checkpointer(
         await setup_conn.close()
 
     # 第三步：创建正常的连接池（用于运行时 checkpoint 操作）
-    # 重要：通过 kwargs 的 options 参数设置 search_path
+    # 注意：PostgreSQL 17 不支持在 kwargs.options 中设置 search_path
+    # 改用数据库级别配置：ALTER DATABASE ... SET search_path TO operational, public;
     pool = AsyncConnectionPool(
         conninfo=normalized_dsn,
         min_size=min_size,
         max_size=max_size,
-        kwargs={
-            "options": f"-c search_path={schema}",  # 在每个连接中设置 search_path
-        },
         open=False,
     )
     logger.info(

@@ -106,6 +106,8 @@ class VisionAnalyzer:
         self,
         vllm_url: str = "http://localhost:8001/v1",
         model_name: str = "glm-4v-plus",
+        *,
+        api_key: str | None = None,
         timeout: float = 30.0,
         temperature: float = 0.1,
     ):
@@ -119,9 +121,13 @@ class VisionAnalyzer:
         """
         self.vllm_url = vllm_url.rstrip("/")
         self.model_name = model_name
+        self.api_key = api_key
         self.timeout = timeout
         self.temperature = temperature
-        self.client = httpx.AsyncClient(timeout=timeout, trust_env=False)
+        headers: dict[str, str] = {}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        self.client = httpx.AsyncClient(timeout=timeout, trust_env=False, headers=headers)
 
         logger.info(
             f"VisionAnalyzer initialized: vllm_url={vllm_url}, "

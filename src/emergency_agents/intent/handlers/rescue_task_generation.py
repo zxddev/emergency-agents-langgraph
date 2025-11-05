@@ -135,6 +135,9 @@ class RescueTaskGenerationHandler(IntentHandler[RescueTaskGenerationSlots]):
         self._incident_dao: IncidentDAO = IncidentDAO.create(self.pool)
         self._risk_cache: RiskCacheManager | None = None
         self._draft_service: RescueDraftService | None = None
+        self._simple_graph: Any | None = None
+        self._simple_graph_lock = asyncio.Lock()
+        self._legacy_fallback_enabled: bool = False
 
     async def _ensure_graph(self, notify: bool) -> RescueTacticalGraph:
         if self._graph is not None:
@@ -167,6 +170,14 @@ class RescueTaskGenerationHandler(IntentHandler[RescueTaskGenerationSlots]):
     def attach_draft_service(self, draft_service: RescueDraftService | None) -> None:
         """挂载救援方案草稿服务。"""
         self._draft_service = draft_service
+
+    def attach_simple_graph(self, graph: Any | None) -> None:
+        """注入简化救援子图。"""
+        self._simple_graph = graph
+
+    def set_legacy_fallback(self, enabled: bool) -> None:
+        """控制是否允许回退到完整战术子图。"""
+        self._legacy_fallback_enabled = bool(enabled)
 
     def _determine_entity_source(self, metadata: Mapping[str, Any]) -> str:
         source_raw = str(metadata.get("source", "")).lower()
@@ -843,7 +854,7 @@ class RescueTaskGenerationHandler(IntentHandler[RescueTaskGenerationSlots]):
         return serialize_actions(actions)
 
     async def handle(self, slots: RescueTaskGenerationSlots, state: dict[str, object]) -> dict[str, object]:
-        graph = await self._ensure_graph(notify=True)
+        # legacy_graph = await self._ensure_graph(notify=True)
         task_id = str(uuid.uuid4())
         conversation_context: Dict[str, Any] = dict(cast(Dict[str, Any], state.get("conversation_context") or {}))
         metadata: Dict[str, Any] = dict(cast(Dict[str, Any], state.get("metadata") or {}))
@@ -872,9 +883,93 @@ class RescueTaskGenerationHandler(IntentHandler[RescueTaskGenerationSlots]):
             "conversation_context": conversation_context,
         }
 
+        coordinates = getattr(slots, "coordinates", None)
+        has_coordinates = isinstance(coordinates, dict) and "lat" in coordinates and "lng" in coordinates
+        logger.info(
+            "rescue_task_slots_prepared",
+            task_id=task_id,
+            thread_id=state.get("thread_id"),
+            mission_type=getattr(slots, "mission_type", None),
+            location_name=getattr(slots, "location_name", None),
+            has_coordinates=has_coordinates,
+            summary_length=len(getattr(slots, "situation_summary", "") or ""),
+        )
+
+        if self._simple_graph is not None:
+            simple_slots = asdict(slots)
+            simple_state = {
+                "thread_id": str(state.get("thread_id")),
+                "user_id": str(state.get("user_id")),
+                "slots": simple_slots,
+            }
+            try:
+                logger.info(
+                    "simple_rescue_graph_invoke_start",
+                    task_id=task_id,
+                    thread_id=state.get("thread_id"),
+                )
+                simple_result = await self._simple_graph.ainvoke(
+                    simple_state,
+                    config={"configurable": {"thread_id": str(state.get("thread_id"))}},
+                )
+                logger.info(
+                    "simple_rescue_graph_invoke_complete",
+                    task_id=task_id,
+                    thread_id=state.get("thread_id"),
+                    status=simple_result.get("status"),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "simple_rescue_graph_invoke_failed",
+                    task_id=task_id,
+                    thread_id=state.get("thread_id"),
+                    error=str(exc),
+                )
+                fallback_text = "简化救援流程暂时不可用，请人工调度或稍后重试。"
+                return {
+                    "response_text": fallback_text,
+                    "rescue_task": None,
+                    "conversation_context": conversation_context,
+                    "simple_rescue": {
+                        "status": "error",
+                        "equipment": None,
+                        "missing_fields": None,
+                    },
+                }
+
+            response_text = str(simple_result.get("response_text") or "救援信息已记录，请继续补充现场情况。")
+            return {
+                "response_text": response_text,
+                "rescue_task": None,
+                "conversation_context": conversation_context,
+                "simple_rescue": {
+                    "status": simple_result.get("status", "success"),
+                    "equipment": simple_result.get("equipment"),
+                    "missing_fields": simple_result.get("missing_fields"),
+                },
+            }
+
+        logger.warning(
+            "simple_rescue_graph_missing",
+            task_id=task_id,
+            thread_id=state.get("thread_id"),
+        )
+        if not self._legacy_fallback_enabled:
+            return {
+                "response_text": "简化救援流程未准备就绪，请联系系统管理员。",
+                "rescue_task": None,
+                "conversation_context": conversation_context,
+                "simple_rescue": {
+                    "status": "error",
+                    "equipment": None,
+                    "missing_fields": None,
+                },
+            }
+
+        graph = await self._ensure_graph(notify=True)
         result = await graph.invoke(
             tactical_state,
-            config={"durability": "sync"},  # 长流程（救援任务生成），同步保存checkpoint确保高可靠性
+            config={"durability": "sync"},
         )
         if result.get("status") == "error":
             error_text = result.get("error", "任务生成失败。")

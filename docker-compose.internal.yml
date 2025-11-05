@@ -1,0 +1,87 @@
+version: '3.8'
+
+services:
+  emergency-agents:
+    image: emergency-agents-langgraph:latest
+    container_name: emergency-agents-internal
+    restart: unless-stopped
+
+    # 环境变量配置（从env.internal加载）
+    env_file:
+      - ./config/env.internal
+
+    # 额外环境变量覆盖（如需要）
+    environment:
+      # 日志配置
+      LOG_LEVEL: INFO
+      LOG_FORMAT: json
+
+      # 服务配置
+      WORKERS: 1
+      HOST: 0.0.0.0
+      PORT: 8008
+
+      # 数据持久化路径（容器内）
+      CHECKPOINT_SQLITE_PATH: /app/temp/checkpoints.sqlite3
+
+    # 端口映射
+    ports:
+      - "8008:8008"
+
+    # 数据卷挂载
+    volumes:
+      # 持久化数据目录
+      - emergency-temp:/app/temp
+      - emergency-logs:/app/logs
+
+      # SQL脚本（可选，用于初始化）
+      - ./sql:/app/sql:ro
+
+      # 配置文件热更新（可选）
+      # - ./config/env.internal:/app/config/env.internal:ro
+
+    # 网络配置
+    networks:
+      - emergency-net
+
+    # 资源限制（根据实际服务器配置调整）
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+        reservations:
+          cpus: '1.0'
+          memory: 2G
+
+    # 健康检查
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8008/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+    # 依赖服务（如果在同一docker-compose中）
+    # depends_on:
+    #   - postgres
+    #   - redis
+
+    # 日志配置
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "10"
+
+# 数据卷定义
+volumes:
+  emergency-temp:
+    driver: local
+  emergency-logs:
+    driver: local
+
+# 网络定义
+networks:
+  emergency-net:
+    driver: bridge

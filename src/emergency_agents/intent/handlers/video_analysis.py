@@ -2,27 +2,23 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any
 
-from emergency_agents.db.dao import DeviceDAO, serialize_dataclass
-from emergency_agents.db.device_resolver import (
-    DeviceResolver,
-    DeviceNotFoundError,
-    AmbiguousDeviceNameError,
-)
 from emergency_agents.intent.handlers.base import IntentHandler
 from emergency_agents.intent.schemas import VideoAnalysisSlots
 from emergency_agents.video.frame_capture import VideoFrameCapture
 from emergency_agents.vehicle.vision import VisionAnalyzer, DangerLevel
+from emergency_agents.video.stream_catalog import VideoStreamCatalog, VideoStreamEntry
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class VideoAnalysisHandler(IntentHandler[VideoAnalysisSlots]):
-    device_dao: DeviceDAO
-    stream_map: Mapping[str, str]
+    stream_catalog: VideoStreamCatalog
     vllm_url: str  # GLM-4V 视觉模型 API 地址
+    vllm_api_key: str | None = None
+    vllm_model: str = "glm-4.5-v"
 
     async def handle(self, slots: VideoAnalysisSlots, state: dict[str, object]) -> dict[str, object]:
         """视频分析意图处理 - 基于 GLM-4V 视觉大模型
@@ -56,51 +52,102 @@ class VideoAnalysisHandler(IntentHandler[VideoAnalysisSlots]):
             },
         )
 
-        # 1. 根据设备名称解析唯一设备（严格：命中唯一，不猜测）
-        resolver = DeviceResolver(self.device_dao)
-        try:
-            device = await resolver.resolve_by_name(slots.device_name)
-        except DeviceNotFoundError as e:
+        device_entry: VideoStreamEntry | None = None
+        candidates = self.stream_catalog.resolve(
+            slots.device_name,
+            device_type=slots.device_type,
+        )
+        if not candidates:
+            fallback_candidates = self.stream_catalog.list_candidates()
+            logger.warning(
+                "video_analysis_device_not_found",
+                extra={
+                    "device_name": slots.device_name,
+                    "device_type": slots.device_type,
+                    "available": len(fallback_candidates),
+                },
+            )
+            fallback_labels = "、".join(item["label"] for item in fallback_candidates) or "无可用设备"
             return {
-                "response_text": f"未找到设备「{slots.device_name}」。请检查名称或选择候选："
-                + ("、".join(f"{s.name or s.id}" for s in e.suggestions) if e.suggestions else "无候选"),
+                "response_text": (
+                    f"未找到名为「{slots.device_name}」的设备。"
+                    f"当前可用设备：{fallback_labels}。请确认名称后重试。"
+                ),
                 "video_analysis": {
                     "status": "device_not_found",
                     "query": slots.device_name,
-                    "candidates": [
-                        serialize_dataclass(c) for c in (e.suggestions or [])
-                    ],
-                },
-            }
-        except AmbiguousDeviceNameError as e:
-            return {
-                "response_text": f"设备名称「{slots.device_name}」存在歧义，请从候选中明确指定："
-                + "、".join(f"{c.name or c.id}" for c in e.candidates),
-                "video_analysis": {
-                    "status": "ambiguous_device_name",
-                    "query": slots.device_name,
-                    "candidates": [serialize_dataclass(c) for c in e.candidates],
+                    "candidates": fallback_candidates,
                 },
             }
 
-        # 2. 获取视频流地址
-        stream_url = device.stream_url or self.stream_map.get(device.id)
-        if stream_url is None:
+        if len(candidates) > 1:
+            logger.warning(
+                "video_analysis_device_ambiguous",
+                extra={
+                    "device_name": slots.device_name,
+                    "matches": [entry.device_id for entry in candidates],
+                },
+            )
             return {
-                "response_text": f"设备 {device.name or device.id} 缺少视频流地址，请联系运维人员配置 stream_url。",
-                "video_analysis": {"status": "missing_stream_url"},
+                "response_text": (
+                    f"设备名称「{slots.device_name}」存在歧义，请明确指定："
+                    + "、".join(candidate.display_name for candidate in candidates)
+                ),
+                "video_analysis": {
+                    "status": "ambiguous_device_name",
+                    "query": slots.device_name,
+                    "candidates": [candidate.to_candidate() for candidate in candidates],
+                },
+            }
+
+        device_entry = candidates[0]
+
+        # 2. 获取视频流地址
+        stream_url = device_entry.stream_url
+        if not stream_url:
+            logger.error(
+                "video_analysis_missing_stream_url",
+                extra={
+                    "device_id": device_entry.device_id,
+                    "device_name": device_entry.display_name,
+                },
+            )
+            return {
+                "response_text": (
+                    f"设备 {device_entry.display_name or device_entry.device_id} 缺少视频流地址，"
+                    "请联系运维人员配置后再试。"
+                ),
+                "video_analysis": {
+                    "status": "missing_stream_url",
+                    "device_id": device_entry.device_id,
+                },
             }
 
         try:
             # 3. 截取视频帧
-            logger.info(f"Capturing frame from stream: {stream_url}")
+            logger.info(
+                "video_frame_capture_start",
+                extra={
+                    "device_id": device_entry.device_id,
+                    "stream_url": stream_url,
+                },
+            )
             capturer = VideoFrameCapture(stream_url=stream_url, timeout=10.0, max_retries=2)
             capture_result = capturer.capture_frame()
 
             if not capture_result.success:
-                logger.error(f"Frame capture failed: {capture_result.error_message}")
+                logger.error(
+                    "video_frame_capture_failed",
+                    extra={
+                        "device_id": device_entry.device_id,
+                        "error": capture_result.error_message,
+                    },
+                )
                 return {
-                    "response_text": f"无法从设备 {device.name or device.id} 获取视频画面：{capture_result.error_message}",
+                    "response_text": (
+                        f"无法从设备 {device_entry.display_name or device_entry.device_id} 获取视频画面："
+                        f"{capture_result.error_message}"
+                    ),
                     "video_analysis": {
                         "status": "capture_failed",
                         "error": capture_result.error_message,
@@ -108,10 +155,17 @@ class VideoAnalysisHandler(IntentHandler[VideoAnalysisSlots]):
                 }
 
             # 4. 调用 GLM-4V 视觉分析
-            logger.info(f"Analyzing frame with GLM-4V: image_size={capture_result.image_size}")
+            logger.info(
+                "video_analysis_inference_start",
+                extra={
+                    "device_id": device_entry.device_id,
+                    "image_size": capture_result.image_size,
+                },
+            )
             analyzer = VisionAnalyzer(
                 vllm_url=self.vllm_url,
-                model_name="glm-4v",  # 智谱 GLM-4V 视觉模型
+                model_name=self.vllm_model,
+                api_key=self.vllm_api_key,
                 timeout=30.0,
                 temperature=0.1,
             )
@@ -124,7 +178,7 @@ class VideoAnalysisHandler(IntentHandler[VideoAnalysisSlots]):
 
             # 5. 生成自然语言描述（对话式回复）
             response_text = self._format_analysis_response(
-                device_name=device.name or device.id,
+                device_name=device_entry.display_name or device_entry.device_id,
                 analysis_goal=slots.analysis_goal,
                 result=analysis_result,
             )
@@ -133,7 +187,7 @@ class VideoAnalysisHandler(IntentHandler[VideoAnalysisSlots]):
             logger.info(
                 "video_analysis_completed",
                 extra={
-                    "device_id": slots.device_id,
+                    "device_id": device_entry.device_id,
                     "danger_level": analysis_result.danger_level.value,
                     "persons_count": analysis_result.persons.count,
                     "vehicles_count": analysis_result.vehicles.total_count,
@@ -145,8 +199,8 @@ class VideoAnalysisHandler(IntentHandler[VideoAnalysisSlots]):
                 "response_text": response_text,
                 "video_analysis": {
                     "status": "success",
-                    "device_id": slots.device_id,
-                    "device_name": device.name,
+                    "device_id": device_entry.device_id,
+                    "device_name": device_entry.display_name,
                     "analysis_goal": slots.analysis_goal,
                     "danger_level": analysis_result.danger_level.value,
                     "persons": {
@@ -174,7 +228,14 @@ class VideoAnalysisHandler(IntentHandler[VideoAnalysisSlots]):
             }
 
         except Exception as e:
-            logger.error(f"Video analysis failed: {e}", exc_info=True)
+            logger.error(
+                "video_analysis_failed",
+                extra={
+                    "device_id": device_entry.device_id if device_entry else None,
+                    "error": str(e),
+                },
+                exc_info=True,
+            )
             return {
                 "response_text": f"视频分析过程中发生错误：{str(e)}。请稍后重试或联系技术支持。",
                 "video_analysis": {

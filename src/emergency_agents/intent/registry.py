@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import inspect
-from typing import Any, Dict
+from typing import Any, Dict, Mapping
 
 from psycopg.rows import DictRow
 from psycopg_pool import AsyncConnectionPool
 
-from emergency_agents.db.dao import DeviceDAO, LocationDAO, TaskDAO, IncidentDAO
+from emergency_agents.db.dao import DeviceDAO, TaskDAO
 from emergency_agents.external.adapter_client import AdapterHubClient
 from emergency_agents.external.amap_client import AmapClient
 from emergency_agents.external.device_directory import DeviceDirectory
@@ -16,19 +16,28 @@ from emergency_agents.graph.kg_service import KGService
 from emergency_agents.intent.handlers import (
     DeviceControlHandler,
     RobotDogControlHandler,
-    LocationPositioningHandler,
     RescueSimulationHandler,
     RescueTaskGenerationHandler,
-    ScoutTaskGenerationHandler,
+    SimpleScoutDispatchHandler,
     TaskProgressQueryHandler,
     VideoAnalysisHandler,
-    UIControlHandler,
 )
+from emergency_agents.intent.handlers.device_status import DeviceStatusQueryHandler
+from emergency_agents.intent.handlers.disaster_overview import DisasterOverviewHandler
 from emergency_agents.risk.service import RiskCacheManager
-from emergency_agents.risk.repository import RiskDataRepository
 from emergency_agents.rag.pipe import RagPipeline
 from emergency_agents.services import RescueDraftService
+from emergency_agents.video.stream_catalog import VideoStreamCatalog
 
+# 默认视频流目录，确保在未提供配置时依然能完成巡逻机器狗的视频分析链路
+DEFAULT_VIDEO_STREAMS: Dict[str, object] = {
+    "scout-robotdog": {
+        "display_name": "侦察巡逻机器狗",
+        "stream_url": "rtsp://8.147.130.215:8554/live/02",
+        "aliases": ("侦察巡逻机器狗", "巡逻机器狗", "侦察机器狗", "机器狗"),
+        "device_type": "robotdog",
+    }
+}
 
 @dataclass
 class IntentHandlerRegistry:
@@ -40,7 +49,7 @@ class IntentHandlerRegistry:
         pool: AsyncConnectionPool[DictRow],
         amap_client: AmapClient,
         device_directory: DeviceDirectory | None,
-        video_stream_map: Dict[str, str],
+        video_stream_map: Mapping[str, object],
         kg_service: KGService,
         rag_pipeline: RagPipeline,
         llm_client: Any,
@@ -51,12 +60,17 @@ class IntentHandlerRegistry:
         rag_timeout: float,
         postgres_dsn: str,
         vllm_url: str,  # GLM-4V 视觉模型 API 地址
+        vllm_api_key: str | None,
+        vllm_model: str,
+        simple_rescue_graph: Any | None = None,
     ) -> "IntentHandlerRegistry":
         if not postgres_dsn:
             raise RuntimeError("POSTGRES_DSN 未配置，无法初始化意图处理器注册表。")
-        location_dao = LocationDAO.create(pool)
         task_dao = TaskDAO.create(pool)
         device_dao = DeviceDAO.create(pool)
+        merged_streams: Dict[str, object] = dict(DEFAULT_VIDEO_STREAMS)
+        merged_streams.update(dict(video_stream_map))
+        stream_catalog = VideoStreamCatalog.from_raw_mapping(merged_streams)
 
         rescue_generation = RescueTaskGenerationHandler(
             pool=pool,
@@ -80,34 +94,40 @@ class IntentHandlerRegistry:
             rag_timeout=rag_timeout,
             postgres_dsn=postgres_dsn,
         )
-        risk_repository = RiskDataRepository(IncidentDAO.create(pool))
-        scout_handler = ScoutTaskGenerationHandler(
-            risk_repository=risk_repository,
-            device_directory=device_directory,  # type: ignore  # 允许None，运行时暴露问题
-            amap_client=amap_client,
-            orchestrator_client=orchestrator_client,  # type: ignore  # 允许None，运行时暴露问题
-            postgres_dsn=postgres_dsn,
+        simple_scout_handler = SimpleScoutDispatchHandler(
             pool=pool,
+            orchestrator_client=orchestrator_client,
+            llm_client=llm_client,
+            llm_model=llm_model,
         )
 
         robotdog_control = RobotDogControlHandler(adapter_client, default_robotdog_id)
 
+        device_status_handler = DeviceStatusQueryHandler(device_dao)
+        disaster_overview_handler = DisasterOverviewHandler()
+
+        if simple_rescue_graph is not None:
+            rescue_generation.attach_simple_graph(simple_rescue_graph)
+
         handlers: Dict[str, Any] = {
             "task-progress-query": TaskProgressQueryHandler(task_dao),
-            "location-positioning": LocationPositioningHandler(location_dao, amap_client),
             "device-control": DeviceControlHandler(device_dao, adapter_client, default_robotdog_id),
             "device-control-robotdog": robotdog_control,
             "device_control_robotdog": robotdog_control,
-            "video-analysis": VideoAnalysisHandler(device_dao, video_stream_map, vllm_url),
+            "video-analysis": VideoAnalysisHandler(stream_catalog, vllm_url, vllm_api_key, vllm_model),
             "rescue-task-generate": rescue_generation,
             "rescue_task_generate": rescue_generation,
             "rescue-simulation": rescue_simulation,
             "rescue_simulation": rescue_simulation,
-            "scout-task-generate": scout_handler,
-            "scout_task_generate": scout_handler,
-            # UI 控制
-            "ui_camera_flyto": UIControlHandler(),
-            "ui_toggle_layer": UIControlHandler(),
+            "scout-task-simple": simple_scout_handler,
+            "scout_task_simple": simple_scout_handler,
+            # 兼容旧的完整侦察意图，暂时重定向到简化处理器
+            "scout-task-generate": simple_scout_handler,
+            "scout_task_generate": simple_scout_handler,
+            "device-status-query": device_status_handler,
+            "device_status_query": device_status_handler,
+            "disaster-analysis": disaster_overview_handler,
+            "situation-overview": disaster_overview_handler,
         }
         return cls(handlers=handlers)
 
@@ -117,7 +137,7 @@ class IntentHandlerRegistry:
     def attach_risk_cache(self, risk_cache: RiskCacheManager | None) -> None:
         """为救援/模拟处理器挂载共享风险缓存。"""
         for handler in self.handlers.values():
-            if isinstance(handler, (RescueTaskGenerationHandler, ScoutTaskGenerationHandler)):
+            if isinstance(handler, RescueTaskGenerationHandler):
                 handler.attach_risk_cache(risk_cache)
 
     def attach_rescue_draft_service(self, draft_service: RescueDraftService | None) -> None:
@@ -125,6 +145,13 @@ class IntentHandlerRegistry:
         for handler in self.handlers.values():
             if isinstance(handler, RescueTaskGenerationHandler):
                 handler.attach_draft_service(draft_service)
+
+    def attach_simple_rescue_graph(self, graph: Any | None) -> None:
+        """为支持的救援处理器注入简化子图。"""
+        for handler in self.handlers.values():
+            attach_fn = getattr(handler, "attach_simple_graph", None)
+            if callable(attach_fn):
+                attach_fn(graph)
 
     async def close(self) -> None:
         seen: set[int] = set()

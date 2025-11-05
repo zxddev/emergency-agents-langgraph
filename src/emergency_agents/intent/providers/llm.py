@@ -188,14 +188,28 @@ class LLMIntentProvider(IntentProvider):
             raise ValueError("意图识别文本为空")
 
         messages = self._build_messages(text)
-        logger.debug("llm_intent_request", model=self._model, message_preview=text[:80])
+        logger.info(
+            "llm_intent_request",
+            model=self._model,
+            message_preview=text[:80],
+        )
         response = self._llm_client.chat.completions.create(
             model=self._model,
             messages=messages,
             temperature=0.0,
         )
         content = getattr(response.choices[0].message, "content", "")
-        logger.debug("llm_intent_response", preview=content[:120])
+        finish_reason = getattr(response.choices[0], "finish_reason", None)
+        response_id = getattr(response, "id", None)
+        usage = getattr(response, "usage", None)
+        logger.info(
+            "llm_intent_response",
+            model=self._model,
+            response_id=response_id,
+            finish_reason=finish_reason,
+            usage=getattr(usage, "model_dump", lambda: usage)(),
+            content_preview=content[:200],
+        )
         clean_text = _clean_json_text(content)
         prediction = _parse_prediction(clean_text)
         return prediction

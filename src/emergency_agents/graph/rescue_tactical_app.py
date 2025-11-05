@@ -7,7 +7,7 @@ import asyncio
 import math
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Dict, List, Optional, Required, NotRequired, Tuple, TypedDict
+from typing import Any, Callable, Dict, List, Optional, Required, NotRequired, Tuple, TypedDict, Awaitable
 
 import structlog
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
@@ -905,7 +905,11 @@ class RescueTacticalGraph:
             graph.add_edge("prepare_response", "__end__")
         return graph
 
-    async def invoke(self, state: RescueTacticalState) -> RescueTacticalState:
+    async def invoke(
+        self,
+        state: RescueTacticalState,
+        config: Optional[Dict[str, Any]] = None,
+    ) -> RescueTacticalState:
         """
         执行战术救援图
         durability="sync": 长流程，每步完成后同步保存checkpoint
@@ -913,13 +917,49 @@ class RescueTacticalGraph:
         """
         if self._compiled is None:
             raise RuntimeError("RescueTacticalGraph 尚未初始化完成")
-        return await self._compiled.ainvoke(
-            state,
-            config={
-                "configurable": {"thread_id": state["thread_id"]},
-                "durability": "sync",
-            },
+        user_config: Dict[str, Any] = dict(config or {})
+        configurable = user_config.setdefault("configurable", {})
+        if not isinstance(configurable, dict):
+            configurable = {"thread_id": state.get("thread_id", "")}
+            user_config["configurable"] = configurable
+        configurable.setdefault("thread_id", state.get("thread_id", ""))
+        user_config.setdefault("durability", "sync")
+        slots_obj = state.get("slots")
+        mission_type = None
+        location_name = None
+        coordinates = None
+        if isinstance(slots_obj, dict):
+            mission_type = slots_obj.get("mission_type")
+            location_name = slots_obj.get("location_name")
+            coordinates = slots_obj.get("coordinates")
+        else:
+            mission_type = getattr(slots_obj, "mission_type", None)
+            location_name = getattr(slots_obj, "location_name", None)
+            coordinates = getattr(slots_obj, "coordinates", None)
+        has_coordinates = False
+        if isinstance(coordinates, dict):
+            has_coordinates = "lat" in coordinates and "lng" in coordinates
+        logger.info(
+            "rescue_tactical_invoke_start",
+            task_id=state.get("task_id"),
+            thread_id=state.get("thread_id"),
+            mission_type=mission_type,
+            location_name=location_name,
+            has_coordinates=has_coordinates,
+            simulation=bool(state.get("simulation_mode", False)),
         )
+        result: RescueTacticalState = await self._compiled.ainvoke(
+            state,
+            config=user_config,
+        )
+        logger.info(
+            "rescue_tactical_invoke_complete",
+            task_id=state.get("task_id"),
+            thread_id=state.get("thread_id"),
+            status=result.get("status", "ok"),
+            error=result.get("error"),
+        )
+        return result
 
 
 async def build_rescue_tactical_graph(

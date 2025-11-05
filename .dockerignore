@@ -1,0 +1,72 @@
+# Git相关
+.git
+.gitignore
+
+# Python相关
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+env/
+*.egg-info/
+dist/
+build/
+
+# 测试相关
+.pytest_cache/
+tests/
+*.db
+*.sqlite3
+htmlcov/
+.coverage
+.tox/
+
+# IDE配置
+.vscode/
+.idea/
+.claude/
+.cursor/
+.codex/
+.serena/
+.spec-workflow/
+.specify/
+
+# 文档和临时文件
+docs/
+*.md
+*.txt
+!requirements.txt
+temp/
+logs/
+*.log
+
+# 数据文件
+*.mmdb
+*.dat
+geoip.dat
+geosite.dat
+Country.mmdb
+
+# 其他不需要的文件
+mihomo-linux-amd64
+repomix-output.md
+prometheus.yml
+pytest.ini
+docker-compose*.yml
+test_*.py
+test_*.sh
+fix_startup.sh
+*.sqlite3
+
+# 配置文件（除了需要的）
+config/*.env
+config/env.*
+!config/env.internal
+
+# OpenSpec规范文档
+openspec/
+prd/

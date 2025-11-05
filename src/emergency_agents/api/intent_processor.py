@@ -4,13 +4,24 @@ import json
 import os
 import time
 from dataclasses import dataclass, asdict, field
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Mapping, Optional
+from urllib.parse import quote
 
 import structlog
 
 from emergency_agents.constants import RESCUE_DEMO_INCIDENT_ID
 from emergency_agents.graph.intent_orchestrator_app import IntentOrchestratorState
 from emergency_agents.intent.registry import IntentHandlerRegistry
+from emergency_agents.intent.handlers.device_control import DeviceControlHandler, RobotDogControlHandler
+from emergency_agents.intent.handlers.device_status import DeviceStatusQueryHandler
+from emergency_agents.intent.handlers.disaster_overview import DisasterOverviewHandler
+from emergency_agents.intent.handlers.rescue_task_generation import (
+    RescueSimulationHandler,
+    RescueTaskGenerationHandler,
+)
+from emergency_agents.intent.handlers.scout_task_simple import SimpleScoutDispatchHandler
+from emergency_agents.intent.handlers.task_progress import TaskProgressQueryHandler
+from emergency_agents.intent.handlers.video_analysis import VideoAnalysisHandler
 from emergency_agents.intent.schemas import INTENT_SLOT_TYPES, BaseSlots
 from emergency_agents.memory.conversation_manager import ConversationManager, MessageRecord
 from emergency_agents.context.service import ContextService
@@ -49,6 +60,19 @@ def _normalize_intent_key(intent_type: str) -> str:
     return intent_type.strip().replace(" ", "").replace("_", "-").lower()
 
 
+def _encode_intent_for_mem0(intent_type: str | None) -> str:
+    """将意图名称转换为 Neo4j 合法的关系名。"""
+    raw = str(intent_type or "").strip()
+    if not raw:
+        return "UNKNOWN"
+    encoded = quote(raw, safe="")
+    sanitized = encoded.replace("%", "_").replace("-", "_")
+    sanitized = sanitized or "UNKNOWN"
+    if not sanitized[0].isalpha():
+        sanitized = f"A_{sanitized}"
+    return sanitized.upper()
+
+
 def _extract_context_from_memories(memory_hits: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
     """从记忆中提取上下文字段。"""
     context: Dict[str, Any] = {}
@@ -83,7 +107,13 @@ def _extract_context_from_memories(memory_hits: Iterable[Dict[str, Any]]) -> Dic
 
 def _build_robotdog_command_text(intent: Dict[str, Any]) -> str:
     slots = intent.get("slots") or {}
-    action_raw = slots.get("action") if isinstance(slots, dict) else None
+    action_raw = None
+    if isinstance(slots, dict):
+        action_raw = (
+            slots.get("action")
+            or slots.get("command")
+            or slots.get("动作")
+        )
     action = str(action_raw).strip() if action_raw else "执行动作"
     return f"机器狗 {action}"
 
@@ -96,6 +126,17 @@ def _to_serializable_mapping(obj: Any) -> Dict[str, Any] | None:
     if isinstance(obj, dict):
         return dict(obj)
     return None
+
+
+def _normalize_memory_hits(raw: Any) -> List[Dict[str, Any]]:
+    """将 mem0 返回的结构整理为列表。"""
+    if isinstance(raw, list):
+        return [item for item in raw if isinstance(item, dict)]
+    if isinstance(raw, dict):
+        candidates = raw.get("results") or raw.get("memories") or []
+        if isinstance(candidates, list):
+            return [item for item in candidates if isinstance(item, dict)]
+    return []
 
 
 async def _handle_robotdog_control(
@@ -239,6 +280,69 @@ async def _handle_robotdog_control(
     )
 
 
+async def _handle_dialogue_fallback(
+    *,
+    message: str,
+    intent: Dict[str, Any],
+    thread_id: str,
+    user_id: str,
+    persist_message: Callable[[str, Optional[str]], Awaitable[MessageRecord]],
+    history_records: List[MessageRecord],
+    build_history: Callable[[List[MessageRecord]], List[Dict[str, Any]]],
+    memory_hits: List[Dict[str, Any]],
+    audit_log: List[Dict[str, Any]],
+    dialogue_graph: Any | None,
+) -> IntentProcessResult:
+    logger.info(
+        "dialogue_fallback_invoked",
+        thread_id=thread_id,
+        user_id=user_id,
+        message_preview=message[:80],
+    )
+    response_text = "收到，目前未识别到明确任务，我将根据现有信息提供研判。"
+    dialogue_result: Dict[str, Any] = {}
+    if dialogue_graph is not None:
+        normalized_memories = _normalize_memory_hits(memory_hits)
+        dialogue_state = {
+            "thread_id": thread_id,
+            "user_id": user_id,
+            "raw_text": message,
+            "conversation_history": build_history(history_records),
+            "memory_hits": normalized_memories,
+        }
+        logger.info("dialogue_graph_invoke_start", thread_id=thread_id)
+        dialogue_result = await dialogue_graph.ainvoke(
+            dialogue_state,
+            config={"configurable": {"thread_id": thread_id}},
+        )
+        logger.info(
+            "dialogue_graph_invoke_complete",
+            thread_id=thread_id,
+            has_response=bool(isinstance(dialogue_result, dict) and dialogue_result.get("response_text")),
+        )
+        if isinstance(dialogue_result, dict):
+            response_text = str(dialogue_result.get("response_text") or response_text)
+            dialogue_audit = dialogue_result.get("audit_log")
+            if isinstance(dialogue_audit, list):
+                audit_log.extend(dialogue_audit)
+    saved = await persist_message(response_text, intent.get("intent_type"))
+    history_records.append(saved)
+    result_payload: Dict[str, Any] = {"response_text": response_text, "echo": message}
+    if isinstance(dialogue_result, dict):
+        for key in ("suggestions", "context_block"):
+            value = dialogue_result.get(key)
+            if value:
+                result_payload[key] = value
+    return IntentProcessResult(
+        status="dialogue",
+        intent=intent,
+        result=result_payload,
+        history=build_history(history_records),
+        memory_hits=memory_hits,
+        audit_log=audit_log,
+    )
+
+
 async def process_intent_core(
     *,
     user_id: str,
@@ -249,6 +353,7 @@ async def process_intent_core(
     registry: IntentHandlerRegistry,
     orchestrator_graph: Any,
     voice_control_graph: Any | None,
+    dialogue_graph: Any | None,
     mem: MemoryFacade,
     build_history: Callable[[List[MessageRecord]], List[Dict[str, Any]]],
     mem0_metrics: Mem0Metrics,
@@ -259,6 +364,15 @@ async def process_intent_core(
     if not message or not message.strip():
         raise ValueError("message不能为空")
 
+    cleaned_message = message.strip()
+    logger.info(
+        "intent_message_received",
+        thread_id=thread_id,
+        user_id=user_id,
+        channel=channel,
+        text=cleaned_message,
+    )
+
     metadata_dict = dict(metadata or {})
     incident_id = str(metadata_dict.get("incident_id") or RESCUE_DEMO_INCIDENT_ID)
     conversation_metadata = metadata_dict | {"incident_id": incident_id}
@@ -267,7 +381,7 @@ async def process_intent_core(
         user_id=user_id,
         thread_id=thread_id,
         role="user",
-        content=message,
+        content=cleaned_message,
         intent_type=None,
         metadata=metadata_dict,
         conversation_metadata=conversation_metadata,
@@ -282,7 +396,7 @@ async def process_intent_core(
         try:
             t0 = time.perf_counter()
             memory_hits = mem.search(
-                query=message,
+                query=cleaned_message,
                 user_id=user_id,
                 run_id=thread_id,
                 top_k=3,
@@ -324,7 +438,7 @@ async def process_intent_core(
         "thread_id": thread_id,
         "user_id": user_id,
         "channel": channel,
-        "raw_text": message,
+        "raw_text": cleaned_message,
         "metadata": metadata_dict,
         "incident_id": incident_id,
         "messages": messages_for_graph,
@@ -527,29 +641,38 @@ async def process_intent_core(
         )
 
     if router_next in {"unknown", "error"}:
-        response_text = "当前请求无法识别，请调整描述后重试。"
-        saved = await _persist_assistant_message(response_text, intent.get("intent_type"))
-        history_records.append(saved)
         logger.info(
             "intent_process_result_unknown",
             intent_type=intent.get("intent_type"),
             router_next=router_next,
             thread_id=thread_id,
         )
-        return IntentProcessResult(
-            status="unknown",
+        return await _handle_dialogue_fallback(
+            message=cleaned_message,
             intent=intent,
-            result={
-                "response_text": response_text,
-            },
-            history=build_history(history_records),
+            thread_id=thread_id,
+            user_id=user_id,
+            persist_message=_persist_assistant_message,
+            history_records=history_records,
+            build_history=build_history,
             memory_hits=memory_hits,
             audit_log=graph_state.get("audit_log") or [],
+            dialogue_graph=dialogue_graph,
         )
 
     slots_payload = intent.get("slots") or {}
 
     if router_next == "device_control_robotdog":
+        logger.info(
+            "intent_dispatch_ready",
+            router_next=router_next,
+            handler="RobotDogControlHandler",
+            graph="VoiceControlGraph",
+            graph_mode="robotdog",
+            thread_id=thread_id,
+            user_id=user_id,
+            channel=channel,
+        )
         robotdog_result = await _handle_robotdog_control(
             intent=intent,
             slots_payload=slots_payload,
@@ -612,6 +735,41 @@ async def process_intent_core(
             audit_log=graph_state.get("audit_log") or [],
         )
 
+    graph_name: Optional[str] = None
+    graph_mode: Optional[str] = None
+    if isinstance(handler, RescueSimulationHandler):
+        graph_name = "RescueTacticalGraph"
+        graph_mode = "simulation"
+    elif isinstance(handler, RescueTaskGenerationHandler):
+        graph_name = "RescueTacticalGraph"
+        graph_mode = "live"
+    elif isinstance(handler, SimpleScoutDispatchHandler):
+        graph_name = "SimpleScoutDispatch"
+    elif isinstance(handler, RobotDogControlHandler):
+        graph_name = "VoiceControlGraph"
+        graph_mode = "robotdog"
+    elif isinstance(handler, DeviceControlHandler):
+        graph_name = "DeviceControlPipeline"
+    elif isinstance(handler, VideoAnalysisHandler):
+        graph_name = "VideoAnalysisService"
+    elif isinstance(handler, TaskProgressQueryHandler):
+        graph_name = "TaskProgressQuery"
+    elif isinstance(handler, DeviceStatusQueryHandler):
+        graph_name = "DeviceStatusQuery"
+    elif isinstance(handler, DisasterOverviewHandler):
+        graph_name = "DisasterOverview"
+
+    logger.info(
+        "intent_dispatch_ready",
+        router_next=router_next,
+        handler=handler.__class__.__name__,
+        graph=graph_name,
+        graph_mode=graph_mode,
+        thread_id=thread_id,
+        user_id=user_id,
+        channel=channel,
+    )
+
     handler_state: Dict[str, Any] = {
         "user_id": user_id,
         "thread_id": thread_id,
@@ -650,11 +808,17 @@ async def process_intent_core(
     history_records.append(saved_assistant)
 
     try:
+        intent_type_raw = intent.get("intent_type")
+        intent_type_encoded = _encode_intent_for_mem0(intent_type_raw)
         mem.add(
-            content=f"意图: {intent.get('intent_type')}, 槽位: {json.dumps(slots_payload, ensure_ascii=False)}",
+            content=f"意图: {intent_type_raw}, 槽位: {json.dumps(slots_payload, ensure_ascii=False)}",
             user_id=user_id,
             run_id=thread_id,
-            metadata={"incident_id": incident_id, "intent_type": intent.get("intent_type")},
+            metadata={
+                "incident_id": incident_id,
+                "intent_type": intent_type_encoded,
+                "intent_type_raw": intent_type_raw,
+            },
         )
         mem0_metrics.inc_add_success()
     except Exception as exc:  # noqa: BLE001

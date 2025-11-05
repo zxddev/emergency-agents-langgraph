@@ -16,7 +16,7 @@ neo4j>=5.20.0
 llama-index>=0.10.60
 pytest>=8.3.0
 dashscope>=1.23.1
-websockets>=12.0
+websockets>=12.0,<14.0  # 避免14.0版本的recv_messages兼容性问题
 structlog>=24.1.0
 python-multipart>=0.0.20
 opuslib>=3.0.1
@@ -35,3 +35,9 @@ jsonschema>=4.19.0
 # 视频分析依赖（用于视频流截取和GLM-4V视觉分析）
 opencv-python>=4.8.0  # 视频流处理和帧截取
 Pillow>=10.0.0        # 图像格式转换
+
+# Redis 缓存
+redis>=5.0.0
+
+# Instructor - LLM结构化输出（用于Markdown侦察方案解析）
+instructor>=1.10.0

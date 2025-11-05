@@ -49,6 +49,7 @@ def test_voice_control_graph_dispatch(tmp_path) -> None:
     assert adapter.commands
     command = adapter.commands.pop()
     assert command["deviceVendor"] == "dqDog"
+    assert command["controlTarget"] == "main"
     assert command["params"]["action"] == "forward"
 
 

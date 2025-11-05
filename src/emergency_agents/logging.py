@@ -16,10 +16,16 @@ from __future__ import annotations
 import logging
 import sys
 from contextvars import ContextVar
+import os
 from typing import Any
 
 import structlog
 from prometheus_client import Counter, Histogram
+
+# 是否抑制定时/健康检查类日志的运行时开关（可热切换）
+_SUPPRESS_PERIODIC_LOGS_FLAG: bool = (
+    os.getenv("SUPPRESS_PERIODIC_LOGS", "false").lower() in {"1", "true", "yes", "y", "on"}
+)
 
 # ========== ContextVar：跨异步边界的trace-id传递 ==========
 trace_id_var: ContextVar[str | None] = ContextVar("trace_id", default=None)
@@ -108,12 +114,52 @@ def configure_logging(
         level=getattr(logging, log_level.upper(), logging.INFO),
     )
 
-    # 配置structlog processor链
+    def drop_periodic_logs(
+        logger: logging.Logger, method_name: str, event_dict: dict[str, Any]
+    ) -> dict[str, Any]:
+        """在开启 SUPPRESS_PERIODIC_LOGS 时丢弃噪声型的定时日志。
+
+        说明：
+        - 仅针对周期性任务产生日志（健康检查、缓存刷新、概要统计）。
+        - 不影响正常的错误/业务日志；只根据事件名过滤。
+        - 通过返回 structlog.DropEvent 让该日志完全不输出，也不计入 Prometheus 指标。
+        """
+        # 读取模块级开关，支持运行时热切换
+        if not _SUPPRESS_PERIODIC_LOGS_FLAG:
+            return event_dict
+
+        event = str(event_dict.get("event", ""))
+        if not event:
+            return event_dict
+
+        # 前缀匹配：大多数定时健康检查日志
+        PERIODIC_PREFIXES = (
+            "health_check_",          # health_check_start/complete/loop_*/error 等
+            "service_health_check",   # service_health_check 与其 *_timeout/_error
+            "aliyun_asr_",            # aliyun_asr_start / aliyun_asr_done
+        )
+
+        # 精确匹配：其它周期性刷新/统计
+        PERIODIC_EXACT = {
+            "risk_cache_refreshed",
+            "risk_prediction_summary",
+            "dao_incident_list_active_risk_zones",
+            "service_recovered",
+            "local_asr_unhealthy",
+        }
+
+        if event in PERIODIC_EXACT or any(event.startswith(p) for p in PERIODIC_PREFIXES):
+            raise structlog.DropEvent
+
+        return event_dict
+
     processors: list[Any] = [
         # 1. 添加logger名称
         structlog.stdlib.add_logger_name,
         # 2. 添加日志级别
         structlog.stdlib.add_log_level,
+        # 2.5 在Prometheus计数前过滤周期性日志（按事件名）
+        drop_periodic_logs,
         # 3. 添加时间戳
         structlog.processors.TimeStamper(fmt="iso", utc=True),
         # 4. 自定义：trace-id注入
@@ -166,6 +212,18 @@ def clear_trace_id() -> None:
 def get_trace_id() -> str | None:
     """获取当前协程的trace-id（用于手动传递）"""
     return trace_id_var.get()
+
+
+# ========== 运行时控制：定时日志抑制 ==========
+def set_periodic_logs_suppressed(enabled: bool) -> None:
+    """运行时打开/关闭定时日志抑制（无需重启）。
+
+    示例：
+        from emergency_agents.logging import set_periodic_logs_suppressed
+        set_periodic_logs_suppressed(True)
+    """
+    global _SUPPRESS_PERIODIC_LOGS_FLAG
+    _SUPPRESS_PERIODIC_LOGS_FLAG = bool(enabled)
 
 
 # ========== 默认初始化 ==========
