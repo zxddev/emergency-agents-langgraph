@@ -6,6 +6,7 @@ from typing import List, Dict, Any
 
 import httpx
 from qdrant_client import QdrantClient
+import structlog
 from llama_index.core import Document, VectorStoreIndex, StorageContext
 from llama_index.core import Settings
 from llama_index.vector_stores.qdrant import QdrantVectorStore
@@ -17,6 +18,7 @@ from prometheus_client import Counter, Histogram
 _RAG_IDX_COUNTER = Counter('rag_index_total', 'RAG index requests', ['domain'])
 _RAG_QRY_COUNTER = Counter('rag_query_total', 'RAG query requests', ['domain'])
 _RAG_QRY_LATENCY = Histogram('rag_query_seconds', 'RAG query latency seconds', ['domain'])
+logger = structlog.get_logger(__name__)
 
 
 @dataclass
@@ -139,3 +141,27 @@ class RagPipeline:
             chunks.append(RagChunk(text=node.node.get_content(), source=source, loc=str(loc)))
         self._qry_counter.labels(domain=domain).inc()
         return chunks
+
+
+class DisabledRagPipeline:
+    """RAG 关闭时的占位实现，清晰提示功能不可用。"""
+
+    def __init__(self) -> None:
+        _RAG_QRY_COUNTER.labels(domain="__disabled").inc()
+        logger.warning("rag_disabled", reason="ENABLE_RAG=false")
+
+    def index_documents(self, domain: str, docs: List[Dict[str, Any]]) -> None:
+        logger.info(
+            "rag_index_skipped_disabled",
+            domain=domain,
+            doc_count=len(docs),
+        )
+
+    def query(self, question: str, domain: str, top_k: int = 3) -> List[RagChunk]:
+        logger.info(
+            "rag_query_skipped_disabled",
+            question_preview=question[:32],
+            domain=domain,
+            top_k=top_k,
+        )
+        return []

@@ -67,6 +67,14 @@ class VideoDevice:
 
 
 @dataclass(slots=True)
+class CarriedDevice:
+    """车载携带设备信息，包含设备名称和天气能力描述。"""
+
+    name: Optional[str]
+    weather_capability: Optional[str]
+
+
+@dataclass(slots=True)
 class TaskSummary:
     """任务概况。"""
 

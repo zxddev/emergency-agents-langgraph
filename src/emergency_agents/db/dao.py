@@ -15,6 +15,7 @@ from psycopg_pool import AsyncConnectionPool
 from typing_extensions import Self
 
 from emergency_agents.db.models import (
+    CarriedDevice,
     DeviceSummary,
     EntityLocation,
     EntityRecord,
@@ -212,6 +213,54 @@ class DeviceDAO:
             found=record is not None,
         )
         return record
+
+    async def fetch_device_by_name(self, device_name: str) -> DeviceSummary | None:
+        """根据设备名称精确匹配查询设备基础信息（大小写不敏感）。
+
+        Args:
+            device_name: 设备名称（如"无人机A"、"机器狗01"）
+
+        Returns:
+            DeviceSummary对象（包含id、device_type、name），如果未找到则返回None
+
+        Note:
+            - 使用 lower(d.name) = lower(%(device_name)s) 实现大小写不敏感的精确匹配
+            - device.name 在数据库层已保证唯一（lower(name) 唯一约束）
+            - 若命中多条则返回第一条，并记录错误日志（数据一致性问题）
+        """
+        start = time.perf_counter()
+        query = """
+            SELECT id::text AS id,
+                   device_type,
+                   name
+              FROM operational.device
+             WHERE lower(name) = lower(%(device_name)s)
+        """
+        async with self._pool.connection() as conn:
+            async with conn.cursor(row_factory=class_row(DeviceSummary)) as cur:
+                await cur.execute(query, {"device_name": device_name})
+                rows = await cur.fetchall()
+
+        duration = time.perf_counter() - start
+        DAO_CALL_LATENCY.labels("device", "fetch_device_by_name").observe(duration)
+        DAO_CALL_TOTAL.labels("device", "fetch_device_by_name", "found" if rows else "not_found").inc()
+        logger.info(
+            "dao_device_fetch_by_name",
+            duration_ms=duration * 1000,
+            device_name=device_name,
+            hit_count=len(rows),
+        )
+
+        if not rows:
+            return None
+        if len(rows) > 1:
+            # 多条命中应由上层视为数据一致性错误
+            logger.error(
+                "dao_device_fetch_by_name_multiple",
+                device_name=device_name,
+                hit_count=len(rows),
+            )
+        return rows[0]
 
     async def fetch_video_device(self, device_id: str) -> VideoDevice | None:
         start = time.perf_counter()
@@ -501,6 +550,47 @@ class DeviceDAO:
             device_count=len(device_map),
         )
         return device_map
+
+    async def fetch_carried_devices(self) -> list[CarriedDevice]:
+        """查询所有车载携带的设备（is_selected=1）及其天气能力。
+
+        用于设备状态查询Handler，当用户询问"有哪些携带的设备"时，
+        返回所有已选中的车载设备及其天气适应性能力描述。
+
+        Returns:
+            list[CarriedDevice]: 携带设备列表，包含设备名称和天气能力描述
+
+        Note:
+            - 仅返回 car_device_select.is_selected = 1 的设备
+            - weather_capability 字段包含自然语言描述，供LLM评估设备天气适应性
+            - 结果按设备名称升序排列
+        """
+        start = time.perf_counter()
+        query = """
+            SELECT d.name,
+                   d.weather_capability
+              FROM operational.device d
+              JOIN operational.car_device_select c
+                ON d.id = c.device_id
+             WHERE c.is_selected = 1
+             ORDER BY d.name ASC
+        """
+
+        async with self._pool.connection() as conn:
+            async with conn.cursor(row_factory=class_row(CarriedDevice)) as cur:
+                await cur.execute(query)
+                rows = await cur.fetchall()
+                result = list(rows)
+
+        duration = time.perf_counter() - start
+        DAO_CALL_LATENCY.labels("device", "fetch_carried_devices").observe(duration)
+        DAO_CALL_TOTAL.labels("device", "fetch_carried_devices", "success").inc()
+        logger.info(
+            "dao_device_fetch_carried_devices",
+            duration_ms=duration * 1000,
+            device_count=len(result),
+        )
+        return result
 
 
 class TaskDAO:

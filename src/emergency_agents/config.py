@@ -13,6 +13,14 @@ _logger = structlog.get_logger(__name__)
 DEFAULT_QDRANT_API_KEY = "qdrantzmkj123456"
 DEFAULT_QDRANT_URL = "http://192.168.1.40:6333"
 
+
+def _bool_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    return normalized in {"1", "true", "yes", "on"}
+
 try:
     # 说明：统一从 APP_ENV 选择性加载环境文件；默认回退到 dev.env，保持兼容
     from dotenv import load_dotenv
@@ -113,6 +121,9 @@ class AppConfig:
     intent_margin_threshold: float
     risk_cache_ttl_seconds: float
     risk_refresh_interval_seconds: float
+    enable_mem0: bool
+    enable_rag: bool
+    enable_kg: bool
 
     @staticmethod
     def load_from_env() -> "AppConfig":
@@ -285,4 +296,7 @@ class AppConfig:
             intent_margin_threshold=float(os.getenv("INTENT_MARGIN_THRESHOLD", "0.20")),
             risk_cache_ttl_seconds=float(os.getenv("RISK_CACHE_TTL_SECONDS", "120")),
             risk_refresh_interval_seconds=float(os.getenv("RISK_REFRESH_INTERVAL_SECONDS", "60")),
+            enable_mem0=_bool_env("ENABLE_MEM0", False),
+            enable_rag=_bool_env("ENABLE_RAG", True),
+            enable_kg=_bool_env("ENABLE_KG", True),
         )

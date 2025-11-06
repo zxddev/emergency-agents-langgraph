@@ -107,6 +107,8 @@ async def intent_registry(
         rag_timeout=30.0,
         postgres_dsn=postgres_dsn,
         vllm_url=cfg.openai_base_url,
+        vllm_api_key=cfg.openai_api_key,
+        vllm_model="glm-4.5v",
     )
 
     yield registry

@@ -168,6 +168,7 @@ class VideoAnalysisHandler(IntentHandler[VideoAnalysisSlots]):
                 api_key=self.vllm_api_key,
                 timeout=30.0,
                 temperature=0.1,
+                enable_thinking=True,
             )
 
             analysis_result = await analyzer.analyze_drone_image(

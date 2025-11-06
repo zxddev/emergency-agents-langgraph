@@ -110,6 +110,7 @@ class VisionAnalyzer:
         api_key: str | None = None,
         timeout: float = 30.0,
         temperature: float = 0.1,
+        enable_thinking: bool = True,
     ):
         """初始化视觉分析器
 
@@ -124,6 +125,7 @@ class VisionAnalyzer:
         self.api_key = api_key
         self.timeout = timeout
         self.temperature = temperature
+        self.enable_thinking = enable_thinking
         headers: dict[str, str] = {}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
@@ -290,12 +292,22 @@ class VisionAnalyzer:
             "temperature": self.temperature,
             "max_tokens": 2048,
         }
+        if self.enable_thinking:
+            payload["thinking"] = {"type": "enabled"}
 
         response = await self.client.post(
             f"{self.vllm_url}/chat/completions",
             json=payload,
         )
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            logger.error(
+                "vision_api_request_failed",
+                status=exc.response.status_code,
+                body=exc.response.text,
+            )
+            raise
 
         data = response.json()
         return data["choices"][0]["message"]["content"]

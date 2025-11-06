@@ -4,6 +4,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+import structlog
+
 from neo4j import GraphDatabase
 
 
@@ -198,6 +200,50 @@ class KGService:
         with self._driver.session() as session:
             rows = session.run(query, hazard=hazard, env=environment, k=top_k)
             return [dict(r) for r in rows]
+
+
+class DisabledKGService:
+    """知识图谱关闭时的占位实现，阻止外部连接。"""
+
+    def __init__(self) -> None:
+        structlog.get_logger(__name__).warning("kg_disabled", reason="ENABLE_KG=false")
+
+    def close(self) -> None:  # noqa: D401
+        structlog.get_logger(__name__).info("kg_close_skipped_disabled")
+
+    def get_equipment_requirements(self, disaster_types: List[str]) -> List[Dict[str, Any]]:
+        structlog.get_logger(__name__).info(
+            "kg_query_skipped_disabled",
+            query="equipment_requirements",
+            types=disaster_types,
+        )
+        return []
+
+    def predict_secondary_disasters(self, primary_disaster: str, magnitude: float = 0.0) -> List[Dict[str, Any]]:
+        structlog.get_logger(__name__).info(
+            "kg_query_skipped_disabled",
+            query="secondary_disasters",
+            disaster=primary_disaster,
+        )
+        return []
+
+    def get_compound_risks(self, disaster_ids: List[str]) -> List[Dict[str, Any]]:
+        structlog.get_logger(__name__).info(
+            "kg_query_skipped_disabled",
+            query="compound_risks",
+            ids=disaster_ids,
+        )
+        return []
+
+    def recommend_equipment(self, hazard: str, environment: Optional[str] = None, top_k: int = 5) -> List[Dict[str, Any]]:
+        structlog.get_logger(__name__).info(
+            "kg_query_skipped_disabled",
+            query="recommend_equipment",
+            hazard=hazard,
+            environment=environment,
+            top_k=top_k,
+        )
+        return []
 
     def search_cases(self, keywords: str, top_k: int = 5) -> List[Dict[str, Any]]:
         query = (

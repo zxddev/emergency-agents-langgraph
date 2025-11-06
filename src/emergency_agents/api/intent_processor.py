@@ -25,7 +25,7 @@ from emergency_agents.intent.handlers.video_analysis import VideoAnalysisHandler
 from emergency_agents.intent.schemas import INTENT_SLOT_TYPES, BaseSlots
 from emergency_agents.memory.conversation_manager import ConversationManager, MessageRecord
 from emergency_agents.context.service import ContextService
-from emergency_agents.memory.mem0_facade import MemoryFacade
+from emergency_agents.memory.mem0_facade import MemoryFacade, DisabledMemoryFacade
 from emergency_agents.ui.actions import serialize_actions
 
 logger = structlog.get_logger(__name__)
@@ -354,11 +354,12 @@ async def process_intent_core(
     orchestrator_graph: Any,
     voice_control_graph: Any | None,
     dialogue_graph: Any | None,
-    mem: MemoryFacade,
+    mem: MemoryFacade | DisabledMemoryFacade,
     build_history: Callable[[List[MessageRecord]], List[Dict[str, Any]]],
     mem0_metrics: Mem0Metrics,
     channel: str = "text",
     context_service: ContextService | None = None,
+    enable_mem0: bool = True,
 ) -> IntentProcessResult:
     """统一意图处理核心逻辑。"""
     if not message or not message.strip():
@@ -391,7 +392,6 @@ async def process_intent_core(
     history_payload = build_history(history_records)
 
     memory_hits: List[Dict[str, Any]] = []
-    enable_mem0 = os.getenv("ENABLE_MEM0", "false").lower() == "true"
     if enable_mem0:
         try:
             t0 = time.perf_counter()
@@ -409,6 +409,12 @@ async def process_intent_core(
             mem0_metrics.inc_search_failure(reason)
             # 配置启用但搜索失败：直接抛出，遵循不兜底原则
             raise
+    else:
+        logger.info(
+            "mem0_disabled_skip",
+            thread_id=thread_id,
+            channel=channel,
+        )
 
     conversation_context = {"incident_id": incident_id} | _extract_context_from_memories(memory_hits)
 

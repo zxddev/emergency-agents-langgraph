@@ -210,3 +210,43 @@ class MemoryFacade:
         mem = self._ensure_mem()
         return mem.search(query, user_id=user_id, agent_id=agent_id, run_id=run_id, limit=top_k)
 
+
+class DisabledMemoryFacade:
+    """Mem0 关闭时的占位实现，显式记录禁用原因。"""
+
+    def __init__(self) -> None:
+        logger.warning("mem0_disabled", reason="ENABLE_MEM0=false")
+
+    def add(
+        self,
+        *,
+        content: str,
+        user_id: str,
+        run_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        actor: str = "ai_agent",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        logger.info(
+            "mem0_add_skipped_disabled",
+            user_id=user_id,
+            run_id=run_id,
+        )
+        return False
+
+    def search(
+        self,
+        *,
+        query: str,
+        user_id: str,
+        run_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        top_k: int = 5,
+    ) -> List[Dict[str, Any]]:
+        logger.info(
+            "mem0_search_skipped_disabled",
+            user_id=user_id,
+            run_id=run_id,
+            query_preview=query[:32],
+        )
+        return []

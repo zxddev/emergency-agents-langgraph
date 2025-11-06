@@ -48,11 +48,11 @@ from emergency_agents.memory.conversation_manager import (
     ConversationNotFoundError,
     MessageRecord,
 )
-from emergency_agents.memory.mem0_facade import Mem0Config, MemoryFacade
+from emergency_agents.memory.mem0_facade import Mem0Config, MemoryFacade, DisabledMemoryFacade
 from emergency_agents.llm.client import get_openai_client
 from emergency_agents.llm.factory import LLMClientFactory
-from emergency_agents.rag.pipe import RagPipeline, RagChunk
-from emergency_agents.graph.kg_service import KGService, KGConfig
+from emergency_agents.rag.pipe import RagPipeline, RagChunk, DisabledRagPipeline
+from emergency_agents.graph.kg_service import KGService, KGConfig, DisabledKGService
 from emergency_agents.db.dao import (
     IncidentDAO,
     IncidentRepository,
@@ -162,44 +162,54 @@ _mem0_add_failure = Counter(
 )
 
 # memory facade singleton
-_mem = MemoryFacade(
-    Mem0Config(
-        qdrant_url=_cfg.qdrant_url or "http://192.168.1.40:6333",
-        qdrant_api_key=_cfg.qdrant_api_key,
-        qdrant_collection="mem0_collection",
-        embedding_model=_cfg.embedding_model,
-        embedding_dim=_cfg.embedding_dim,
-        neo4j_uri=_cfg.neo4j_uri or "bolt://192.168.1.40:7687",
-        neo4j_user=_cfg.neo4j_user or "neo4j",
-        # pragma: allowlist secret - placeholder credential for development
-        neo4j_password=_cfg.neo4j_password or "example-neo4j",
-        openai_base_url=_cfg.openai_base_url,
-        # pragma: allowlist secret - placeholder credential for development
-        openai_api_key=_cfg.openai_api_key,
-        graph_llm_model=_cfg.llm_model,
+if _cfg.enable_mem0:
+    _mem = MemoryFacade(
+        Mem0Config(
+            qdrant_url=_cfg.qdrant_url or "http://192.168.1.40:6333",
+            qdrant_api_key=_cfg.qdrant_api_key,
+            qdrant_collection="mem0_collection",
+            embedding_model=_cfg.embedding_model,
+            embedding_dim=_cfg.embedding_dim,
+            neo4j_uri=_cfg.neo4j_uri or "bolt://192.168.1.40:7687",
+            neo4j_user=_cfg.neo4j_user or "neo4j",
+            # pragma: allowlist secret - placeholder credential for development
+            neo4j_password=_cfg.neo4j_password or "example-neo4j",
+            openai_base_url=_cfg.openai_base_url,
+            # pragma: allowlist secret - placeholder credential for development
+            openai_api_key=_cfg.openai_api_key,
+            graph_llm_model=_cfg.llm_model,
+        )
     )
-)
+else:
+    _mem = DisabledMemoryFacade()
+    structlog.get_logger(__name__).warning("mem0_feature_disabled_startup")
 
 # rag pipeline singleton
-_rag = RagPipeline(
-    qdrant_url=_cfg.qdrant_url or "http://192.168.1.40:6333",
-    qdrant_api_key=_cfg.qdrant_api_key,
-    embedding_model=_cfg.embedding_model,
-    embedding_dim=_cfg.embedding_dim,
-    openai_base_url=_cfg.openai_base_url,
-    openai_api_key=_cfg.openai_api_key,
-    llm_model=_cfg.llm_model,
-)
+if _cfg.enable_rag:
+    _rag = RagPipeline(
+        qdrant_url=_cfg.qdrant_url or "http://192.168.1.40:6333",
+        qdrant_api_key=_cfg.qdrant_api_key,
+        embedding_model=_cfg.embedding_model,
+        embedding_dim=_cfg.embedding_dim,
+        openai_base_url=_cfg.openai_base_url,
+        openai_api_key=_cfg.openai_api_key,
+        llm_model=_cfg.llm_model,
+    )
+else:
+    _rag = DisabledRagPipeline()
 
 # kg service singleton
-_kg = KGService(
-    KGConfig(
-        uri=_cfg.neo4j_uri or "bolt://192.168.1.40:7687",
-        user=_cfg.neo4j_user or "neo4j",
-        # pragma: allowlist secret - placeholder credential for development
-        password=_cfg.neo4j_password or "example-neo4j",
+if _cfg.enable_kg:
+    _kg = KGService(
+        KGConfig(
+            uri=_cfg.neo4j_uri or "bolt://192.168.1.40:7687",
+            user=_cfg.neo4j_user or "neo4j",
+            # pragma: allowlist secret - placeholder credential for development
+            password=_cfg.neo4j_password or "example-neo4j",
+        )
     )
-)
+else:
+    _kg = DisabledKGService()
 
 if not _cfg.postgres_dsn:
     raise RuntimeError("必须配置POSTGRES_DSN以启用会话服务")
@@ -209,6 +219,15 @@ _pg_pool: AsyncConnectionPool[DictRow] = AsyncConnectionPool(
     min_size=1,
     max_size=4,
     open=False,
+    # 连接超时配置：防止长时间等待无响应的数据库
+    timeout=10.0,  # 获取连接的超时时间（秒）
+    # 连接生命周期管理：自动清理过期连接
+    max_idle=300.0,  # 连接最大空闲时间5分钟，超过则关闭
+    max_lifetime=3600.0,  # 连接最大生命周期1小时，超过则关闭
+    # 重连配置：数据库重启后自动恢复
+    reconnect_timeout=5.0,  # 重连超时5秒
+    # 连接健康检查：每次使用前验证连接有效性
+    check=AsyncConnectionPool.check_connection,  # 使用前自动检查连接状态
 )
 _conversation_manager = ConversationManager(_pg_pool)
 
@@ -585,6 +604,7 @@ async def startup_event():
         build_history=_build_history,
         mem0_metrics_factory=_mem0_metrics_factory,
         context_service=_context_service,
+        enable_mem0=_cfg.enable_mem0,
     )
     logger.info("voice_chat_intent_pipeline_injected")
 
@@ -993,9 +1013,26 @@ async def assist_answer(req: AssistAnswerRequest):
     with _assist_latency.time():
         try:
             # 1) 检索 RAG 片段
-            rag_chunks: List[RagChunk] = _rag.query(req.question, req.domain.value, req.top_k)
+            rag_chunks: List[RagChunk] = []
+            if _cfg.enable_rag:
+                rag_chunks = _rag.query(req.question, req.domain.value, req.top_k)
+            else:
+                logger.info(
+                    "assist_rag_disabled",
+                    question=req.question,
+                    domain=req.domain.value,
+                )
+
             # 2) 检索 Mem0 记忆
-            mem_results = _mem.search(query=req.question, user_id=req.user_id, run_id=req.run_id, top_k=req.top_k)
+            if _cfg.enable_mem0:
+                mem_results = _mem.search(query=req.question, user_id=req.user_id, run_id=req.run_id, top_k=req.top_k)
+            else:
+                mem_results = []
+                logger.info(
+                    "assist_mem0_disabled",
+                    question=req.question,
+                    user_id=req.user_id,
+                )
             # 3) 汇总证据并生成回答
             client = get_openai_client(_cfg)
             context_parts: List[str] = []
@@ -1037,31 +1074,88 @@ async def intent_process(req: IntentProcessRequest):
     if req.incident_id:
         metadata.setdefault("incident_id", req.incident_id)
 
-    result: IntentProcessResult = await process_intent_core(
-        user_id=req.user_id,
-        thread_id=req.thread_id,
-        message=req.message,
-        metadata=metadata,
-        manager=manager,
-        registry=registry,
-        orchestrator_graph=_require_intent_graph(),
-        voice_control_graph=_require_voice_control_graph(),
-        dialogue_graph=_require_dialogue_graph(),
-        mem=_mem,
-        build_history=_build_history,
-        mem0_metrics=_mem0_metrics_factory(),
-        channel=req.channel,
-        context_service=_context_service,
-    )
-    return {
-        "status": result.status,
-        "intent": result.intent,
-        "result": result.result,
-        "history": result.history,
-        "memory_hits": result.memory_hits,
-        "audit_log": result.audit_log,
-        "ui_actions": result.ui_actions,
-    }
+    try:
+        result: IntentProcessResult = await process_intent_core(
+            user_id=req.user_id,
+            thread_id=req.thread_id,
+            message=req.message,
+            metadata=metadata,
+            manager=manager,
+            registry=registry,
+            orchestrator_graph=_require_intent_graph(),
+            voice_control_graph=_require_voice_control_graph(),
+            dialogue_graph=_require_dialogue_graph(),
+            mem=_mem,
+            build_history=_build_history,
+            mem0_metrics=_mem0_metrics_factory(),
+            channel=req.channel,
+            context_service=_context_service,
+            enable_mem0=_cfg.enable_mem0,
+        )
+        return {
+            "status": result.status,
+            "intent": result.intent,
+            "result": result.result,
+            "history": result.history,
+            "memory_hits": result.memory_hits,
+            "audit_log": result.audit_log,
+            "ui_actions": result.ui_actions,
+        }
+    except Exception as exc:
+        # 记录详细错误信息到日志（包括堆栈跟踪）
+        logger = structlog.get_logger(__name__)
+        logger.error(
+            "intent_process_failed",
+            user_id=req.user_id,
+            thread_id=req.thread_id,
+            error=str(exc),
+            exc_info=True,
+        )
+
+        # 识别数据库连接错误，提供友好的错误信息
+        error_str = str(exc).lower()
+        db_error_keywords = [
+            "consuming input failed",
+            "server closed the connection",
+            "connection refused",
+            "connection reset",
+            "connection timed out",
+            "could not connect",
+            "network error",
+            "connection error",
+            "database error",
+        ]
+
+        is_db_error = any(keyword in error_str for keyword in db_error_keywords)
+
+        if is_db_error:
+            # 数据库连接问题：使用降级响应
+            friendly_message = "系统正在维护中，请稍后再试。"
+            logger.warning(
+                "database_connection_issue_in_api",
+                user_id=req.user_id,
+                thread_id=req.thread_id,
+                message_preview=req.message[:50] if req.message else "",
+            )
+            # 返回一个降级的响应，而不是抛出500错误
+            return {
+                "status": "error",
+                "intent": {"intent_type": "unknown"},
+                "result": {
+                    "response_text": friendly_message,
+                    "error_type": "service_unavailable",
+                },
+                "history": [],
+                "memory_hits": [],
+                "audit_log": [],
+                "ui_actions": [],
+            }
+        else:
+            # 其他错误：返回通用错误信息
+            raise HTTPException(
+                status_code=500,
+                detail="系统处理遇到问题，请稍后重试。",
+            )
 
 
 @app.post("/conversations/history")

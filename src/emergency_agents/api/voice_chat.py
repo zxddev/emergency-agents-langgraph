@@ -21,7 +21,7 @@ from emergency_agents.api.intent_processor import (
 )
 from emergency_agents.memory.conversation_manager import ConversationManager, MessageRecord
 from emergency_agents.intent.registry import IntentHandlerRegistry
-from emergency_agents.memory.mem0_facade import MemoryFacade
+from emergency_agents.memory.mem0_facade import MemoryFacade, DisabledMemoryFacade
 from emergency_agents.context.service import ContextService
 
 
@@ -90,10 +90,11 @@ class VoiceChatHandler:
         self._intent_graph: Any | None = None
         self._voice_control_graph: Any | None = None
         self._dialogue_graph: Any | None = None
-        self._mem: Optional[MemoryFacade] = None
+        self._mem: Optional[MemoryFacade | DisabledMemoryFacade] = None
         self._build_history: Optional[Callable[[List[MessageRecord]], List[Dict[str, Any]]]] = None
         self._mem0_metrics_factory: Optional[Callable[[], Mem0Metrics]] = None
         self._context_service: Optional[ContextService] = None
+        self._enable_mem0: bool = True
 
     def set_intent_pipeline(
         self,
@@ -103,10 +104,11 @@ class VoiceChatHandler:
         orchestrator_graph: Any,
         voice_control_graph: Any,
         dialogue_graph: Any,
-        mem: MemoryFacade,
+        mem: MemoryFacade | DisabledMemoryFacade,
         build_history: Callable[[List[MessageRecord]], List[Dict[str, Any]]],
         mem0_metrics_factory: Callable[[], Mem0Metrics],
         context_service: Optional[ContextService] = None,
+        enable_mem0: bool = True,
     ) -> None:
         """注入统一意图处理依赖，用于语音路径走编排图与子图。"""
         self._conv_manager = manager
@@ -118,6 +120,7 @@ class VoiceChatHandler:
         self._build_history = build_history
         self._mem0_metrics_factory = mem0_metrics_factory
         self._context_service = context_service
+        self._enable_mem0 = enable_mem0
         logger.info("voice_chat_intent_pipeline_ready")
 
     async def start_background_tasks(self) -> None:
@@ -424,6 +427,7 @@ class VoiceChatHandler:
                 mem0_metrics=self._mem0_metrics_factory(),
                 channel="voice",
                 context_service=self._context_service,
+                enable_mem0=self._enable_mem0,
             )
 
             # 兼容现有前端协议：返还 llm 文本 + intent 类型
@@ -448,8 +452,38 @@ class VoiceChatHandler:
             except Exception as tts_err:
                 logger.error("tts_call_failed", error=str(tts_err))
         except Exception as exc:
-            logger.error("intent_pipeline_failed", error=str(exc), session_id=session.session_id)
-            await session.send_json({"type": "error", "message": f"意图处理失败: {exc}"})
+            # 记录详细技术错误到日志
+            logger.error("intent_pipeline_failed", error=str(exc), session_id=session.session_id, exc_info=True)
+
+            # 识别数据库连接错误，提供友好的错误信息
+            error_message = "抱歉，系统处理遇到问题，请稍后重试。"
+            error_str = str(exc).lower()
+
+            # 检测常见的数据库连接错误
+            db_error_keywords = [
+                "consuming input failed",
+                "server closed the connection",
+                "connection refused",
+                "connection reset",
+                "connection timed out",
+                "could not connect",
+                "network error",
+                "connection error",
+                "database error",
+            ]
+
+            is_db_error = any(keyword in error_str for keyword in db_error_keywords)
+
+            if is_db_error:
+                # 数据库连接问题：使用降级响应，不暴露技术细节
+                error_message = "系统正在维护中，请稍后再试。我们已记录您的请求，稍后会为您处理。"
+                logger.warning(
+                    "database_connection_issue_detected",
+                    session_id=session.session_id,
+                    user_text_preview=user_text[:50] if user_text else "",
+                )
+
+            await session.send_json({"type": "error", "message": error_message})
 
 
 _voice_config = AppConfig.load_from_env()

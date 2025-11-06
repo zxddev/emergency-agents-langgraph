@@ -7,7 +7,9 @@ FROM python:3.11-slim as builder
 WORKDIR /app
 
 # 安装系统依赖（编译期需要）
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# 临时取消代理设置，避免apt-get使用无法访问的宿主机代理
+RUN unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY && \
+    apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     g++ \
     libpq-dev \
@@ -20,7 +22,9 @@ COPY requirements.txt .
 
 # 安装Python依赖（使用pip缓存加速）
 # 注意：PyTorch使用CPU版本以减少镜像大小
-RUN pip install --no-cache-dir --user \
+# 临时取消代理设置，避免pip使用无法访问的宿主机代理
+RUN unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY && \
+    pip install --no-cache-dir --user \
     torch==2.4.1 torchaudio==2.4.1 --index-url https://download.pytorch.org/whl/cpu && \
     pip install --no-cache-dir --user -r requirements.txt
 
@@ -36,7 +40,9 @@ ENV PYTHONUNBUFFERED=1 \
     TZ=Asia/Shanghai
 
 # 安装运行时依赖
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# 临时取消代理设置，避免apt-get使用无法访问的宿主机代理
+RUN unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY && \
+    apt-get update && apt-get install -y --no-install-recommends \
     libpq5 \
     libopus0 \
     libsndfile1 \

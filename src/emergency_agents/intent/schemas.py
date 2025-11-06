@@ -80,11 +80,12 @@ class RouteSafePointQuerySlots(BaseSlots):
 class DeviceStatusQuerySlots(BaseSlots):
     """设备状态查询槽位。
 
-    注意：device_type和metric改为可选，以处理LLM提取不完整的情况。
+    注意：所有字段均可选，以处理LLM提取不完整的情况。
+    使用device_name而非device_id，支持用户自然语言输入设备名称。
     """
     device_type: Optional[str] = None
     metric: Optional[str] = None
-    device_id: Optional[str] = None
+    device_name: Optional[str] = None
 
 
 @dataclass
@@ -391,6 +392,7 @@ INTENT_SLOT_TYPES: Dict[str, type[BaseSlots]] = {
     "hazard_report": HazardReportSlots,
     "route_safe_point_query": RouteSafePointQuerySlots,
     "device_status_query": DeviceStatusQuerySlots,
+    "device-status-query": DeviceStatusQuerySlots,  # 添加连字符版本
     "geo_annotate": GeoAnnotateSlots,
     "annotation_sign": AnnotationSignSlots,
     "plan_task_approval": PlanTaskApprovalSlots,

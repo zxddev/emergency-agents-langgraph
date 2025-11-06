@@ -1,0 +1,85 @@
+version: '3.8'
+
+services:
+  emergency-agents:
+    image: emergency-agents-langgraph:latest
+    container_name: emergency-agents-external
+    restart: unless-stopped
+
+    # 环境变量配置（从env.external加载）
+    env_file:
+      - ./config/env.external
+
+    # 额外环境变量覆盖
+    environment:
+      # 指定使用外网环境
+      APP_ENV: external
+
+      # 日志配置
+      LOG_LEVEL: INFO
+      LOG_FORMAT: json
+
+      # 服务配置
+      WORKERS: 2
+      HOST: 0.0.0.0
+      PORT: 8008
+
+      # 数据持久化路径（容器内）
+      CHECKPOINT_SQLITE_PATH: /app/temp/checkpoints.sqlite3
+
+    # 端口映射
+    ports:
+      - "8008:8008"
+
+    # 数据卷挂载
+    volumes:
+      # 持久化数据目录
+      - emergency-temp-external:/app/temp
+      - emergency-logs-external:/app/logs
+
+      # SQL脚本（可选，用于初始化）
+      - ./sql:/app/sql:ro
+
+      # 配置文件热更新（可选）
+      # - ./config/env.external:/app/config/env.external:ro
+
+    # 网络配置
+    networks:
+      - emergency-net
+
+    # 资源限制（生产环境配置）
+    deploy:
+      resources:
+        limits:
+          cpus: '4.0'
+          memory: 8G
+        reservations:
+          cpus: '2.0'
+          memory: 4G
+
+    # 健康检查
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8008/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+    # 日志配置
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "20"
+
+# 数据卷定义
+volumes:
+  emergency-temp-external:
+    driver: local
+  emergency-logs-external:
+    driver: local
+
+# 网络定义
+networks:
+  emergency-net:
+    driver: bridge
