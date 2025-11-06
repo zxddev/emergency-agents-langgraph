@@ -106,6 +106,44 @@ class IntentClassifierRuntime:
                     if isinstance(prediction.get("slots"), dict):
                         prediction["slots"]["situation_summary"] = ""
 
+        # 特殊处理：system-data-query 的槽位映射
+        # 如果用户说"查看所有携带设备"，LLM可能返回device_type而不是query_type
+        if intent_name in {"system_data_query", "system-data-query"} and isinstance(slots, dict):
+            # 根据关键词推断查询类型
+            if "device_type" in slots or "设备" in text or "携带" in text:
+                # 如果没有device_name，说明是查询所有携带设备
+                if not slots.get("device_name"):
+                    slots = {
+                        "query_type": "carried_devices",
+                        "query_params": {}
+                    }
+                else:
+                    # 如果有device_name，说明是按名称查询
+                    slots = {
+                        "query_type": "device_by_name",
+                        "query_params": {"device_name": slots.get("device_name")}
+                    }
+            elif "task" in slots or "任务" in text:
+                task_id = slots.get("task_id")
+                task_code = slots.get("task_code")
+                if task_id:
+                    slots = {
+                        "query_type": "task_progress",
+                        "query_params": {"task_id": task_id}
+                    }
+                elif task_code:
+                    slots = {
+                        "query_type": "task_by_code",
+                        "query_params": {"task_code": task_code}
+                    }
+            # 如果slots中没有query_type，设置默认值
+            elif "query_type" not in slots:
+                # 默认查询携带设备（最常用）
+                slots = {
+                    "query_type": "carried_devices",
+                    "query_params": {}
+                }
+
         intent_payload = {
             "intent_type": intent_name if not need_confirm else "unknown",
             "slots": slots,

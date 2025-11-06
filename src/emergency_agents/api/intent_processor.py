@@ -14,6 +14,7 @@ from emergency_agents.graph.intent_orchestrator_app import IntentOrchestratorSta
 from emergency_agents.intent.registry import IntentHandlerRegistry
 from emergency_agents.intent.handlers.device_control import DeviceControlHandler, RobotDogControlHandler
 from emergency_agents.intent.handlers.device_status import DeviceStatusQueryHandler
+from emergency_agents.intent.handlers.system_data_query import SystemDataQueryHandler
 from emergency_agents.intent.handlers.disaster_overview import DisasterOverviewHandler
 from emergency_agents.intent.handlers.rescue_task_generation import (
     RescueSimulationHandler,
@@ -392,7 +393,11 @@ async def process_intent_core(
     history_payload = build_history(history_records)
 
     memory_hits: List[Dict[str, Any]] = []
-    if enable_mem0:
+    # 性能优化：对于设备状态查询类意图，跳过mem0搜索以减少延迟
+    # 设备查询是无状态的，不需要历史记忆
+    skip_mem0_for_device = "设备" in cleaned_message or "device" in cleaned_message.lower()
+
+    if enable_mem0 and not skip_mem0_for_device:
         try:
             t0 = time.perf_counter()
             memory_hits = mem.search(
@@ -404,6 +409,12 @@ async def process_intent_core(
             duration = max(time.perf_counter() - t0, 0.0)
             mem0_metrics.inc_search_success()
             mem0_metrics.observe_search_duration(duration)
+            logger.info(
+                "mem0_search_completed",
+                thread_id=thread_id,
+                duration_ms=int(duration * 1000),
+                hits_count=len(memory_hits),
+            )
         except Exception as exc:  # noqa: BLE001
             reason = exc.__class__.__name__
             mem0_metrics.inc_search_failure(reason)
@@ -456,13 +467,60 @@ async def process_intent_core(
         checkpointer_type=type(getattr(orchestrator_graph, "checkpointer", None)).__name__,
     )
 
-    graph_state: IntentOrchestratorState = await orchestrator_graph.ainvoke(
-        initial_state,
-        config={
-            "configurable": {"thread_id": thread_id},
-            "durability": "async",  # 中流程（意图编排），异步保存checkpoint平衡性能
-        },
+    # 添加精确的计时日志
+    start_time = time.perf_counter()
+    logger.warning(
+        "langgraph_ainvoke_starting",
+        thread_id=thread_id,
+        initial_state_keys=list(initial_state.keys()),
+        start_time=start_time,
     )
+
+    # 性能优化：根据消息内容判断是否需要checkpoint
+    # 只有复杂的救援和侦察任务需要checkpoint，简单查询不需要
+    needs_checkpoint = (
+        "救援" in cleaned_message or "rescue" in cleaned_message.lower() or
+        "侦察" in cleaned_message or "scout" in cleaned_message.lower() or
+        "任务" in cleaned_message or "task" in cleaned_message.lower()
+    )
+
+    try:
+        if needs_checkpoint:
+            # 复杂任务：使用完整的checkpoint进行状态持久化
+            logger.info(
+                "langgraph_with_checkpoint",
+                thread_id=thread_id,
+                reason="complex_task",
+            )
+            graph_state: IntentOrchestratorState = await orchestrator_graph.ainvoke(
+                initial_state,
+                config={"configurable": {"thread_id": thread_id}},
+                # 异步checkpoint，减少阻塞
+                durability="async",
+            )
+        else:
+            # 简单查询：使用exit模式，只在最后保存，跳过中间checkpoint
+            logger.info(
+                "langgraph_minimal_checkpoint",
+                thread_id=thread_id,
+                reason="simple_query",
+            )
+            # 必须提供thread_id（checkpointer要求），但使用exit模式最小化开销
+            graph_state: IntentOrchestratorState = await orchestrator_graph.ainvoke(
+                initial_state,
+                config={"configurable": {"thread_id": thread_id}},
+                # exit模式：只在图执行结束时保存一次，跳过所有中间checkpoint
+                durability="exit",
+            )
+    finally:
+        end_time = time.perf_counter()
+        elapsed_ms = int((end_time - start_time) * 1000)
+        logger.warning(
+            "langgraph_ainvoke_completed",
+            thread_id=thread_id,
+            elapsed_ms=elapsed_ms,
+            elapsed_seconds=f"{end_time - start_time:.2f}",
+        )
 
     intent = graph_state.get("intent") or {}
     validation_status = graph_state.get("validation_status", "valid")
@@ -762,8 +820,33 @@ async def process_intent_core(
         graph_name = "TaskProgressQuery"
     elif isinstance(handler, DeviceStatusQueryHandler):
         graph_name = "DeviceStatusQuery"
+    elif isinstance(handler, SystemDataQueryHandler):
+        graph_name = "SystemDataQuery"
     elif isinstance(handler, DisasterOverviewHandler):
         graph_name = "DisasterOverview"
+
+    raw_text_for_handler = str(graph_state.get("raw_text") or cleaned_message)
+    # 将LangGraph传回的消息转换成字典列表，保证各Handler拿到稳定结构
+    messages_from_graph = graph_state.get("messages")
+    normalized_messages: list[dict[str, str]] = []
+    if isinstance(messages_from_graph, list):
+        normalized_messages = [
+            {
+                "role": str(item.get("role", "user")),
+                "content": str(item.get("content", "")),
+            }
+            for item in messages_from_graph
+            if isinstance(item, dict)
+        ]
+    else:
+        normalized_messages = [
+            {
+                "role": str(item.get("role", "user")),
+                "content": str(item.get("content", "")),
+            }
+            for item in messages_for_graph
+            if isinstance(item, dict)
+        ]
 
     logger.info(
         "intent_dispatch_ready",
@@ -774,6 +857,8 @@ async def process_intent_core(
         thread_id=thread_id,
         user_id=user_id,
         channel=channel,
+        raw_text_length=len(raw_text_for_handler),  # 记录传递给Handler的文本长度，方便排查空prompt
+        message_count=len(normalized_messages),  # 记录上下文数量，确保消息链路完整
     )
 
     handler_state: Dict[str, Any] = {
@@ -783,6 +868,8 @@ async def process_intent_core(
         "conversation_context": conversation_context,
         "memory_hits": memory_hits,
         "metadata": metadata_dict,
+        "raw_text": raw_text_for_handler,  # 让Handler拿到最新用户输入
+        "messages": normalized_messages,  # 让Handler复用最近会话上下文
     }
 
     handler_result = await handler.handle(slots_instance or slots_payload, handler_state)
@@ -813,24 +900,33 @@ async def process_intent_core(
     saved_assistant = await _persist_assistant_message(response_text, intent.get("intent_type"))
     history_records.append(saved_assistant)
 
-    try:
-        intent_type_raw = intent.get("intent_type")
-        intent_type_encoded = _encode_intent_for_mem0(intent_type_raw)
-        mem.add(
-            content=f"意图: {intent_type_raw}, 槽位: {json.dumps(slots_payload, ensure_ascii=False)}",
-            user_id=user_id,
-            run_id=thread_id,
-            metadata={
-                "incident_id": incident_id,
-                "intent_type": intent_type_encoded,
-                "intent_type_raw": intent_type_raw,
-            },
+    # 性能优化：对于设备查询类意图，跳过记忆添加
+    intent_type_raw = intent.get("intent_type")
+    skip_mem_for_device = intent_type_raw in {"device-status-query", "device_status_query", "system-data-query"}
+
+    if not skip_mem_for_device:
+        try:
+            intent_type_encoded = _encode_intent_for_mem0(intent_type_raw)
+            mem.add(
+                content=f"意图: {intent_type_raw}, 槽位: {json.dumps(slots_payload, ensure_ascii=False)}",
+                user_id=user_id,
+                run_id=thread_id,
+                metadata={
+                    "incident_id": incident_id,
+                    "intent_type": intent_type_encoded,
+                    "intent_type_raw": intent_type_raw,
+                },
+            )
+            mem0_metrics.inc_add_success()
+        except Exception as exc:  # noqa: BLE001
+            mem0_metrics.inc_add_failure(exc.__class__.__name__)
+            raise
+    else:
+        logger.info(
+            "mem0_add_skipped_for_device_query",
+            thread_id=thread_id,
+            intent_type=intent_type_raw,
         )
-        mem0_metrics.inc_add_success()
-    except Exception as exc:  # noqa: BLE001
-        reason = exc.__class__.__name__
-        mem0_metrics.inc_add_failure(reason)
-        raise
 
     # 会话记忆写回（事件与任务，谨慎且安全）
     try:

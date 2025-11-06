@@ -227,6 +227,10 @@ def validate_and_prompt_node(state: Dict[str, Any], llm_client, llm_model: str) 
         if normalized in {"video_analyze", "videoanalyze", "video-analysis", "video_analysis"}:
             intent_type = "video-analysis"
             intent = intent | {"intent_type": intent_type}
+        # 兼容 system_data_query / system-data-query
+        elif normalized in {"system_data_query", "systemdataquery", "system-data-query"}:
+            intent_type = "system-data-query"
+            intent = intent | {"intent_type": intent_type}
     slots = intent.get("slots") or {}
 
     from emergency_agents.intent.schemas import INTENT_SCHEMAS

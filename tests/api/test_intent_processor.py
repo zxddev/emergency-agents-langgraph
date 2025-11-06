@@ -9,7 +9,9 @@ from emergency_agents.api._prompt_utils import resolve_missing_prompt
 from emergency_agents.api.intent_processor import (
     Mem0Metrics,
     _handle_robotdog_control,
+    process_intent_core,
 )
+from emergency_agents.intent.schemas import GeneralChatSlots
 from emergency_agents.control.models import DeviceCommand
 from emergency_agents.memory.conversation_manager import MessageRecord
 
@@ -172,3 +174,131 @@ async def test_handle_robotdog_control_unavailable() -> None:
 
     assert result.status == "error"
     assert "语音控制子图未启用" in result.result["response_text"]
+
+
+@pytest.mark.asyncio
+async def test_process_intent_core_passes_raw_text_and_messages() -> None:
+    class _FakeConversationManager:
+        def __init__(self) -> None:
+            self._messages: List[MessageRecord] = []
+            self._conversation_id = 1
+
+        async def save_message(
+            self,
+            *,
+            user_id: str,
+            thread_id: str,
+            role: str,
+            content: str,
+            intent_type: Optional[str],
+            metadata: Optional[Dict[str, Any]] = None,
+            conversation_metadata: Optional[Dict[str, Any]] = None,
+        ) -> MessageRecord:
+            record = MessageRecord(
+                id=len(self._messages) + 1,
+                conversation_id=self._conversation_id,
+                role=role,
+                content=content,
+                intent_type=intent_type,
+                event_time=datetime.utcnow(),
+                metadata=dict(metadata or {}),
+            )
+            self._messages.append(record)
+            return record
+
+        async def get_history(self, thread_id: str, limit: int = 20) -> List[MessageRecord]:
+            return list(self._messages[-limit:])
+
+    class _FakeMem:
+        def __init__(self) -> None:
+            self.added: List[str] = []
+
+        def search(self, **_: Any) -> List[Dict[str, Any]]:
+            return []
+
+        def add(
+            self,
+            *,
+            content: str,
+            user_id: str,
+            run_id: Optional[str],
+            metadata: Optional[Dict[str, Any]] = None,
+            **__: Any,
+        ) -> bool:
+            self.added.append(content)
+            return True
+
+    class _FakeGraph:
+        async def ainvoke(self, initial_state: Dict[str, Any], **_: Any) -> Dict[str, Any]:
+            return {
+                **initial_state,
+                "intent": {"intent_type": "general-chat", "slots": {}},
+                "router_next": "general-chat",
+            }
+
+    class _FakeHandler:
+        def __init__(self) -> None:
+            self.received_state: Dict[str, Any] | None = None
+            self.received_slots: GeneralChatSlots | Dict[str, Any] | None = None
+
+        async def handle(self, slots: GeneralChatSlots, state: Dict[str, object]) -> Dict[str, object]:
+            self.received_state = dict(state)
+            self.received_slots = slots
+            return {
+                "response_text": "已收到",
+                "intent_type": "general-chat",
+                "confidence": 1.0,
+            }
+
+    class _FakeRegistry:
+        def __init__(self, mapping: Dict[str, Any]) -> None:
+            self._mapping = mapping
+
+        def get(self, key: str) -> Any | None:
+            return self._mapping.get(key)
+
+    manager = _FakeConversationManager()
+    mem = _FakeMem()
+    handler = _FakeHandler()
+    registry = _FakeRegistry({"general-chat": handler})
+
+    metrics = Mem0Metrics(
+        inc_search_success=lambda: None,
+        inc_search_failure=lambda reason: None,
+        observe_search_duration=lambda duration: None,
+        inc_add_success=lambda: None,
+        inc_add_failure=lambda reason: None,
+    )
+
+    async def _build_history(records: List[MessageRecord]) -> List[Dict[str, Any]]:
+        return [
+            {"role": record.role, "content": record.content}
+            for record in records
+        ]
+
+    result = await process_intent_core(
+        user_id="user-1",
+        thread_id="thread-raw-text",
+        message="你是什么大模型",
+        metadata={},
+        manager=manager,  # type: ignore[arg-type]
+        registry=registry,
+        orchestrator_graph=_FakeGraph(),
+        voice_control_graph=None,
+        dialogue_graph=None,
+        mem=mem,  # type: ignore[arg-type]
+        build_history=_build_history,
+        mem0_metrics=metrics,
+        channel="voice",
+        context_service=None,
+        enable_mem0=False,
+    )
+
+    assert result.status == "success"
+    assert isinstance(handler.received_slots, GeneralChatSlots)
+    assert handler.received_state is not None
+    assert handler.received_state.get("raw_text") == "你是什么大模型"
+    assert handler.received_state.get("messages")
+    last_message = handler.received_state["messages"][-1]
+    assert isinstance(last_message, dict)
+    assert last_message.get("content") == "你是什么大模型"

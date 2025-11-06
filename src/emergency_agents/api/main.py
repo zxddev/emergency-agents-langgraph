@@ -70,6 +70,7 @@ from emergency_agents.intent.prompt_missing import prompt_missing_slots_node
 from emergency_agents.intent.registry import IntentHandlerRegistry
 from emergency_agents.context.service import ContextService
 from emergency_agents.intent.validator import validate_and_prompt_node, set_default_robotdog_id
+from emergency_agents.intent.router import configure_scout_adapter
 from emergency_agents.api.intent_processor import (
     IntentProcessResult,
     Mem0Metrics,
@@ -546,6 +547,15 @@ async def startup_event():
     )
     _intent_registry.attach_rescue_draft_service(_rescue_draft_service)
     logger.info("api_intent_registry_initialized")
+
+    # 配置侦察适配器依赖注入（用于router.py中的设备查询和LLM选择）
+    configure_scout_adapter(
+        pool=_pg_pool,
+        orchestrator=_orchestrator_client,
+        llm_client=_llm_client_rescue,
+        llm_model=_cfg.llm_model,
+    )
+    logger.info("api_scout_adapter_configured")
 
     _graph_app = await build_app(_cfg.checkpoint_sqlite_path, _cfg.postgres_dsn)
     _register_graph_close(_graph_app)

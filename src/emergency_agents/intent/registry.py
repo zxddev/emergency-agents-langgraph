@@ -7,7 +7,7 @@ from typing import Any, Dict, Mapping
 from psycopg.rows import DictRow
 from psycopg_pool import AsyncConnectionPool
 
-from emergency_agents.db.dao import DeviceDAO, TaskDAO
+from emergency_agents.db.dao import DeviceDAO, TaskDAO, EventDAO, PoiDAO, RescuerDAO
 from emergency_agents.external.adapter_client import AdapterHubClient
 from emergency_agents.external.amap_client import AmapClient
 from emergency_agents.external.device_directory import DeviceDirectory
@@ -21,8 +21,10 @@ from emergency_agents.intent.handlers import (
     SimpleScoutDispatchHandler,
     TaskProgressQueryHandler,
     VideoAnalysisHandler,
+    GeneralChatHandler,
 )
 from emergency_agents.intent.handlers.device_status import DeviceStatusQueryHandler
+from emergency_agents.intent.handlers.system_data_query import SystemDataQueryHandler
 from emergency_agents.intent.handlers.disaster_overview import DisasterOverviewHandler
 from emergency_agents.risk.service import RiskCacheManager
 from emergency_agents.rag.pipe import RagPipeline
@@ -68,6 +70,9 @@ class IntentHandlerRegistry:
             raise RuntimeError("POSTGRES_DSN 未配置，无法初始化意图处理器注册表。")
         task_dao = TaskDAO.create(pool)
         device_dao = DeviceDAO.create(pool)
+        event_dao = EventDAO.create(pool)
+        poi_dao = PoiDAO.create(pool)
+        rescuer_dao = RescuerDAO.create(pool)
         merged_streams: Dict[str, object] = dict(DEFAULT_VIDEO_STREAMS)
         merged_streams.update(dict(video_stream_map))
         stream_catalog = VideoStreamCatalog.from_raw_mapping(merged_streams)
@@ -104,7 +109,15 @@ class IntentHandlerRegistry:
         robotdog_control = RobotDogControlHandler(adapter_client, default_robotdog_id)
 
         device_status_handler = DeviceStatusQueryHandler(device_dao)
+        system_data_query_handler = SystemDataQueryHandler(
+            device_dao=device_dao,
+            task_dao=task_dao,
+            event_dao=event_dao,
+            poi_dao=poi_dao,
+            rescuer_dao=rescuer_dao
+        )
         disaster_overview_handler = DisasterOverviewHandler()
+        general_chat_handler = GeneralChatHandler(llm_client, llm_model)
 
         if simple_rescue_graph is not None:
             rescue_generation.attach_simple_graph(simple_rescue_graph)
@@ -126,8 +139,10 @@ class IntentHandlerRegistry:
             "scout_task_generate": simple_scout_handler,
             "device-status-query": device_status_handler,
             "device_status_query": device_status_handler,
+            "system-data-query": system_data_query_handler,  # 统一数据查询
             "disaster-analysis": disaster_overview_handler,
             "situation-overview": disaster_overview_handler,
+            "general-chat": general_chat_handler,  # 通用对话
         }
         return cls(handlers=handlers)
 

@@ -37,3 +37,9 @@ mihomo-linux-amd64
 .DS_Store
 Thumbs.db
 *.tar.gz
+
+# Claude Code
+CLAUDE.md
+.claude/
+claude_history/
+.claude_cache/

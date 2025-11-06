@@ -196,6 +196,15 @@ class ConversationControlSlots(BaseSlots):
 
 
 @dataclass
+class GeneralChatSlots(BaseSlots):
+    """通用对话槽位。
+
+    用于处理闲聊、问候、测试等非业务对话场景。
+    """
+    pass  # 对话不需要特定槽位
+
+
+@dataclass
 class TaskProgressQuerySlots(BaseSlots):
     """任务进度查询槽位。"""
     task_id: Optional[str] = None
@@ -254,6 +263,41 @@ class VideoAnalysisSlots(BaseSlots):
     analysis_goal: str
     analysis_params: Optional[Dict[str, Any]] = None
 
+@dataclass
+class SystemDataQuerySlots(BaseSlots):
+    """系统数据查询槽位（统一查询接口）
+    
+    支持查询各种系统内部数据：
+    - 设备状态（carried_devices, device_by_name）
+    - 任务进度（task_progress, task_by_code）
+    - 事件位置（event_location, team_location）
+    - POI信息（poi_location）
+    
+    Attributes:
+        query_type: 查询类型（必填），决定调用哪个DAO方法
+        query_params: 查询参数（可选），根据query_type决定具体内容
+        
+    Example:
+        # 查询所有携带设备
+        slots = SystemDataQuerySlots(
+            query_type="carried_devices"
+        )
+        
+        # 查询指定设备
+        slots = SystemDataQuerySlots(
+            query_type="device_by_name",
+            query_params={"device_name": "无人机A"}
+        )
+        
+        # 查询任务进度
+        slots = SystemDataQuerySlots(
+            query_type="task_progress",
+            query_params={"task_id": "TASK-001"}
+        )
+    """
+    query_type: str  # 查询类型（carried_devices/device_by_name/task_progress等）
+    query_params: Optional[Dict[str, Any]] = None  # 查询参数
+
 
 # ===== UI 控制最小槽位 =====
 
@@ -311,6 +355,7 @@ def _dataclass_to_jsonschema(dc_class) -> Dict[str, Any]:
         field_type = f.type
         field_type_str = str(field_type)
         
+        # 处理特定的Dict字段
         if "Dict" in field_type_str and f.name == "coordinates":
             schema["properties"][f.name] = {
                 "type": "object",
@@ -320,6 +365,12 @@ def _dataclass_to_jsonschema(dc_class) -> Dict[str, Any]:
                 },
                 "required": ["lat", "lng"],
                 "additionalProperties": False,
+            }
+        # 处理通用的Dict[str, Any]字段（如query_params）
+        elif "Dict[str, typing.Any]" in field_type_str or "Dict[str, Any]" in field_type_str:
+            schema["properties"][f.name] = {
+                "type": "object",
+                "additionalProperties": True  # 允许任意属性
             }
         elif "List[List[float]]" in field_type_str:
             schema["properties"][f.name] = {"type": "array", "items": {"type": "array", "items": {"type": "number"}}}
@@ -334,10 +385,12 @@ def _dataclass_to_jsonschema(dc_class) -> Dict[str, Any]:
         elif "str" in field_type_str:
             schema["properties"][f.name] = {"type": "string"}
         else:
-            schema["properties"][f.name] = {}
+            # 对于其他未知类型，设置为object
+            schema["properties"][f.name] = {"type": "object"}
         
         from dataclasses import MISSING
-        if f.default is MISSING and f.default_factory is MISSING:
+        # 只有非Optional字段才是required
+        if f.default is MISSING and f.default_factory is MISSING and "Optional" not in field_type_str:
             schema["required"].append(f.name)
     
     return schema
@@ -371,6 +424,10 @@ INTENT_SCHEMAS: Dict[str, Dict[str, Any]] = {
     # UI 控制
     "ui_camera_flyto": _dataclass_to_jsonschema(UICameraFlytoSlots),
     "ui_toggle_layer": _dataclass_to_jsonschema(UIToggleLayerSlots),
+    # 统一数据查询
+    "system-data-query": _dataclass_to_jsonschema(SystemDataQuerySlots),
+    # 通用对话
+    "general-chat": _dataclass_to_jsonschema(GeneralChatSlots),
 }
 
 
@@ -410,4 +467,8 @@ INTENT_SLOT_TYPES: Dict[str, type[BaseSlots]] = {
     # UI 控制
     "ui_camera_flyto": UICameraFlytoSlots,
     "ui_toggle_layer": UIToggleLayerSlots,
+    # 统一数据查询
+    "system-data-query": SystemDataQuerySlots,
+    # 通用对话
+    "general-chat": GeneralChatSlots,
 }

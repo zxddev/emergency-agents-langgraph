@@ -70,18 +70,28 @@ class VoiceChatHandler:
         self.sessions: dict[str, VoiceChatSession] = {}
         self.health_checker = HealthChecker(check_interval=30)
         self.asr_service = asr_service or ASRService()
-        self.tts_client = tts_client or TTSClient(
-            tts_url=self._config.tts_api_url,
-            voice=self._config.tts_voice,
-        )
+        # 语音播报暂时下线，直接标记禁用，避免对外部TTS服务发起请求
+        self._tts_enabled: bool = False
+        if self._tts_enabled:
+            # 当重新开启TTS时按配置初始化客户端
+            self.tts_client = tts_client or TTSClient(
+                tts_url=self._config.tts_api_url,
+                voice=self._config.tts_voice,
+            )
+        else:
+            # 禁用阶段保持None，防止误用
+            self.tts_client = None
         self.intent_handler = intent_handler or IntentHandler(self._config)
         self.vad_detector = VADDetector()
         self.health_checker.register_service("voice_asr", self._check_asr_health)
-        self.health_checker.register_service("voice_tts", self.tts_client.health_check)
+        if self.tts_client is not None:
+            # 仅当TTS启用时纳入健康检查
+            self.health_checker.register_service("voice_tts", self.tts_client.health_check)
 
         logger.info(
             "voice_chat_handler_initialized",
             vad_enabled=True,
+            tts_enabled=self._tts_enabled,
         )
 
         # 统一意图管线依赖（启动后由 main.py 注入）
@@ -130,7 +140,9 @@ class VoiceChatHandler:
 
     async def stop_background_tasks(self) -> None:
         await self.asr_service.stop_health_check()
-        await self.tts_client.close()
+        if self.tts_client is not None:
+            # 仅在启用TTS时关闭客户端连接，避免对None调用
+            await self.tts_client.close()
         await self.health_checker.stop()
         logger.info("voice_chat_background_tasks_stopped")
 
@@ -399,13 +411,15 @@ class VoiceChatHandler:
             logger.warning("intent_pipeline_not_ready_fallback")
             intent_type, response_text = await self.intent_handler.understand_and_respond(user_text)
             await session.send_json({"type": "llm", "text": response_text, "intent": intent_type})
-            try:
-                tts_audio = await self.tts_client.synthesize(response_text)
-                if tts_audio:
-                    audio_base64 = base64.b64encode(tts_audio).decode()
-                    await session.send_json({"type": "tts", "audio": audio_base64, "format": "pcm"})
-            except Exception as tts_err:
-                logger.error("tts_call_failed", error=str(tts_err))
+            if self.tts_client is not None:
+                # 保留未来恢复TTS时的播报逻辑
+                try:
+                    tts_audio = await self.tts_client.synthesize(response_text)
+                    if tts_audio:
+                        audio_base64 = base64.b64encode(tts_audio).decode()
+                        await session.send_json({"type": "tts", "audio": audio_base64, "format": "pcm"})
+                except Exception as tts_err:
+                    logger.error("tts_call_failed", error=str(tts_err))
             return
 
         user_id = session.user_id or "voice_user"
@@ -444,13 +458,15 @@ class VoiceChatHandler:
             await session.send_json({"type": "llm", "text": response_text, "intent": intent_type})
 
             # TTS 合成（失败不影响连接）
-            try:
-                tts_audio = await self.tts_client.synthesize(response_text)
-                if tts_audio:
-                    audio_base64 = base64.b64encode(tts_audio).decode()
-                    await session.send_json({"type": "tts", "audio": audio_base64, "format": "pcm"})
-            except Exception as tts_err:
-                logger.error("tts_call_failed", error=str(tts_err))
+            if self.tts_client is not None:
+                # TTS 已关闭时直接跳过语音播报
+                try:
+                    tts_audio = await self.tts_client.synthesize(response_text)
+                    if tts_audio:
+                        audio_base64 = base64.b64encode(tts_audio).decode()
+                        await session.send_json({"type": "tts", "audio": audio_base64, "format": "pcm"})
+                except Exception as tts_err:
+                    logger.error("tts_call_failed", error=str(tts_err))
         except Exception as exc:
             # 记录详细技术错误到日志
             logger.error("intent_pipeline_failed", error=str(exc), session_id=session.session_id, exc_info=True)

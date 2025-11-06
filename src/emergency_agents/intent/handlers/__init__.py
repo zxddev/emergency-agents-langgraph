@@ -11,6 +11,7 @@ from .rescue_task_generation import (
 from .scout_task_simple import SimpleScoutDispatchHandler
 from .task_progress import TaskProgressQueryHandler
 from .video_analysis import VideoAnalysisHandler
+from .general_chat import GeneralChatHandler
 
 __all__ = [
     "IntentHandler",
@@ -23,4 +24,5 @@ __all__ = [
     "SimpleScoutDispatchHandler",
     "TaskProgressQueryHandler",
     "VideoAnalysisHandler",
+    "GeneralChatHandler",
 ]

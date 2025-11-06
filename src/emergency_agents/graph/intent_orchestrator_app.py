@@ -14,6 +14,7 @@ from langgraph.graph.message import add_messages
 from emergency_agents.config import AppConfig
 from emergency_agents.constants import RESCUE_DEMO_INCIDENT_ID
 from emergency_agents.graph.checkpoint_utils import create_async_postgres_checkpointer
+from emergency_agents.intent.router import scout_dispatch_node, route_from_router
 
 logger = structlog.get_logger(__name__)
 
@@ -73,6 +74,7 @@ async def build_intent_orchestrator_graph(
 
     def ingest(state: IntentOrchestratorState) -> Dict[str, Any]:
         """入口节点：补齐事件ID并记录审计。"""
+        start_time = time.perf_counter()
         incident_id = state.get("incident_id") or RESCUE_DEMO_INCIDENT_ID
         audit = _append_audit(
             state,
@@ -83,6 +85,12 @@ async def build_intent_orchestrator_graph(
                 "timestamp": time.time(),
             },
         )
+        elapsed_ms = int((time.perf_counter() - start_time) * 1000)
+        logger.debug(
+            "node_ingest_completed",
+            thread_id=state.get("thread_id"),
+            elapsed_ms=elapsed_ms,
+        )
         return {
             "incident_id": incident_id,
             "audit_log": audit,
@@ -90,8 +98,16 @@ async def build_intent_orchestrator_graph(
 
     def classify(state: IntentOrchestratorState) -> Dict[str, Any]:
         """调用提供的意图分类节点。"""
+        start_time = time.perf_counter()
         updated = classifier_node(state)
         intent = (updated.get("intent") or state.get("intent") or {}).copy()
+        elapsed_ms = int((time.perf_counter() - start_time) * 1000)
+        logger.debug(
+            "node_classify_completed",
+            thread_id=state.get("thread_id"),
+            elapsed_ms=elapsed_ms,
+            intent_type=intent.get("intent_type", "unknown"),
+        )
         audit = _append_audit(
             state,
             {
@@ -175,6 +191,10 @@ async def build_intent_orchestrator_graph(
             # 态势研判，占位实现
             "disaster-analysis": "disaster-analysis",
             "situation-overview": "disaster-analysis",
+            # 统一数据查询
+            "system-data-query": "system-data-query",
+            # 通用对话（新增）
+            "general-chat": "general-chat",
         }
         router_next = route_map.get(normalized, "unknown")
 
@@ -195,6 +215,16 @@ async def build_intent_orchestrator_graph(
                 thread_id=state.get("thread_id"),
                 incident_id=state.get("incident_id"),
                 slots=intent.get("slots", {}),
+            )
+
+        # 系统数据查询额外日志（用于监控查询类型）
+        if router_next == "system-data-query":
+            slots = intent.get("slots", {})
+            logger.info(
+                "system_data_query_routed",
+                thread_id=state.get("thread_id"),
+                query_type=slots.get("query_type"),
+                has_params=bool(slots.get("query_params")),
             )
 
         audit = _append_audit(
@@ -229,6 +259,7 @@ async def build_intent_orchestrator_graph(
     state_graph.add_node("prompt", prompt_missing)
     state_graph.add_node("failure", finalize_failure)
     state_graph.add_node("route", route)
+    state_graph.add_node("scout_dispatch", scout_dispatch_node)
 
     state_graph.set_entry_point("ingest")
     state_graph.add_edge("ingest", "classify")
@@ -244,15 +275,31 @@ async def build_intent_orchestrator_graph(
     )
     state_graph.add_edge("prompt", "validate")
     state_graph.add_edge("failure", "__end__")
-    state_graph.add_edge("route", "__end__")
+    # route节点根据router_next条件路由到不同节点
+    state_graph.add_conditional_edges(
+        "route",
+        route_from_router,
+        {
+            "scout_dispatch": "scout_dispatch",  # 侦察派遣流程
+            "analysis": "__end__",  # 默认结束
+            "done": "__end__",  # 完成
+            "report_intake": "__end__",  # 报告受理（TODO: 对接子图）
+            "annotation_lifecycle": "__end__",  # 标注生命周期（TODO: 对接子图）
+            "robotdog_control": "__end__",  # 机器狗控制（TODO: 对接子图）
+            "general-chat": "__end__",  # 通用对话（新增）
+        },
+    )
+    state_graph.add_edge("scout_dispatch", "__end__")
 
     if not cfg.postgres_dsn:
         raise RuntimeError("POSTGRES_DSN 未配置，无法构建意图编排子图。")
+    # 修复性能问题：大幅增加连接池大小以支持高并发checkpoint操作
+    # 之前 min_size=1, max_size=1 导致严重的连接瓶颈
     checkpointer, close_cb = await create_async_postgres_checkpointer(
         dsn=cfg.postgres_dsn,
         schema="intent_checkpoint",
-        min_size=1,
-        max_size=1,
+        min_size=20,  # 保持20个常驻连接，避免频繁创建连接的开销
+        max_size=100,  # 支持最多100个并发连接，应对高峰流量
     )
     logger.info("intent_graph_checkpointer_ready", schema="intent_checkpoint")
     compiled = state_graph.compile(checkpointer=checkpointer)

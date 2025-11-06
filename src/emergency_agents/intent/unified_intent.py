@@ -393,22 +393,26 @@ def unified_intent_node(
 意图识别规则：
 1. **只有明确的应急救援业务请求才匹配具体意图**（confidence ≥ 0.7）
    - 例如：灾情报告、设备控制、路线查询、任务生成等
-2. **以下情况必须返回 UNKNOWN**（intent_type="UNKNOWN"，validation_status="unknown"）：
+2. **以下情况必须返回 GENERAL_CHAT**（intent_type="GENERAL_CHAT"，validation_status="valid"，**slots必须为空对象{{}}**）：
    - 通用问候：你好、在吗、能听见我吗等
    - 闲聊：天气怎么样、吃了吗等
    - 测试语句：测试、试试看等
+   - 自我介绍询问：你是谁、你是什么模型、你能做什么等
+   - **重要**：GENERAL_CHAT意图不需要槽位，slots字段必须为空对象{{}}，不要提取任何槽位！
+3. **以下情况必须返回 UNKNOWN**（intent_type="UNKNOWN"，validation_status="unknown"）：
    - 模糊查询：看一下XX、了解一下XX（没有明确的查询对象）
-   - 超出应急救援范围的请求
-3. 槽位验证：根据意图类型的必填字段检查
+   - 超出应急救援范围的请求（非问候、非业务）
+4. 槽位验证：根据意图类型的必填字段检查
    - 所有必填字段都有值 → validation_status="valid"
    - 缺少必填字段 → validation_status="invalid"，列出missing_fields，生成友好的prompt询问缺失信息
    - **RESCUE_TASK_GENERATION**：必须提供 `mission_type`、`coordinates.lat`、`coordinates.lng`，并给出不少于15个汉字的 `situation_summary`。缺失任何一项均判定为 invalid 并提示补充。
    - **HAZARD_REPORT**：必须包含 `event_type` 与地点信息（`coordinates` 或 `location_text`）。如缺少坐标，应提示用户补充经纬度或精确地址。
-4. confidence范围：0.0-1.0，评估识别的确定性
-5. 若判定为救援任务相关意图（如 RESCUE_TASK_GENERATION），请在 slots 中补充 event_type 字段，取值必须来自合法事件类型列表；无法确定时返回 null 并设置 validation_status="invalid"，给出补充提示。
+5. confidence范围：0.0-1.0，评估识别的确定性
+6. 若判定为救援任务相关意图（如 RESCUE_TASK_GENERATION），请在 slots 中补充 event_type 字段，取值必须来自合法事件类型列表；无法确定时返回 null 并设置 validation_status="invalid"，给出补充提示。
 
 **示例**：
-- "能否听见我说话？" → UNKNOWN（通用测试）
+- "能否听见我说话？" → {{"intent_type":"GENERAL_CHAT", "slots":{{}}, "validation_status":"valid"}}（通用测试，对话场景）
+- "你是什么大模型？" → {{"intent_type":"GENERAL_CHAT", "slots":{{}}, "validation_status":"valid"}}（自我介绍询问，对话场景）
 - "帮我看一下汶川地震的情况" → UNKNOWN（模糊查询，没有明确查询对象）
 - "查询无人机XYZ的电量" → device_status_query（明确业务请求）
 - "有人被困在A楼5层" → trapped_report（明确业务报告）

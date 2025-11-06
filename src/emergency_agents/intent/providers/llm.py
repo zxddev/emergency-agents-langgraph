@@ -29,7 +29,7 @@ def _build_prompt(text: str) -> str:
         f"- {display}（内部标识: {canonical})"
         for canonical, display in sorted(INTENT_DISPLAY_MAP.items(), key=lambda item: item[1])
     )
-    schema_example = {
+    rescue_example = {
         "intent_type": "RESCUE_TASK_GENERATION",
         "slots": {
             "location_name": "XX县XX镇",
@@ -48,6 +48,53 @@ def _build_prompt(text: str) -> str:
             {"intent": "HAZARD_REPORT", "confidence": 0.10},
         ],
     }
+    scout_example = {
+        "intent_type": "SCOUT_TASK_SIMPLE",
+        "slots": {
+            "coordinates": {"lat": 31.6, "lng": 103.8},
+            "objective_summary": "侦察现场态势",
+            "priority": "high"
+        },
+        "meta": {
+            "confidence": 0.92,
+            "margin": 0.68,
+            "need_confirm": False,
+        },
+        "ranking": [
+            {"intent": "SCOUT_TASK_SIMPLE", "confidence": 0.92},
+            {"intent": "DEVICE_CONTROL", "confidence": 0.24},
+        ],
+    }
+    query_example = {
+        "intent_type": "SYSTEM_DATA_QUERY",
+        "slots": {
+            "query_type": "carried_devices",
+            "query_params": {}
+        },
+        "meta": {
+            "confidence": 0.95,
+            "margin": 0.85,
+            "need_confirm": False,
+        },
+        "ranking": [
+            {"intent": "SYSTEM_DATA_QUERY", "confidence": 0.95},
+            {"intent": "DEVICE_STATUS_QUERY", "confidence": 0.10},
+        ],
+    }
+    # 通用对话示例：问候、闲聊、自我介绍询问等场景
+    general_chat_example = {
+        "intent_type": "GENERAL_CHAT",
+        "slots": {},  # 通用对话不需要任何槽位
+        "meta": {
+            "confidence": 0.98,
+            "margin": 0.88,
+            "need_confirm": False,
+        },
+        "ranking": [
+            {"intent": "GENERAL_CHAT", "confidence": 0.98},
+            {"intent": "UNKNOWN", "confidence": 0.10},
+        ],
+    }
     prompt = (
         "你是应急救援指挥系统的意图识别专家，请分析指挥员输入并返回严格的JSON结果。\n\n"
         "输出要求：\n"
@@ -62,16 +109,39 @@ def _build_prompt(text: str) -> str:
         "   - `situation_summary`（不少于15个汉字的现场详细描述，用于后续态势分析）。\n"
         "   - `mission_type`（缺省写为 `rescue`，除非用户明确要求侦察）。\n"
         "   如果用户暂未给出坐标或细节，请保留为 null，让系统提示补充，不得凭空捏造。\n"
-        "5. `ranking` 填写前2-3个候选意图及置信度，按置信度降序排列。\n"
-        "6. 合法事件类型列表："
+        "5. 对于侦察任务（`SCOUT_TASK_SIMPLE` / `SCOUT_TASK_GENERATE`），`slots` **必须包含**：\n"
+        "   - `coordinates.lat` 和 `coordinates.lng`（浮点数，经纬度坐标，必须提取）；\n"
+        "   - `objective_summary`（侦察目标描述，如\"侦察现场态势\"、\"查看灾情\"等）。\n"
+        "   **坐标提取规则（严格执行）**：\n"
+        "   a) 标准格式：\"103.8, 31.6\" → {\"lng\": 103.8, \"lat\": 31.6}\n"
+        "   b) 括号格式：\"(103.8, 31.6)\" 或 \"(103.8,31.6)\" → {\"lng\": 103.8, \"lat\": 31.6}\n"
+        "   c) 东经北纬：\"东经103度48分，北纬31度36分\" → {\"lng\": 103.8, \"lat\": 31.6}（度分秒转十进制）\n"
+        "   d) 中文描述：\"去103点8逗号31点6\" → {\"lng\": 103.8, \"lat\": 31.6}\n"
+        "   e) 顺序判断：第一个数字是经度(lng)，第二个是纬度(lat)；中国区域：lng在100-110，lat在25-35\n"
+        "   f) 如果只有一个坐标数字对，默认按(lng, lat)顺序解析\n"
+        "   g) 如果用户未提供坐标，将coordinates设为null，不得编造\n"
+        "   h) 坐标必须是数字类型(float)，不要用字符串，例如103.8不要写成\"103.8\"\n"
+        "6. `ranking` 填写前2-3个候选意图及置信度，按置信度降序排列。\n"
+        "7. 合法事件类型列表："
         f"{ALLOWED_EVENT_TYPES}，slots中出现 event_type 时必须从此列表选择。\n"
-        "7. 以下场景必须返回 `intent_type=\"UNKNOWN\"`：问候、闲聊、测试语句、"
-        "模糊查询或非应急救援业务。\n\n"
+        "8. 以下场景必须返回 `intent_type=\"GENERAL_CHAT\"`（**slots必须为空对象{}**）：\n"
+        "   - 问候：你好、在吗、能听见我吗、早上好等\n"
+        "   - 闲聊：天气怎么样、吃了吗等\n"
+        "   - 测试语句：测试、试试看、能否听见等\n"
+        "   - 自我介绍询问：你是谁、你是什么模型、你能做什么等\n"
+        "   **重要**：GENERAL_CHAT意图不需要提取任何槽位，slots字段必须为空对象{}，不要提取任何信息到slots中。\n"
+        "9. 以下场景必须返回 `intent_type=\"UNKNOWN\"`：模糊查询或完全超出应急救援范围的请求。\n\n"
         "意图判定指引：\n"
         "- 语句中出现建筑/设施倒塌、人员被困、伤亡、请求支援、需要立即处置等表述，一律判定为 `RESCUE_TASK_GENERATION`，即便用户只是在汇报现象，也代表需要生成救援行动。\n"
         "- 仅在纯信息播报、无行动需求的情况下使用 `HAZARD_REPORT`。\n"
-        '- 当用户给出的描述过于笼统（只提到灾种或灾点，未说明人数、障碍、危险源等细节）时，将 `situation_summary` 置为 null，交由系统追问更具体细节；例如 "XX地震，建筑倒塌" 这类单句概述视为细节不足。\\n\\n'
-        f"示例结构：\n{json.dumps(schema_example, ensure_ascii=False, indent=2)}\n\n"
+        "- 语句中明确包含\"侦察\"、\"查看\"、\"监控\"、\"巡视\"等侦察相关动词时，判定为 `SCOUT_TASK_SIMPLE`。\n"
+        "- **重要**：\"查看所有携带设备\"、\"显示车载设备\"、\"查询设备列表\"等查询系统数据的请求，必须判定为 `SYSTEM_DATA_QUERY`，而不是 `DEVICE_CONTROL` 或 `DEVICE_STATUS_QUERY`。\n"
+        "  SYSTEM_DATA_QUERY的slots格式：{\"query_type\": \"carried_devices\", \"query_params\": {}}（查询所有携带设备时不需要参数）\n"
+        '- 当用户给出的描述过于笼统（只提到灾种或灾点，未说明人数、障碍、危险源等细节）时，将 `situation_summary` 置为 null，交由系统追问更具体细节；例如 "XX地震，建筑倒塌" 这类单句概述视为细节不足。\n\n'
+        f"救援任务示例：\n{json.dumps(rescue_example, ensure_ascii=False, indent=2)}\n\n"
+        f"侦察任务示例：\n{json.dumps(scout_example, ensure_ascii=False, indent=2)}\n\n"
+        f"系统查询示例（查看携带设备）：\n{json.dumps(query_example, ensure_ascii=False, indent=2)}\n\n"
+        f"通用对话示例（问候、闲聊、自我介绍）：\n{json.dumps(general_chat_example, ensure_ascii=False, indent=2)}\n\n"
         f"指挥员输入：{text}\n"
         "请只返回JSON，不要附加解释。"
     )

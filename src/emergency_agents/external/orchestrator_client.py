@@ -189,35 +189,38 @@ class RescueScenarioPayload:
 
 @dataclass(slots=True)
 class ScoutScenarioPayload:
-    """侦察场景推送请求（用于notify_backend_task通知前端）"""
+    """侦察场景推送请求（简化版-适配Java后端需求）
+
+    字段说明：
+    - event_id: 事件ID（固定值："fef8469f-5f78-4dd4-8825-dbc915d1b630"）
+    - device_id: 设备ID（从数据库查询）
+    - device_type: 设备类型（dog/ship/drone，已映射为小写）
+    - end_lon: 目标点经度
+    - end_lat: 目标点纬度
+    - title: 任务标题（LLM提取）
+    - content: 任务内容描述
+
+    注意：
+    - Java端会生成task_id，不需要Python传递
+    - Java端会查询command_post作为起点，Python只传终点
+    """
 
     event_id: str
-    task_id: str
-    location: RescueScenarioLocation
-    title: Optional[str] = None
-    content: Optional[str] = None
-    targets: Optional[List[Dict[str, Any]]] = None
-    sensors: Optional[List[str]] = None
-    route: Optional[List[Dict[str, Any]]] = None
-    estimated_duration_minutes: Optional[int] = None
+    device_id: str
+    device_type: str
+    end_lon: float
+    end_lat: float
+    title: str
+    content: str
 
     def to_dict(self) -> Dict[str, Any]:
-        """转换为 JSON 字典（camelCase），自动剔除空值"""
-        data: Dict[str, Any] = {
+        """转换为 JSON 字典（camelCase），用于HTTP请求"""
+        return {
             "eventId": self.event_id,
-            "taskId": self.task_id,
-            "location": self.location.to_dict(),
+            "deviceId": self.device_id,
+            "deviceType": self.device_type,
+            "endLon": self.end_lon,
+            "endLat": self.end_lat,
+            "title": self.title,
+            "content": self.content,
         }
-        if self.title:
-            data["title"] = self.title
-        if self.content:
-            data["content"] = self.content
-        if self.targets:
-            data["targets"] = self.targets
-        if self.sensors:
-            data["sensors"] = self.sensors
-        if self.route:
-            data["route"] = self.route
-        if self.estimated_duration_minutes is not None:
-            data["estimatedDurationMinutes"] = self.estimated_duration_minutes
-        return data

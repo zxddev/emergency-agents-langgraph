@@ -179,6 +179,77 @@ class LocationDAO:
         return record
 
 
+class EventDAO:
+    """事件数据访问封装，面向高层查询接口。"""
+
+    def __init__(self, pool: AsyncConnectionPool[Any]) -> None:
+        self._location = LocationDAO(pool)
+
+    @classmethod
+    def create(cls, pool: AsyncConnectionPool[Any]) -> Self:
+        if pool is None:
+            raise ValueError("pool 不能为空")
+        return cls(pool)
+
+    async def fetch_event_location(
+        self,
+        *,
+        event_id: str | None = None,
+        event_code: str | None = None,
+    ) -> EventLocation | None:
+        params: QueryParams = {}
+        if event_id:
+            params["event_id"] = event_id
+        if event_code:
+            params["event_code"] = event_code
+        return await self._location.fetch_event_location(params)
+
+
+class PoiDAO:
+    """POI 查询封装。"""
+
+    def __init__(self, pool: AsyncConnectionPool[Any]) -> None:
+        self._location = LocationDAO(pool)
+
+    @classmethod
+    def create(cls, pool: AsyncConnectionPool[Any]) -> Self:
+        if pool is None:
+            raise ValueError("pool 不能为空")
+        return cls(pool)
+
+    async def fetch_poi_location(self, *, poi_name: str) -> PoiLocation | None:
+        if not poi_name:
+            raise ValueError("poi_name 不能为空")
+        params: QueryParams = {"poi_name": poi_name}
+        return await self._location.fetch_poi_location(params)
+
+
+class RescuerDAO:
+    """救援队伍定位查询封装。"""
+
+    def __init__(self, pool: AsyncConnectionPool[Any]) -> None:
+        self._location = LocationDAO(pool)
+
+    @classmethod
+    def create(cls, pool: AsyncConnectionPool[Any]) -> Self:
+        if pool is None:
+            raise ValueError("pool 不能为空")
+        return cls(pool)
+
+    async def fetch_team_location(
+        self,
+        *,
+        team_id: str | None = None,
+        team_name: str | None = None,
+    ) -> EntityLocation | None:
+        params: QueryParams = {}
+        if team_id:
+            params["team_id"] = team_id
+        if team_name:
+            params["team_name"] = team_name
+        return await self._location.fetch_team_location(params)
+
+
 class DeviceDAO:
     """设备层查询。"""
 

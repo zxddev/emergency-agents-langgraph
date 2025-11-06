@@ -68,10 +68,10 @@ class VideoDevice:
 
 @dataclass(slots=True)
 class CarriedDevice:
-    """车载携带设备信息，包含设备名称和天气能力描述。"""
+    """车载携带设备信息，包含设备名称和能力描述。"""
 
     name: Optional[str]
-    weather_capability: Optional[str]
+    weather_capability: Optional[str]  # 实际上是设备的能力描述，字段名保持不变避免影响数据库
 
 
 @dataclass(slots=True)
