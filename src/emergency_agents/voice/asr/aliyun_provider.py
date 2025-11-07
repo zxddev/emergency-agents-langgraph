@@ -169,4 +169,3 @@ class AliyunASRProvider(ASRProvider):
         except Exception as e:
             logger.warning("aliyun_asr_unhealthy", error=str(e))
             return False
-

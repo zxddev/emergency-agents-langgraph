@@ -111,17 +111,15 @@ def _enforce_required_fields(intent_type: Optional[str], slots: Dict[str, Any]) 
 
     # 救援任务/模拟共用必填项，缺失时提示指挥员补充
     if canonical in {"rescue_task_generate", "rescue_task_generation", "rescue_simulation"}:
-        rescue_missing: List[str] = []  # 收集当前分支缺失字段
-        if not _has_non_empty_text(slots.get("mission_type")):
-            rescue_missing.append("mission_type")  # 任务类型缺失，后续流程无法匹配策略
+        rescue_missing: List[str] = []
         if not _has_coordinates(slots):
-            rescue_missing.append("coordinates")  # 缺少经纬度会导致现场定位失败
-        if not _has_detail_text(slots.get("situation_summary"), min_len=15):
-            rescue_missing.append("situation_summary")  # 场景描述过短无法驱动分析
-        if not _has_location(slots):
-            rescue_missing.append("location")  # 缺少地点标识无法做地理编码
+            rescue_missing.append("coordinates")
         if rescue_missing:
-            logger.info("intent_required_missing", intent=canonical, missing=rescue_missing)
+            logger.info(
+                "intent_required_missing",
+                intent=canonical,
+                missing=rescue_missing,
+            )
             missing.extend(rescue_missing)
 
     # 侦察任务需要明确目标与位置，缺少时提前追问
@@ -136,6 +134,11 @@ def _enforce_required_fields(intent_type: Optional[str], slots: Dict[str, Any]) 
         if scout_missing:
             logger.info("intent_required_missing", intent=canonical, missing=scout_missing)
             missing.extend(scout_missing)
+
+    if canonical == "scout_task_simple":
+        if not _has_coordinates(slots):
+            logger.info("intent_required_missing", intent=canonical, missing=["coordinates"])
+            missing.append("coordinates")
 
     if canonical == "hazard_report":
         if not _has_non_empty_text(slots.get("event_type")):

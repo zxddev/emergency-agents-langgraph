@@ -36,6 +36,7 @@ class IntentOrchestratorState(TypedDict):
     incident_id: NotRequired[str]
     metadata: NotRequired[Dict[str, Any]]
     messages: NotRequired[Annotated[list[Dict[str, Any]], add_messages]]
+    conversation_context: NotRequired[Dict[str, Any]]
 
     # 意图识别流程字段（可选）
     intent: NotRequired[Dict[str, Any]]

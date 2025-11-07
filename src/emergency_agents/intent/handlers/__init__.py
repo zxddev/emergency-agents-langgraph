@@ -8,6 +8,7 @@ from .rescue_task_generation import (
     RescueSimulationHandler,
     RescueTaskGenerationHandler,
 )
+from .rescue_team_dispatch import RescueTeamDispatchHandler
 from .scout_task_simple import SimpleScoutDispatchHandler
 from .task_progress import TaskProgressQueryHandler
 from .video_analysis import VideoAnalysisHandler
@@ -19,8 +20,9 @@ __all__ = [
     "RobotDogControlHandler",
     "DeviceStatusQueryHandler",
     "DisasterOverviewHandler",
-    "RescueTaskGenerationHandler",
     "RescueSimulationHandler",
+    "RescueTaskGenerationHandler",
+    "RescueTeamDispatchHandler",
     "SimpleScoutDispatchHandler",
     "TaskProgressQueryHandler",
     "VideoAnalysisHandler",

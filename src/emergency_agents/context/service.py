@@ -204,3 +204,35 @@ class ContextService:
             incident_id=incident_id,
             intent_type=intent_type,
         )
+
+    async def set_last_intent(
+        self,
+        *,
+        thread_id: str,
+        intent_type: Optional[str],
+    ) -> None:
+        """仅更新最近意图类型，保持其它上下文字段不变。"""
+
+        if not thread_id:
+            raise ValueError("thread_id 不能为空")
+        async with self.pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO operational.session_context (
+                        thread_id, last_intent_type
+                    ) VALUES (%(thread_id)s, %(intent_type)s)
+                    ON CONFLICT (thread_id) DO UPDATE
+                        SET last_intent_type = EXCLUDED.last_intent_type,
+                            updated_at = now()
+                    """,
+                    {
+                        "thread_id": thread_id,
+                        "intent_type": intent_type,
+                    },
+                )
+        logger.info(
+            "session_context_intent_saved",
+            thread_id=thread_id,
+            intent_type=intent_type,
+        )

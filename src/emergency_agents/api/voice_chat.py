@@ -23,6 +23,7 @@ from emergency_agents.memory.conversation_manager import ConversationManager, Me
 from emergency_agents.intent.registry import IntentHandlerRegistry
 from emergency_agents.memory.mem0_facade import MemoryFacade, DisabledMemoryFacade
 from emergency_agents.context.service import ContextService
+from emergency_agents.utils.branding import mask_model_aliases
 
 
 logger = structlog.get_logger(__name__)
@@ -410,11 +411,12 @@ class VoiceChatHandler:
         ):
             logger.warning("intent_pipeline_not_ready_fallback")
             intent_type, response_text = await self.intent_handler.understand_and_respond(user_text)
-            await session.send_json({"type": "llm", "text": response_text, "intent": intent_type})
+            sanitized_text = mask_model_aliases(response_text) or response_text
+            await session.send_json({"type": "llm", "text": sanitized_text, "intent": intent_type})
             if self.tts_client is not None:
                 # 保留未来恢复TTS时的播报逻辑
                 try:
-                    tts_audio = await self.tts_client.synthesize(response_text)
+                    tts_audio = await self.tts_client.synthesize(sanitized_text)
                     if tts_audio:
                         audio_base64 = base64.b64encode(tts_audio).decode()
                         await session.send_json({"type": "tts", "audio": audio_base64, "format": "pcm"})
@@ -454,6 +456,8 @@ class VoiceChatHandler:
                 )
             if not response_text:
                 response_text = "处理完成。"
+
+            response_text = mask_model_aliases(response_text) or "处理完成。"
 
             await session.send_json({"type": "llm", "text": response_text, "intent": intent_type})
 
@@ -499,7 +503,7 @@ class VoiceChatHandler:
                     user_text_preview=user_text[:50] if user_text else "",
                 )
 
-            await session.send_json({"type": "error", "message": error_message})
+            await session.send_json({"type": "error", "message": mask_model_aliases(error_message) or error_message})
 
 
 _voice_config = AppConfig.load_from_env()

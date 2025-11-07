@@ -20,12 +20,13 @@ from emergency_agents.intent.handlers.rescue_task_generation import (
     RescueSimulationHandler,
     RescueTaskGenerationHandler,
 )
+from emergency_agents.intent.handlers.rescue_team_dispatch import RescueTeamDispatchHandler
 from emergency_agents.intent.handlers.scout_task_simple import SimpleScoutDispatchHandler
 from emergency_agents.intent.handlers.task_progress import TaskProgressQueryHandler
 from emergency_agents.intent.handlers.video_analysis import VideoAnalysisHandler
 from emergency_agents.intent.schemas import INTENT_SLOT_TYPES, BaseSlots
 from emergency_agents.memory.conversation_manager import ConversationManager, MessageRecord
-from emergency_agents.context.service import ContextService
+from emergency_agents.context.service import ContextService, SessionContextRecord
 from emergency_agents.memory.mem0_facade import MemoryFacade, DisabledMemoryFacade
 from emergency_agents.ui.actions import serialize_actions
 
@@ -427,13 +428,37 @@ async def process_intent_core(
             channel=channel,
         )
 
+    session_ctx: SessionContextRecord | None = None
+    if context_service is not None:
+        try:
+            session_ctx = await context_service.get(thread_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("session_context_lookup_failed", error=str(exc))
+
     conversation_context = {"incident_id": incident_id} | _extract_context_from_memories(memory_hits)
+    if session_ctx and session_ctx.get("last_intent_type"):
+        conversation_context["last_intent_type"] = session_ctx.get("last_intent_type")
 
     messages_for_graph = [
         {"role": item.get("role", "user"), "content": item.get("content", "")}
         for item in history_payload
         if isinstance(item, dict)
     ]
+    pending_rescue = False
+    if session_ctx and session_ctx.get("last_intent_type") == "rescue-task-generate":
+        for entry in reversed(history_payload):
+            if isinstance(entry, dict) and entry.get("role") == "assistant":
+                content = str(entry.get("content") or "")
+                if any(keyword in content for keyword in ("救援任务", "情况概述", "任务坐标", "补充缺失")):
+                    pending_rescue = True
+                break
+    if pending_rescue:
+        messages_for_graph.append(
+            {
+                "role": "system",
+                "content": "系统提示：当前正在补充救援任务相关信息，请继续按照救援任务意图解析用户输入。",
+            }
+        )
     if memory_hits:
         summary_lines = []
         for record in memory_hits:
@@ -460,6 +485,7 @@ async def process_intent_core(
         "incident_id": incident_id,
         "messages": messages_for_graph,
         "memory_hits": memory_hits,
+        "conversation_context": conversation_context,
     }
 
     logger.warning(
@@ -551,8 +577,8 @@ async def process_intent_core(
             policy_task = os.getenv("AUTO_BINDING_POLICY_TASK", "strict").strip().lower()
             policy_incident = os.getenv("AUTO_BINDING_POLICY_INCIDENT", "strict").strip().lower()
 
-            ctx: SessionContextRecord | None = None
-            if context_service is not None:
+            ctx: SessionContextRecord | None = session_ctx
+            if ctx is None and context_service is not None:
                 try:
                     ctx = await context_service.get(thread_id)
                 except Exception as exc:  # noqa: BLE001
@@ -604,15 +630,16 @@ async def process_intent_core(
                     # recent device
                     recent_label: str | None = None
                     recent_value: str | None = None
-                    if context_service is not None:
+                    ctx2 = session_ctx
+                    if ctx2 is None and context_service is not None:
                         try:
                             ctx2 = await context_service.get(thread_id)
-                            if ctx2 and ctx2.get("last_device_name"):
-                                recent_label = str(ctx2["last_device_name"])  # type: ignore[index]
-                                last_id2 = ctx2.get("last_device_id")
-                                recent_value = str(last_id2) if isinstance(last_id2, str) else None
                         except Exception as exc:  # noqa: BLE001
                             logger.warning("session_context_lookup_failed", error=str(exc))
+                    if ctx2 and ctx2.get("last_device_name"):
+                        recent_label = str(ctx2["last_device_name"])  # type: ignore[index]
+                        last_id2 = ctx2.get("last_device_id")
+                        recent_value = str(last_id2) if isinstance(last_id2, str) else None
                     sql = (
                         "WITH candidates AS (\n"
                         "  SELECT d.id::text AS id, d.name AS name\n"
@@ -645,6 +672,17 @@ async def process_intent_core(
                     ui_actions_payload = [clarify]
             except Exception as exc:  # noqa: BLE001
                 logger.warning("build_clarify_ui_actions_failed", error=str(exc))
+
+            if context_service is not None:
+                try:
+                    intent_marker = intent.get("intent_type")
+                    intent_to_store = str(intent_marker).strip() if isinstance(intent_marker, str) else None
+                    await context_service.set_last_intent(
+                        thread_id=thread_id,
+                        intent_type=intent_to_store or None,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("session_context_intent_save_failed", error=str(exc))
 
             saved = await _persist_assistant_message(response_text, intent.get("intent_type"))
             history_records.append(saved)
@@ -807,6 +845,8 @@ async def process_intent_core(
     elif isinstance(handler, RescueTaskGenerationHandler):
         graph_name = "RescueTacticalGraph"
         graph_mode = "live"
+    elif isinstance(handler, RescueTeamDispatchHandler):
+        graph_name = "RescueTeamDispatch"
     elif isinstance(handler, SimpleScoutDispatchHandler):
         graph_name = "SimpleScoutDispatch"
     elif isinstance(handler, RobotDogControlHandler):

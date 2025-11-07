@@ -157,7 +157,7 @@ class VideoAnalyzeSlots(BaseSlots):
 @dataclass
 class RescueTaskGenerationSlots(BaseSlots):
     """救援任务生成槽位。"""
-    mission_type: str
+    mission_type: Optional[str] = None
     location_name: Optional[str] = None
     coordinates: Optional[Dict[str, float]] = None
     situation_summary: Optional[str] = None

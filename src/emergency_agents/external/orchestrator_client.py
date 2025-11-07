@@ -3,7 +3,7 @@ from __future__ import annotations
 import json  # 引入 json 便于调试时输出
 import os  # 读取环境变量
 from dataclasses import dataclass  # dataclass 提供强类型数据容器
-from typing import Any, Dict, List, Optional  # 类型提示
+from typing import Any, Dict, List, Mapping, Optional, Sequence  # 类型提示
 
 import httpx  # HTTP 客户端
 import structlog  # 结构化日志
@@ -80,6 +80,13 @@ class OrchestratorClient:
         body = payload.to_dict()
         response = self._post("/api/v1/rescue/scenario", body)
         logger.info("rescue_scenario_published", response=response)
+        return response
+
+    def publish_rescue_dispatch(self, payload: "RescueDispatchPayload") -> Dict[str, Any]:
+        """推送救援队伍派遣消息，用于生成路线与动画。"""
+        body = payload.to_dict()
+        response = self._post("/api/v1/rescue/dispatch", body)
+        logger.info("rescue_dispatch_published", response=response)
         return response
 
     def publish_scout_scenario(self, payload: "ScoutScenarioPayload") -> Dict[str, Any]:
@@ -223,4 +230,48 @@ class ScoutScenarioPayload:
             "endLat": self.end_lat,
             "title": self.title,
             "content": self.content,
+        }
+
+
+@dataclass(slots=True)
+class RescueDispatchPayload:
+    """救援队伍派遣请求体。"""
+
+    event_id: str
+    team_id: str
+    team_name: str
+    team_type: str
+    team_longitude: Optional[float]
+    team_latitude: Optional[float]
+    target_longitude: float
+    target_latitude: float
+    mission_type: str
+    disaster_type: Optional[str]
+    score: float
+    eta_minutes: Optional[int]
+    capability_level: Optional[int]
+    response_minutes: Optional[int]
+    equipment: Sequence[Mapping[str, Any]]
+    reasons: Sequence[str]
+
+    def to_dict(self) -> Dict[str, Any]:
+        """转换为 Java 所需的 camelCase JSON。"""
+
+        return {
+            "eventId": self.event_id,
+            "teamId": self.team_id,
+            "teamName": self.team_name,
+            "teamType": self.team_type,
+            "teamLongitude": self.team_longitude,
+            "teamLatitude": self.team_latitude,
+            "targetLongitude": self.target_longitude,
+            "targetLatitude": self.target_latitude,
+            "missionType": self.mission_type,
+            "disasterType": self.disaster_type,
+            "score": round(self.score, 4),
+            "etaMinutes": self.eta_minutes,
+            "capabilityLevel": self.capability_level,
+            "responseMinutes": self.response_minutes,
+            "equipment": list(self.equipment),
+            "reasons": list(self.reasons),
         }

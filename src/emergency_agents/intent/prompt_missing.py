@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Sequence
 
 from langgraph.types import interrupt
 
@@ -31,13 +31,17 @@ def prompt_missing_slots_node(state: Dict[str, Any], llm_client, llm_model: str)
     
     intent = state.get("intent") or {}
     slots = intent.get("slots") or {}
-    
+
+    previous_summary = slots.get("situation_summary")
+
     补充值 = _parse_user_补充(user_input, missing_fields, llm_client, llm_model)
-    
+
     slots.update(补充值)
-    
-    logger.info("用户补充槽位: %s", 补充值)
-    
+
+    _merge_situation_summary(slots, supplement=补充值, previous_summary=previous_summary)
+
+    logger.info("用户补充槽位", extra={"fields": list(补充值.keys()), "summary_length": len(str(slots.get("situation_summary") or ""))})
+
     return {"intent": intent | {"slots": slots}}
 
 
@@ -128,3 +132,81 @@ def _parse_user_补充(user_input: Any, missing_fields: list, llm_client, llm_mo
         logger.error("LLM解析用户补充失败: %s", e, exc_info=True)
     
     return {}
+
+
+def _merge_situation_summary(
+    slots: Dict[str, Any],
+    *,
+    supplement: Dict[str, Any],
+    previous_summary: Any,
+) -> None:
+    """整合多轮输入确保态势描述完整。
+
+    - 保留历史摘要与最新补充，去重后合并。
+    - 自动拼接任务类型、地点、坐标等结构化信息，增强描述密度。
+    """
+
+    fragments: List[str] = []
+    seen: set[str] = set()
+
+    def _append(candidate: Optional[str]) -> None:
+        if not isinstance(candidate, str):
+            return
+        text = candidate.strip()
+        if not text or text in seen:
+            return
+        seen.add(text)
+        fragments.append(text)
+
+    _append(str(previous_summary) if previous_summary is not None else None)
+    _append(str(supplement.get("situation_summary")) if supplement.get("situation_summary") is not None else None)
+
+    normalized_summary = slots.get("situation_summary")
+    if normalized_summary is not previous_summary:
+        _append(str(normalized_summary) if normalized_summary is not None else None)
+
+    mission_type = _first_text(slots, supplement, keys=("mission_type",))
+    if mission_type:
+        _append(f"任务类型：{mission_type}")
+
+    location_name = _first_text(slots, supplement, keys=("location_name", "location"))
+    if location_name:
+        _append(f"地点：{location_name}")
+
+    coordinates = _first_mapping(slots, supplement, keys=("coordinates",))
+    if coordinates:
+        lat = coordinates.get("lat") or coordinates.get("latitude")
+        lng = coordinates.get("lng") or coordinates.get("longitude") or coordinates.get("lon")
+        if isinstance(lat, (int, float)) and isinstance(lng, (int, float)):
+            _append(f"坐标：{lat:.6f}, {lng:.6f}")
+
+    if fragments:
+        slots["situation_summary"] = "；".join(fragments)
+
+
+def _first_text(
+    slots: Dict[str, Any],
+    supplement: Dict[str, Any],
+    *,
+    keys: Sequence[str],
+) -> Optional[str]:
+    for container in (supplement, slots):
+        for key in keys:
+            value = container.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+def _first_mapping(
+    slots: Dict[str, Any],
+    supplement: Dict[str, Any],
+    *,
+    keys: Sequence[str],
+) -> Optional[Dict[str, Any]]:
+    for container in (supplement, slots):
+        for key in keys:
+            value = container.get(key)
+            if isinstance(value, dict):
+                return value
+    return None

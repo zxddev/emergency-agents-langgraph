@@ -69,6 +69,7 @@ from emergency_agents.intent.classifier import intent_classifier_node
 from emergency_agents.intent.prompt_missing import prompt_missing_slots_node
 from emergency_agents.intent.registry import IntentHandlerRegistry
 from emergency_agents.context.service import ContextService
+from emergency_agents.utils.branding import mask_payload
 from emergency_agents.intent.validator import validate_and_prompt_node, set_default_robotdog_id
 from emergency_agents.intent.router import configure_scout_adapter
 from emergency_agents.api.intent_processor import (
@@ -1102,14 +1103,21 @@ async def intent_process(req: IntentProcessRequest):
             context_service=_context_service,
             enable_mem0=_cfg.enable_mem0,
         )
+        masked_intent = mask_payload(result.intent)
+        masked_result = mask_payload(result.result)
+        masked_history = mask_payload(result.history)
+        masked_memory_hits = mask_payload(result.memory_hits)
+        masked_audit_log = mask_payload(result.audit_log)
+        masked_ui_actions = mask_payload(result.ui_actions)
+
         return {
             "status": result.status,
-            "intent": result.intent,
-            "result": result.result,
-            "history": result.history,
-            "memory_hits": result.memory_hits,
-            "audit_log": result.audit_log,
-            "ui_actions": result.ui_actions,
+            "intent": masked_intent,
+            "result": masked_result,
+            "history": masked_history,
+            "memory_hits": masked_memory_hits,
+            "audit_log": masked_audit_log,
+            "ui_actions": masked_ui_actions,
         }
     except Exception as exc:
         # 记录详细错误信息到日志（包括堆栈跟踪）
@@ -1184,6 +1192,7 @@ async def conversation_history(req: ConversationHistoryRequest):
         raise HTTPException(status_code=403, detail="thread owner mismatch")
     records = await manager.get_history(req.thread_id, limit=req.limit)
     history_payload = _build_history(records)
+    history_payload = mask_payload(history_payload)
     return {
         "history": history_payload,
         "total": len(history_payload),

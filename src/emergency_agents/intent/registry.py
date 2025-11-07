@@ -18,6 +18,7 @@ from emergency_agents.intent.handlers import (
     RobotDogControlHandler,
     RescueSimulationHandler,
     RescueTaskGenerationHandler,
+    RescueTeamDispatchHandler,
     SimpleScoutDispatchHandler,
     TaskProgressQueryHandler,
     VideoAnalysisHandler,
@@ -77,28 +78,29 @@ class IntentHandlerRegistry:
         merged_streams.update(dict(video_stream_map))
         stream_catalog = VideoStreamCatalog.from_raw_mapping(merged_streams)
 
-        rescue_generation = RescueTaskGenerationHandler(
-            pool=pool,
-            kg_service=kg_service,
-            rag_pipeline=rag_pipeline,
-            amap_client=amap_client,
-            llm_client=llm_client,
-            llm_model=llm_model,
-            orchestrator_client=orchestrator_client,
-            rag_timeout=rag_timeout,
-            postgres_dsn=postgres_dsn,
-        )
-        rescue_simulation = RescueSimulationHandler(
-            pool=pool,
-            kg_service=kg_service,
-            rag_pipeline=rag_pipeline,
-            amap_client=amap_client,
-            llm_client=llm_client,
-            llm_model=llm_model,
-            orchestrator_client=orchestrator_client,
-            rag_timeout=rag_timeout,
-            postgres_dsn=postgres_dsn,
-        )
+        # LangGraph 救援方案流程暂时停用，保留构造逻辑以备后续恢复
+        # rescue_generation = RescueTaskGenerationHandler(
+        #     pool=pool,
+        #     kg_service=kg_service,
+        #     rag_pipeline=rag_pipeline,
+        #     amap_client=amap_client,
+        #     llm_client=llm_client,
+        #     llm_model=llm_model,
+        #     orchestrator_client=orchestrator_client,
+        #     rag_timeout=rag_timeout,
+        #     postgres_dsn=postgres_dsn,
+        # )
+        # rescue_simulation = RescueSimulationHandler(
+        #     pool=pool,
+        #     kg_service=kg_service,
+        #     rag_pipeline=rag_pipeline,
+        #     amap_client=amap_client,
+        #     llm_client=llm_client,
+        #     llm_model=llm_model,
+        #     orchestrator_client=orchestrator_client,
+        #     rag_timeout=rag_timeout,
+        #     postgres_dsn=postgres_dsn,
+        # )
         simple_scout_handler = SimpleScoutDispatchHandler(
             pool=pool,
             orchestrator_client=orchestrator_client,
@@ -119,8 +121,13 @@ class IntentHandlerRegistry:
         disaster_overview_handler = DisasterOverviewHandler()
         general_chat_handler = GeneralChatHandler(llm_client, llm_model)
 
-        if simple_rescue_graph is not None:
-            rescue_generation.attach_simple_graph(simple_rescue_graph)
+        # if simple_rescue_graph is not None:
+        #     rescue_generation.attach_simple_graph(simple_rescue_graph)
+
+        rescue_dispatch_handler = RescueTeamDispatchHandler(
+            pool=pool,
+            orchestrator_client=orchestrator_client,
+        )
 
         handlers: Dict[str, Any] = {
             "task-progress-query": TaskProgressQueryHandler(task_dao),
@@ -128,10 +135,8 @@ class IntentHandlerRegistry:
             "device-control-robotdog": robotdog_control,
             "device_control_robotdog": robotdog_control,
             "video-analysis": VideoAnalysisHandler(stream_catalog, vllm_url, vllm_api_key, vllm_model),
-            "rescue-task-generate": rescue_generation,
-            "rescue_task_generate": rescue_generation,
-            "rescue-simulation": rescue_simulation,
-            "rescue_simulation": rescue_simulation,
+            "rescue-task-generate": rescue_dispatch_handler,
+            "rescue_task_generate": rescue_dispatch_handler,
             "scout-task-simple": simple_scout_handler,
             "scout_task_simple": simple_scout_handler,
             # 兼容旧的完整侦察意图，暂时重定向到简化处理器
