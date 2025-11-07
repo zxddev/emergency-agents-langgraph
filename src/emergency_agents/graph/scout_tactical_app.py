@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Mapping, NotRequired, Optional, Required, Sequence, Tuple, TypedDict, Awaitable, Literal, Iterable
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, TypedDict, Awaitable, Literal, Iterable
+
+try:
+    from typing import NotRequired, Required
+except ImportError:
+    from typing_extensions import NotRequired, Required
 
 import structlog
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver

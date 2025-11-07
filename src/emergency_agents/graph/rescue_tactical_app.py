@@ -7,7 +7,12 @@ import asyncio
 import math
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Dict, List, Optional, Required, NotRequired, Tuple, TypedDict, Awaitable
+from typing import Any, Callable, Dict, List, Optional, Tuple, TypedDict, Awaitable
+
+try:
+    from typing import Required, NotRequired
+except ImportError:
+    from typing_extensions import Required, NotRequired
 
 import structlog
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
