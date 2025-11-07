@@ -302,7 +302,11 @@ class SystemDataQuerySlots(BaseSlots):
 # ===== UI 控制最小槽位 =====
 
 # ===== 通用澄清交互结构 =====
-from typing import TypedDict, NotRequired
+from typing import TypedDict
+try:
+    from typing import NotRequired
+except ImportError:
+    from typing_extensions import NotRequired
 
 
 class ClarifyOption(TypedDict):
