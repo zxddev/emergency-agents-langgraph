@@ -90,12 +90,16 @@ class SystemDataQueryNode:
             "carried_devices": self._query_carried_devices,
             "device_by_name": self._query_device_by_name,
             "device_by_id": self._query_device_by_id,
+            "vehicle_location": self._query_vehicle_location,
 
             # 任务查询
             "task_progress": self._query_task_progress,
             "task_by_code": self._query_task_by_code,
             "task_latest_log": self._query_task_latest_log,
             "task_route_plan": self._query_task_route_plan,
+            "task_count": self._query_task_count,
+            "task_status_by_name": self._query_task_status_by_name,
+            "task_assignees": self._query_task_assignees,
 
             # 位置查询
             "event_location": self._query_event_location,
@@ -267,6 +271,117 @@ class SystemDataQueryNode:
                 "device_type": device.device_type
             },
             "message": f"设备 {device.name}（编号 {device.id}）查询成功"
+        }
+
+    async def _query_vehicle_location(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """查询车辆位置（指挥/作战车辆）。"""
+        vehicle_id = str(params.get("vehicle_id") or "").strip()
+        vehicle_name = str(params.get("vehicle_name") or params.get("name") or "").strip()
+
+        location = await self.rescuer_dao.fetch_vehicle_location(
+            vehicle_id=vehicle_id or None,
+            vehicle_name=vehicle_name or None,
+        )
+
+        if location is None:
+            identifier = vehicle_name or vehicle_id or "车辆"
+            return {
+                "data": None,
+                "message": f"未找到 {identifier} 的位置信息"
+            }
+
+        return {
+            "data": {
+                "name": location.name,
+                "lng": location.lng,
+                "lat": location.lat
+            },
+            "message": f"{location.name} 位置: ({location.lat}, {location.lng})"
+        }
+
+    # ==================== 任务数量与状态 ====================
+
+    async def _query_task_count(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """统计当前任务数量（未删除）。"""
+        total = await self.task_dao.count_tasks()
+        return {
+            "data": {"total": total},
+            "message": f"当前共有 {total} 个任务"
+        }
+
+    async def _query_task_status_by_name(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """按任务名称/编号模糊匹配，并返回状态与参与设备数。"""
+        task_name = str(params.get("task_name") or params.get("name") or "").strip()
+        if not task_name:
+            return {
+                "data": None,
+                "message": "任务名称不能为空"
+            }
+
+        record = await self.task_dao.fetch_task_by_name(task_name)
+        if record is None:
+            return {
+                "data": None,
+                "message": f"未找到名称包含 {task_name} 的任务"
+            }
+
+        # 查询指派实体列表
+        assignees = await self.task_dao.fetch_task_assignees(record.id)
+        assignee_brief = ", ".join([a.name or a.entity_id for a in assignees][:5])
+
+        return {
+            "data": {
+                "id": record.id,
+                "code": record.code,
+                "description": record.description,
+                "status": record.status,
+                "progress": record.progress,
+                "device_count": record.device_count,
+                "assignees": [
+                    {"entity_id": a.entity_id, "entity_type": a.entity_type, "name": a.name}
+                    for a in assignees
+                ],
+            },
+            "message": (
+                f"任务 {record.code or record.id} 状态 {record.status}，"
+                f"进度 {record.progress or 0}% ，参与设备 {record.device_count} 台"
+                + (f"：{assignee_brief}" if assignee_brief else "")
+            ),
+        }
+
+    async def _query_task_assignees(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """查询任务指派实体列表，支持 task_id 或 task_name 模糊匹配。"""
+        task_id = str(params.get("task_id") or "").strip()
+        task_name = str(params.get("task_name") or params.get("name") or "").strip()
+
+        # 若未提供 task_id，用名称先查一次
+        if not task_id and task_name:
+            record = await self.task_dao.fetch_task_by_name(task_name)
+            task_id = record.id if record else ""
+        if not task_id:
+            record = await self.task_dao.fetch_latest_task_with_assignees()
+            task_id = record.id if record else ""
+            fallback_used = True
+        else:
+            fallback_used = False
+
+        assignees = await self.task_dao.fetch_task_assignees(task_id) if task_id else []
+        if not assignees:
+            return {
+                "data": [],
+                "message": "该任务当前没有指派设备/实体" if task_id else "未找到可用的指派设备/实体"
+            }
+
+        names = ", ".join([a.name or a.entity_id for a in assignees])
+        return {
+            "data": [
+                {"entity_id": a.entity_id, "entity_type": a.entity_type, "name": a.name}
+                for a in assignees
+            ],
+            "message": (
+                ("使用最近任务" if fallback_used else "任务指派列表")
+                + f"（{len(assignees)}）：{names}"
+            )
         }
 
     # ==================== 任务查询工具 ====================

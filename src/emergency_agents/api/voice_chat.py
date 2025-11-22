@@ -112,7 +112,7 @@ class VoiceChatHandler:
         *,
         manager: ConversationManager,
         registry: IntentHandlerRegistry,
-        orchestrator_graph: Any,
+        # orchestrator_graph: Any, # Removed
         voice_control_graph: Any,
         dialogue_graph: Any,
         mem: MemoryFacade | DisabledMemoryFacade,
@@ -124,7 +124,7 @@ class VoiceChatHandler:
         """注入统一意图处理依赖，用于语音路径走编排图与子图。"""
         self._conv_manager = manager
         self._intent_registry = registry
-        self._intent_graph = orchestrator_graph
+        # self._intent_graph = orchestrator_graph # Removed
         self._voice_control_graph = voice_control_graph
         self._dialogue_graph = dialogue_graph
         self._mem = mem
@@ -402,7 +402,7 @@ class VoiceChatHandler:
         if not (
             self._conv_manager
             and self._intent_registry
-            and self._intent_graph is not None
+            # and self._intent_graph is not None # Removed
             and self._voice_control_graph is not None
             and self._dialogue_graph is not None
             and self._mem
@@ -435,7 +435,7 @@ class VoiceChatHandler:
                 metadata={},
                 manager=self._conv_manager,
                 registry=self._intent_registry,
-                orchestrator_graph=self._intent_graph,
+                # orchestrator_graph=self._intent_graph, # Removed
                 voice_control_graph=self._voice_control_graph,
                 dialogue_graph=self._dialogue_graph,
                 mem=self._mem,

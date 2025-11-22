@@ -333,6 +333,7 @@ async def create_batch_weather_plan(
     # 直接使用所有设备（跳过天气评估）
     suitable_devices = devices
     llm_client = _get_llm_client(cfg)
+    llm_model = os.getenv("RECON_LLM_MODEL", "glm-4-flash")
 
     logger.info(
         "跳过天气评估，所有设备直接可用",
@@ -452,8 +453,8 @@ async def create_batch_weather_plan(
                    target_count=len(targets_dict),
                    trace_id=trace_id)
 
-        # 创建分组Markdown生成器
-        markdown_generator = GroupedMarkdownGenerator(llm_client, "glm-4.6")
+        # 创建分组Markdown生成器（默认使用更快的 glm-4-flash，可通过 RECON_LLM_MODEL 覆盖）
+        markdown_generator = GroupedMarkdownGenerator(llm_client, llm_model)
 
         # 调用并行生成（内部会自动分组为air/land/sea，并行调用LLM）
         markdown_text = markdown_generator.generate(
@@ -508,7 +509,7 @@ async def create_batch_weather_plan(
                                 req.severity,
                                 len(devices_dict),
                                 len(targets_dict),
-                                os.getenv("RECON_LLM_MODEL", "glm-4.6"),
+                                llm_model,
                                 "draft",
                                 "system"
                             )
@@ -563,7 +564,7 @@ async def create_batch_weather_plan(
             "severity": req.severity,
             "device_count": len(devices_dict),
             "target_count": len(targets_dict),
-            "llm_model": os.getenv("RECON_LLM_MODEL", "glm-4.6"),
+            "llm_model": llm_model,
             "generated_at": datetime.utcnow().isoformat(),
             "trace_id": trace_id
         }
@@ -601,7 +602,7 @@ async def create_batch_weather_plan(
                             req.severity,
                             len(devices_dict),
                             len(targets_dict),
-                            os.getenv("RECON_LLM_MODEL", "glm-4.6"),
+                            llm_model,
                             "draft",
                             "system"
                         )
@@ -809,11 +810,11 @@ def _get_weather_condition(scenario: str) -> WeatherCondition:
 
 
 def _get_llm_client(cfg: AppConfig) -> OpenAI:
-    """获取LLM客户端（glm-4.6）- 同步版本"""
+    """获取LLM客户端（默认glm-4-flash，可通过 RECON_LLM_MODEL 覆盖）- 同步版本"""
     if not cfg.recon_llm_base_url or not cfg.recon_llm_api_key:
         raise HTTPException(
             status_code=503,
-            detail="RECON_LLM_BASE_URL或RECON_LLM_API_KEY未配置，无法调用glm-4.6",
+            detail="RECON_LLM_BASE_URL或RECON_LLM_API_KEY未配置，无法调用侦察LLM",
         )
 
     # 使用同步的 httpx.Client（而非 AsyncClient）
@@ -1251,6 +1252,7 @@ async def format_plan_markdown(
         # 获取LLM配置
         cfg = AppConfig.load_from_env()
         client = OpenAI(api_key=cfg.openai_api_key, base_url=cfg.openai_base_url)
+        llm_model = os.getenv("RECON_LLM_MODEL", "glm-4-flash")
 
         logger.info(
             "开始生成Markdown格式报告",
@@ -1261,7 +1263,7 @@ async def format_plan_markdown(
 
         # 调用LLM生成Markdown
         response = client.chat.completions.create(
-            model="glm-4.6",  # 使用glm-4.6模型
+            model=llm_model,  # 更快模型，可通过 RECON_LLM_MODEL 配置
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,  # 保持一致性，但允许适当的语言变化
             max_tokens=8000,  # GLM-4系列最大输出限制为8192

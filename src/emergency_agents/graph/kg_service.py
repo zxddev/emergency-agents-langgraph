@@ -246,16 +246,10 @@ class DisabledKGService:
         return []
 
     def search_cases(self, keywords: str, top_k: int = 5) -> List[Dict[str, Any]]:
-        query = (
-            """
-            MATCH (c:Case)
-            WHERE toLower(c.title) CONTAINS toLower($kw) OR toLower(coalesce(c.summary,'')) CONTAINS toLower($kw)
-            OPTIONAL MATCH (c)-[:USED]->(e:Equipment)
-            WITH c, collect(DISTINCT e.name) AS equipments
-            RETURN c.title AS title, c.id AS id, equipments AS equipments
-            LIMIT $k
-            """
+        structlog.get_logger(__name__).info(
+            "kg_query_skipped_disabled",
+            query="search_cases",
+            keywords=keywords,
+            top_k=top_k,
         )
-        with self._driver.session() as session:
-            rows = session.run(query, kw=keywords, k=top_k)
-            return [dict(r) for r in rows]
+        return []

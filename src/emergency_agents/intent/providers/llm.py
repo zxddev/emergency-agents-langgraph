@@ -131,12 +131,18 @@ def _build_prompt(text: str) -> str:
         "   - 自我介绍询问：你是谁、你是什么模型、你能做什么等\n"
         "   **重要**：GENERAL_CHAT意图不需要提取任何槽位，slots字段必须为空对象{}，不要提取任何信息到slots中。\n"
         "9. 以下场景必须返回 `intent_type=\"UNKNOWN\"`：模糊查询或完全超出应急救援范围的请求。\n\n"
+        "上下文引用规则：若用户追问“这两台是谁”“哪两台参与了”这类无明确目标的指代，必须从对话历史中取最近一次提到的任务/设备信息，填入 query_params（如 task_id 或 task_name），不要把追问原句当成任务名称。\n"
         "意图判定指引：\n"
         "- 语句中出现建筑/设施倒塌、人员被困、伤亡、请求支援、需要立即处置等表述，一律判定为 `RESCUE_TASK_GENERATION`，即便用户只是在汇报现象，也代表需要生成救援行动。\n"
         "- 仅在纯信息播报、无行动需求的情况下使用 `HAZARD_REPORT`。\n"
         "- 语句中明确包含\"侦察\"、\"查看\"、\"监控\"、\"巡视\"等侦察相关动词时，判定为 `SCOUT_TASK_SIMPLE`。\n"
         "- **重要**：\"查看所有携带设备\"、\"显示车载设备\"、\"查询设备列表\"等查询系统数据的请求，必须判定为 `SYSTEM_DATA_QUERY`，而不是 `DEVICE_CONTROL` 或 `DEVICE_STATUS_QUERY`。\n"
-        "  SYSTEM_DATA_QUERY的slots格式：{\"query_type\": \"carried_devices\", \"query_params\": {}}（查询所有携带设备时不需要参数）\n"
+        "  SYSTEM_DATA_QUERY的slots格式：{\"query_type\": \"carried_devices\", \"query_params\": {}}（查询所有携带设备时不需要参数）。\n"
+        "  查询车辆位置（“指挥车在哪”“车辆位置”）也归类为 SYSTEM_DATA_QUERY，示例：{\"query_type\": \"vehicle_location\", \"query_params\": {\"vehicle_name\": \"指挥车\"}}\n"
+        "  查询任务数量或按名称查任务状态，也归类 SYSTEM_DATA_QUERY，示例：\n"
+        "    - 任务数量：{\"query_type\": \"task_count\", \"query_params\": {}}\n"
+        "    - 任务状态：{\"query_type\": \"task_status_by_name\", \"query_params\": {\"task_name\": \"避难人员物资投送\"}}\n"
+        "    - 任务指派列表（回答“哪几台设备”）：{\"query_type\": \"task_assignees\", \"query_params\": {\"task_name\": \"避难人员物资投送\"}}\n"
         '- 当用户给出的描述过于笼统（只提到灾种或灾点，未说明人数、障碍、危险源等细节）时，将 `situation_summary` 置为 null，交由系统追问更具体细节；例如 "XX地震，建筑倒塌" 这类单句概述视为细节不足。\n\n'
         f"救援任务示例：\n{json.dumps(rescue_example, ensure_ascii=False, indent=2)}\n\n"
         f"侦察任务示例：\n{json.dumps(scout_example, ensure_ascii=False, indent=2)}\n\n"
@@ -263,21 +269,45 @@ class LLMIntentProvider(IntentProvider):
             model=self._model,
             message_preview=text[:80],
         )
-        response = self._llm_client.chat.completions.create(
-            model=self._model,
-            messages=messages,
-            temperature=0.0,
-        )
-        content = getattr(response.choices[0].message, "content", "")
-        finish_reason = getattr(response.choices[0], "finish_reason", None)
-        response_id = getattr(response, "id", None)
-        usage = getattr(response, "usage", None)
+
+        # Support both raw OpenAI client (legacy) and LangChain ChatOpenAI (modern)
+        if hasattr(self._llm_client, "chat") and hasattr(self._llm_client.chat, "completions"):
+            response = self._llm_client.chat.completions.create(
+                model=self._model,
+                messages=messages,
+                temperature=0.0,
+            )
+            content = getattr(response.choices[0].message, "content", "")
+            finish_reason = getattr(response.choices[0], "finish_reason", None)
+            response_id = getattr(response, "id", None)
+            usage = getattr(response, "usage", None)
+            usage_dict = getattr(usage, "model_dump", lambda: usage)() if usage else {}
+        else:
+            # Assume LangChain ChatOpenAI / Runnable
+            from langchain_core.messages import HumanMessage, SystemMessage
+            
+            lc_messages = []
+            for m in messages:
+                if m["role"] == "system":
+                    lc_messages.append(SystemMessage(content=m["content"]))
+                elif m["role"] == "user":
+                    lc_messages.append(HumanMessage(content=m["content"]))
+                else:
+                    lc_messages.append(HumanMessage(content=m["content"]))
+            
+            response = self._llm_client.invoke(lc_messages)
+            content = str(response.content)
+            response_id = getattr(response, "id", None)
+            response_metadata = getattr(response, "response_metadata", {})
+            finish_reason = response_metadata.get("finish_reason")
+            usage_dict = response_metadata.get("token_usage", {})
+
         logger.info(
             "llm_intent_response",
             model=self._model,
             response_id=response_id,
             finish_reason=finish_reason,
-            usage=getattr(usage, "model_dump", lambda: usage)(),
+            usage=usage_dict,
             content_preview=content[:200],
         )
         clean_text = _clean_json_text(content)

@@ -119,12 +119,18 @@ def _parse_user_补充(user_input: Any, missing_fields: list, llm_client, llm_mo
     )
     
     try:
-        rsp = llm_client.chat.completions.create(
-            model=llm_model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0
-        )
-        content = rsp.choices[0].message.content
+        if hasattr(llm_client, "chat") and hasattr(llm_client.chat, "completions"):
+            rsp = llm_client.chat.completions.create(
+                model=llm_model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0
+            )
+            content = rsp.choices[0].message.content
+        else:
+            from langchain_core.messages import HumanMessage
+            rsp = llm_client.invoke([HumanMessage(content=prompt)])
+            content = str(rsp.content)
+
         parsed = json.loads(content)
         if isinstance(parsed, dict):
             return {k: v for k, v in parsed.items() if k in missing_fields}

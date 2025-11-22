@@ -18,6 +18,8 @@ class QueryParams(TypedDict, total=False):
     task_id: str
     task_code: str
     device_id: str
+    vehicle_id: str
+    vehicle_name: str
 
 
 @dataclass(slots=True)
@@ -84,6 +86,28 @@ class TaskSummary:
     status: str
     progress: Optional[int]
     updated_at: datetime
+
+
+@dataclass(slots=True)
+class TaskStatusWithCount:
+    """任务状态 + 参与实体数量。"""
+
+    id: str
+    code: Optional[str]
+    description: Optional[str]
+    status: str
+    progress: Optional[int]
+    updated_at: datetime
+    device_count: int
+
+
+@dataclass(slots=True)
+class TaskAssigneeSummary:
+    """任务指派实体摘要。"""
+
+    entity_id: str
+    entity_type: Optional[str]
+    name: Optional[str]
 
 
 @dataclass(slots=True)

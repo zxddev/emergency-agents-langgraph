@@ -269,7 +269,8 @@ class SystemDataQuerySlots(BaseSlots):
     
     支持查询各种系统内部数据：
     - 设备状态（carried_devices, device_by_name）
-    - 任务进度（task_progress, task_by_code）
+    - 车辆位置（vehicle_location）
+    - 任务进度/数量/状态/指派（task_progress, task_by_code, task_count, task_status_by_name, task_assignees）
     - 事件位置（event_location, team_location）
     - POI信息（poi_location）
     

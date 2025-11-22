@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import time
 from datetime import datetime
+import os
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
 import structlog
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, NonNegativeFloat, NonNegativeInt, PositiveInt
+from psycopg.rows import dict_row
+from psycopg_pool import AsyncConnectionPool
 
 from emergency_agents.config import AppConfig
 from emergency_agents.llm.client import get_openai_client
@@ -15,6 +18,13 @@ from emergency_agents.llm.prompts.rescue_assessment import build_rescue_assessme
 from emergency_agents.llm.prompts.post_rescue_assessment import build_post_rescue_assessment_prompt
 
 logger = structlog.get_logger(__name__)
+
+# 默认模型可通过环境覆盖，主模型+超时降级模型。
+DEFAULT_REPORT_MODEL = "glm-4-flash"
+DEFAULT_REPORT_FALLBACK_MODEL = "glm-4-flash"
+
+# 依赖在 main.py 中注入
+_pg_pool_async: Optional[AsyncConnectionPool] = None
 
 
 class DisasterType(str, Enum):
@@ -196,23 +206,53 @@ _kg_service: Any | None = None
 _rag_pipeline: Any | None = None
 
 
+async def _fetch_available_devices(pool: AsyncConnectionPool) -> List[Dict[str, Any]]:
+    """查询所有可用设备及其能力信息。
+    
+    同时考虑 car_device_select 表，优先标记被选中的设备。
+    """
+    sql = """
+        SELECT 
+            d.id, 
+            d.name, 
+            d.device_type, 
+            d.env_type, 
+            d.is_recon,
+            d.weather_capability,
+            COALESCE(cds.is_selected, 0) as is_selected
+        FROM operational.device d
+        LEFT JOIN operational.car_device_select cds ON d.id = cds.device_id AND cds.is_selected = 1
+        WHERE d.deleted_at IS NULL
+    """
+    
+    async with pool.connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(sql)
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
+
+
 @router.post("/rescue-assessment", response_model=RescueAssessmentResponse)
 async def generate_rescue_assessment(payload: RescueAssessmentInput) -> RescueAssessmentResponse:
-    """生成救援评估汇报（集成KG+RAG）。
+    """生成救援评估汇报（集成KG+RAG+实有装备库）。
 
     流程：
     1. 调用KG获取装备推荐
-    2. 调用RAG检索规范文档
-    3. 调用KG检索历史案例
-    4. 构造增强prompt（包含权威参考资料）
-    5. 调用LLM生成报告
-    6. 计算置信度评分
-    7. 返回完整报告信息
+    2. 查询数据库获取实有装备列表
+    3. 调用RAG检索规范文档
+    4. 调用KG检索历史案例
+    5. 构造增强prompt（包含权威参考资料和实有装备）
+    6. 调用LLM生成报告
+    7. 计算置信度评分
+    8. 返回完整报告信息
     """
     total_start = time.perf_counter()
     cfg = AppConfig.load_from_env()
     disaster_type = payload.basic.disaster_type.value
-    location = payload.basic.location
+    fallback_location = "四川茂县"
+    location = payload.basic.location.strip() if payload.basic.location else ""
+    if not location or location == "未知区域":
+        location = fallback_location
 
     logger.info(
         "rescue_assessment_start",
@@ -227,6 +267,7 @@ async def generate_rescue_assessment(payload: RescueAssessmentInput) -> RescueAs
     case_titles: List[str] = []
     reference_materials: List[str] = []
 
+    # ============ 1. KG装备推荐 ============
     kg_start = time.perf_counter()
     try:
         if _kg_service is None:
@@ -277,6 +318,59 @@ async def generate_rescue_assessment(payload: RescueAssessmentInput) -> RescueAs
         )
         errors.append(error_msg)
 
+    # ============ 2. 实有装备查询 ============
+    db_start = time.perf_counter()
+    try:
+        if _pg_pool_async:
+            real_devices = await _fetch_available_devices(_pg_pool_async)
+            
+            # 分类整理实有装备
+            selected_devices = [d for d in real_devices if d['is_selected'] == 1]
+            other_devices = [d for d in real_devices if d['is_selected'] == 0]
+            
+            device_summary = []
+            if selected_devices:
+                device_summary.append("【当前选中/携带装备】（优先使用）：")
+                for d in selected_devices:
+                    desc = f"- {d['name']} ({d['device_type']}/{d['env_type']})"
+                    if d['weather_capability']:
+                        desc += f" [能力: {d['weather_capability']}]"
+                    device_summary.append(desc)
+            
+            if other_devices:
+                device_summary.append("\n【库内其他可用装备】（可供调派）：")
+                # 仅列出前10个避免prompt过长，优先展示侦察设备
+                sorted_others = sorted(other_devices, key=lambda x: x['is_recon'], reverse=True)[:10]
+                for d in sorted_others:
+                     device_summary.append(f"- {d['name']} ({d['device_type']})")
+                if len(other_devices) > 10:
+                    device_summary.append(f"...等共{len(other_devices)}台设备")
+
+            if device_summary:
+                data_sources.append("实有装备库")
+                reference_materials.append(
+                    "**现有可用装备清单（基于数据库）：**\n" +
+                    "\n".join(device_summary)
+                )
+                logger.info(
+                    "db_fetch_devices_success",
+                    selected_count=len(selected_devices),
+                    total_count=len(real_devices)
+                )
+        else:
+            logger.warning("db_pool_not_initialized_skipping_devices")
+
+    except Exception as e:
+        db_elapsed_ms = int((time.perf_counter() - db_start) * 1000)
+        error_msg = f"实有装备查询失败: {str(e)}"
+        logger.error(
+            "db_fetch_devices_failed",
+            error=str(e),
+            latency_ms=db_elapsed_ms,
+        )
+        errors.append(error_msg)
+
+    # ============ 3. RAG规范检索 ============
     rag_spec_start = time.perf_counter()
     try:
         if _rag_pipeline is None:
@@ -381,14 +475,15 @@ async def generate_rescue_assessment(payload: RescueAssessmentInput) -> RescueAs
     )
 
     llm_client = get_openai_client(cfg)
+    primary_model = os.getenv("RESCUE_REPORT_MODEL", DEFAULT_REPORT_MODEL)
+    fallback_model = os.getenv("RESCUE_REPORT_FALLBACK_MODEL", DEFAULT_REPORT_FALLBACK_MODEL)
     llm_start = time.perf_counter()
 
-    try:
-        # 使用 glm-4.6 模型生成报告（专用于救援评估报告生成）
-        completion = llm_client.chat.completions.create(
-            model="glm-4.6",
+    def _call_llm(model: str, max_tokens: int):
+        return llm_client.chat.completions.create(
+            model=model,
             temperature=0.2,
-            max_tokens=8000,  # 提升至8000以支持完整的9章节报告生成
+            max_tokens=max_tokens,
             presence_penalty=0,
             frequency_penalty=0,
             messages=[
@@ -403,14 +498,28 @@ async def generate_rescue_assessment(payload: RescueAssessmentInput) -> RescueAs
                 {"role": "user", "content": prompt},
             ],
         )
+
+    try:
+        completion = _call_llm(primary_model, 8000)
+        used_model = primary_model
     except Exception as exc:
-        llm_elapsed_ms = int((time.perf_counter() - llm_start) * 1000)
-        logger.exception(
-            "rescue_assessment_llm_failed",
-            latency_ms=llm_elapsed_ms,
-            disaster_type=disaster_type,
-        )
-        raise HTTPException(status_code=502, detail="模型生成失败，请稍后重试") from exc
+        errmsg = str(exc).lower()
+        if fallback_model and fallback_model != primary_model and ("timeout" in errmsg or "timed out" in errmsg):
+            logger.warning(
+                "rescue_assessment_llm_retry_fallback",
+                primary=primary_model,
+                fallback=fallback_model,
+            )
+            completion = _call_llm(fallback_model, 6000)
+            used_model = fallback_model
+        else:
+            llm_elapsed_ms = int((time.perf_counter() - llm_start) * 1000)
+            logger.exception(
+                "rescue_assessment_llm_failed",
+                latency_ms=llm_elapsed_ms,
+                disaster_type=disaster_type,
+            )
+            raise HTTPException(status_code=502, detail="模型生成失败，请稍后重试") from exc
 
     llm_elapsed_ms = int((time.perf_counter() - llm_start) * 1000)
     content = completion.choices[0].message.content if completion.choices else None
@@ -425,6 +534,7 @@ async def generate_rescue_assessment(payload: RescueAssessmentInput) -> RescueAs
     logger.info(
         "rescue_assessment_llm_success",
         latency_ms=llm_elapsed_ms,
+        model=used_model,
         output_length=len(content),
     )
 
@@ -1003,7 +1113,10 @@ async def generate_post_rescue_assessment(
 
         # KGService.search_cases的参数是keywords(str)和top_k
         # 拼接灾害类型和地点作为关键词
-        search_keywords = f"{disaster_type} {payload.disaster_overview.location}"
+        _loc = (payload.disaster_overview.location or "").strip()
+        if not _loc or _loc == "未知区域":
+            _loc = "四川茂县"
+        search_keywords = f"{disaster_type} {_loc}"
         kg_cases = _kg_service.search_cases(
             keywords=search_keywords,
             top_k=3
@@ -1108,13 +1221,15 @@ async def generate_post_rescue_assessment(
 
     # ============ LLM生成报告 ============
     llm_client = get_openai_client(cfg)
+    primary_model = os.getenv("RESCUE_REPORT_MODEL", DEFAULT_REPORT_MODEL)
+    fallback_model = os.getenv("RESCUE_REPORT_FALLBACK_MODEL", DEFAULT_REPORT_FALLBACK_MODEL)
     llm_start = time.perf_counter()
 
-    try:
-        completion = llm_client.chat.completions.create(
-            model="glm-4.6",
+    def _call_llm(model: str, max_tokens: int):
+        return llm_client.chat.completions.create(
+            model=model,
             temperature=0.2,
-            max_tokens=10000,  # 评估报告可能更长，需要详细分析
+            max_tokens=max_tokens,
             presence_penalty=0,
             frequency_penalty=0,
             messages=[
@@ -1129,14 +1244,28 @@ async def generate_post_rescue_assessment(
                 {"role": "user", "content": prompt},
             ],
         )
+
+    try:
+        completion = _call_llm(primary_model, 10000)
+        used_model = primary_model
     except Exception as exc:
-        llm_elapsed_ms = int((time.perf_counter() - llm_start) * 1000)
-        logger.exception(
-            "post_rescue_assessment_llm_failed",
-            latency_ms=llm_elapsed_ms,
-            disaster_name=disaster_name,
-        )
-        raise HTTPException(status_code=502, detail="模型生成失败，请稍后重试") from exc
+        errmsg = str(exc).lower()
+        if fallback_model and fallback_model != primary_model and ("timeout" in errmsg or "timed out" in errmsg):
+            logger.warning(
+                "post_rescue_assessment_llm_retry_fallback",
+                primary=primary_model,
+                fallback=fallback_model,
+            )
+            completion = _call_llm(fallback_model, 7000)
+            used_model = fallback_model
+        else:
+            llm_elapsed_ms = int((time.perf_counter() - llm_start) * 1000)
+            logger.exception(
+                "post_rescue_assessment_llm_failed",
+                latency_ms=llm_elapsed_ms,
+                disaster_name=disaster_name,
+            )
+            raise HTTPException(status_code=502, detail="模型生成失败，请稍后重试") from exc
 
     llm_elapsed_ms = int((time.perf_counter() - llm_start) * 1000)
     content = completion.choices[0].message.content if completion.choices else None
@@ -1152,6 +1281,7 @@ async def generate_post_rescue_assessment(
     logger.info(
         "post_rescue_assessment_llm_success",
         latency_ms=llm_elapsed_ms,
+        model=used_model,
         output_length=len(content),
     )
 
@@ -1229,4 +1359,3 @@ def _calculate_post_rescue_input_completeness(payload: PostRescueAssessmentInput
     scores.append(resource_score * 0.2)
 
     return round(sum(scores), 3)
-

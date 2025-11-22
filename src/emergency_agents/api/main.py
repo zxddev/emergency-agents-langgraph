@@ -34,9 +34,9 @@ from emergency_agents.external.adapter_client import AdapterHubClient
 from emergency_agents.external.amap_client import AmapClient
 from emergency_agents.external.orchestrator_client import OrchestratorClient
 from emergency_agents.graph.app import build_app
-from emergency_agents.graph.intent_orchestrator_app import build_intent_orchestrator_graph
+# # from emergency_agents.graph.intent_orchestrator_app import build_intent_orchestrator_graph # Removed # Removed
 from emergency_agents.graph.voice_control_app import build_voice_control_graph
-from emergency_agents.graph.simple_rescue_app import build_simple_rescue_graph
+# # from emergency_agents.graph.simple_rescue_app import build_simple_rescue_graph # Removed # Removed
 from emergency_agents.graph.dialogue_app import build_dialogue_graph
 from emergency_agents.graph.sitrep_app import build_sitrep_graph
 from emergency_agents.graph.recon_app import build_recon_graph_async
@@ -91,16 +91,72 @@ class Domain(str, Enum):
     EQUIP = "装备"
 
 
+from emergency_agents.container import container
+from langchain_openai import ChatOpenAI
+
 app = FastAPI(title="AI Emergency Brain API")
 _cfg = AppConfig.load_from_env()
 if not _cfg.postgres_dsn:
     raise RuntimeError("POSTGRES_DSN 未配置，无法启动服务。")
 set_default_robotdog_id(_cfg.default_robotdog_id)
+
+# Container Initialization (Refactored)
+container.set_config(_cfg)
+
+# Initialize Standard LangChain Client
+_llm_client = ChatOpenAI(
+    model=_cfg.llm_model,
+    openai_api_key=_cfg.openai_api_key,
+    openai_api_base=_cfg.openai_base_url,
+    temperature=0,
+)
+container.register("llm_client", _llm_client)
+
+# Initialize DB Pool (Shared)
+_pg_pool: AsyncConnectionPool[DictRow] = AsyncConnectionPool(
+    conninfo=_cfg.postgres_dsn,
+    min_size=1,
+    max_size=4,
+    open=False,
+    timeout=10.0,
+    max_idle=300.0,
+    max_lifetime=3600.0,
+    reconnect_timeout=5.0,
+    check=AsyncConnectionPool.check_connection,
+)
+container.register("db_pool", _pg_pool)
+
+# KG Service
+if _cfg.enable_kg:
+    _kg = KGService(KGConfig(
+        uri=_cfg.neo4j_uri or "bolt://192.168.1.40:7687",
+        user=_cfg.neo4j_user or "neo4j",
+        password=_cfg.neo4j_password or "example-neo4j",
+    ))
+else:
+    _kg = DisabledKGService()
+container.register("kg_service", _kg)
+
+# RAG Pipeline
+if _cfg.enable_rag:
+    _rag = RagPipeline(
+        qdrant_url=_cfg.qdrant_url or "http://192.168.1.40:6333",
+        qdrant_api_key=_cfg.qdrant_api_key,
+        embedding_model=_cfg.embedding_model,
+        embedding_dim=_cfg.embedding_dim,
+        openai_base_url=_cfg.openai_base_url,
+        openai_api_key=_cfg.openai_api_key,
+        llm_model=_cfg.llm_model,
+    )
+else:
+    _rag = DisabledRagPipeline()
+container.register("rag_pipeline", _rag)
+
 _graph_app: Any | None = None
-_intent_graph: Any | None = None
+# _intent_graph Removed (Refactored to Pipeline)
 _voice_control_graph: Any | None = None
 _dialogue_graph: Any | None = None
-_simple_rescue_graph: Any | None = None
+_simple_rescue_graph: Any | None = None # Will be removed/refactored logic
 _sitrep_graph: Any | None = None
 _recon_graph: Any | None = None
 _graph_closers: list[Callable[[], Awaitable[None]]] = []
@@ -562,16 +618,16 @@ async def startup_event():
     _register_graph_close(_graph_app)
     logger.info("api_graph_ready", graph="rescue_app")
 
-    _intent_graph = await build_intent_orchestrator_graph(
-        cfg=_cfg,
-        llm_client=_intent_llm_client,
-        llm_model=_cfg.intent_llm_model or _cfg.llm_model,
-        classifier_node=_classifier_wrapper,
-        validator_node=_validator_wrapper,
-        prompt_node=_prompt_wrapper,
-    )
-    _register_graph_close(_intent_graph)
-    logger.info("api_graph_ready", graph="intent_orchestrator")
+    # _intent_graph = await build_intent_orchestrator_graph(
+    #     cfg=_cfg,
+    #     llm_client=_intent_llm_client,
+    #     llm_model=_cfg.intent_llm_model or _cfg.llm_model,
+    #     classifier_node=_classifier_wrapper,
+    #     validator_node=_validator_wrapper,
+    #     prompt_node=_prompt_wrapper,
+    # )
+    # _register_graph_close(_intent_graph)
+    logger.info("api_graph_ready", graph="intent_orchestrator_refactored_to_pipeline")
 
     # 会话上下文服务（基于全局 AsyncConnectionPool）
     _context_service = ContextService(pool=_pg_pool)
@@ -589,13 +645,13 @@ async def startup_event():
     logger.info("api_graph_ready", graph="voice_control")
 
     rescue_dao = RescueDAO.create(_pg_pool)
-    _simple_rescue_graph = await build_simple_rescue_graph(
-        rescue_dao=rescue_dao,
-    )
-    app.state.simple_rescue_graph = _simple_rescue_graph
-    if _intent_registry is not None:
-        _intent_registry.attach_simple_rescue_graph(_simple_rescue_graph)
-    logger.info("api_graph_ready", graph="simple_rescue")
+    # _simple_rescue_graph = await build_simple_rescue_graph(
+    #     rescue_dao=rescue_dao,
+    # )
+    # app.state.simple_rescue_graph = _simple_rescue_graph
+    # if _intent_registry is not None:
+    #     _intent_registry.attach_simple_rescue_graph(_simple_rescue_graph)
+    logger.info("api_graph_ready", graph="simple_rescue_refactored_to_function")
 
     _dialogue_graph = await build_dialogue_graph(
         postgres_dsn=_cfg.postgres_dsn,
@@ -608,7 +664,7 @@ async def startup_event():
     voice_chat_handler.set_intent_pipeline(
         manager=_conversation_manager,
         registry=_intent_registry,
-        orchestrator_graph=_intent_graph,
+        # orchestrator_graph=_intent_graph, # Removed
         voice_control_graph=_voice_control_graph,
         dialogue_graph=_dialogue_graph,
         mem=_mem,
@@ -645,8 +701,10 @@ async def startup_event():
     app.include_router(plan_api.router)
     # 绑定 /ai/rescue 路由（整体救援方案）
     overall_rescue_api._pg_pool_async = _pg_pool  # type: ignore[assignment]
+    rescue_api._pg_pool_async = _pg_pool  # type: ignore[assignment]
     recon_priority_api._pg_pool_async = _pg_pool  # type: ignore[assignment]
     recon_batch_weather_api._pg_pool_async = _pg_pool  # type: ignore[assignment]
+    reports_api._pg_pool_async = _pg_pool  # type: ignore[assignment]
 
     # ========== 初始化SITREP子图 ==========
     task_dao = TaskDAO.create(_pg_pool)
@@ -1076,104 +1134,45 @@ async def assist_answer(req: AssistAnswerRequest):
             raise
 
 
+# Intent Processing (Refactored)
+from emergency_agents.intent.pipeline import intent_pipeline
+
 @app.post("/intent/process")
 async def intent_process(req: IntentProcessRequest):
-    """统一意图处理入口（语音与文本复用）。"""
-    manager = _require_conversation_manager()
-    registry = _require_intent_registry()
+    """统一意图处理入口（Refactored: 使用纯管道替代 Graph）。"""
+    
+    # 1. Context Gathering
     metadata = dict(req.metadata or {})
     if req.incident_id:
         metadata.setdefault("incident_id", req.incident_id)
+        
+    context = {
+        "user_id": req.user_id,
+        "thread_id": req.thread_id,
+        "incident_id": req.incident_id,
+        "metadata": metadata,
+    }
 
     try:
-        result: IntentProcessResult = await process_intent_core(
-            user_id=req.user_id,
-            thread_id=req.thread_id,
-            message=req.message,
-            metadata=metadata,
-            manager=manager,
-            registry=registry,
-            orchestrator_graph=_require_intent_graph(),
-            voice_control_graph=_require_voice_control_graph(),
-            dialogue_graph=_require_dialogue_graph(),
-            mem=_mem,
-            build_history=_build_history,
-            mem0_metrics=_mem0_metrics_factory(),
-            channel=req.channel,
-            context_service=_context_service,
-            enable_mem0=_cfg.enable_mem0,
-        )
-        masked_intent = mask_payload(result.intent)
-        masked_result = mask_payload(result.result)
-        masked_history = mask_payload(result.history)
-        masked_memory_hits = mask_payload(result.memory_hits)
-        masked_audit_log = mask_payload(result.audit_log)
-        masked_ui_actions = mask_payload(result.ui_actions)
-
+        # 2. Pipeline Execution (Simple Linear Flow)
+        result_data = await intent_pipeline.process(req.message, context=context)
+        
+        # 3. Response Formatting
+        # 模拟旧 API 的响应结构以保持前端兼容性
         return {
-            "status": result.status,
-            "intent": masked_intent,
-            "result": masked_result,
-            "history": masked_history,
-            "memory_hits": masked_memory_hits,
-            "audit_log": masked_audit_log,
-            "ui_actions": masked_ui_actions,
+            "status": "success",
+            "intent": result_data.get("intent"),
+            "result": {
+                "router_next": result_data.get("router_next"),
+                # "payload": result_data.get("state"), # Optional debugging
+            },
+            "history": [], # Would require DB lookup if needed
+            "audit_log": [], 
         }
+
     except Exception as exc:
-        # 记录详细错误信息到日志（包括堆栈跟踪）
-        logger = structlog.get_logger(__name__)
-        logger.error(
-            "intent_process_failed",
-            user_id=req.user_id,
-            thread_id=req.thread_id,
-            error=str(exc),
-            exc_info=True,
-        )
-
-        # 识别数据库连接错误，提供友好的错误信息
-        error_str = str(exc).lower()
-        db_error_keywords = [
-            "consuming input failed",
-            "server closed the connection",
-            "connection refused",
-            "connection reset",
-            "connection timed out",
-            "could not connect",
-            "network error",
-            "connection error",
-            "database error",
-        ]
-
-        is_db_error = any(keyword in error_str for keyword in db_error_keywords)
-
-        if is_db_error:
-            # 数据库连接问题：使用降级响应
-            friendly_message = "系统正在维护中，请稍后再试。"
-            logger.warning(
-                "database_connection_issue_in_api",
-                user_id=req.user_id,
-                thread_id=req.thread_id,
-                message_preview=req.message[:50] if req.message else "",
-            )
-            # 返回一个降级的响应，而不是抛出500错误
-            return {
-                "status": "error",
-                "intent": {"intent_type": "unknown"},
-                "result": {
-                    "response_text": friendly_message,
-                    "error_type": "service_unavailable",
-                },
-                "history": [],
-                "memory_hits": [],
-                "audit_log": [],
-                "ui_actions": [],
-            }
-        else:
-            # 其他错误：返回通用错误信息
-            raise HTTPException(
-                status_code=500,
-                detail="系统处理遇到问题，请稍后重试。",
-            )
+        logger.error(f"Intent process failed: {exc}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.post("/conversations/history")

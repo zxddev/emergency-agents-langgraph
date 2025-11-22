@@ -5,12 +5,14 @@ import os
 import time
 from dataclasses import dataclass, asdict, field
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Mapping, Optional
+import re
 from urllib.parse import quote
 
 import structlog
 
 from emergency_agents.constants import RESCUE_DEMO_INCIDENT_ID
-from emergency_agents.graph.intent_orchestrator_app import IntentOrchestratorState
+# from emergency_agents.graph.intent_orchestrator_app import IntentOrchestratorState # Removed
+from emergency_agents.intent.pipeline import intent_pipeline
 from emergency_agents.intent.registry import IntentHandlerRegistry
 from emergency_agents.intent.handlers.device_control import DeviceControlHandler, RobotDogControlHandler
 from emergency_agents.intent.handlers.device_status import DeviceStatusQueryHandler
@@ -31,6 +33,7 @@ from emergency_agents.memory.mem0_facade import MemoryFacade, DisabledMemoryFaca
 from emergency_agents.ui.actions import serialize_actions
 
 logger = structlog.get_logger(__name__)
+_UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE)
 
 
 @dataclass(slots=True)
@@ -60,6 +63,29 @@ class IntentProcessResult:
 def _normalize_intent_key(intent_type: str) -> str:
     """标准化意图名称，统一使用短横线命名。"""
     return intent_type.strip().replace(" ", "").replace("_", "-").lower()
+
+
+def _extract_latest_task_id_from_history(history_records: List[MessageRecord]) -> Optional[str]:
+    """从对话历史中提取最近出现的 UUID（用于任务ID指代）。"""
+    for msg in reversed(history_records):
+        try:
+            if str(msg.role).lower() != "assistant":
+                continue
+            match = _UUID_RE.search(msg.content or "")
+            if match:
+                return match.group(0)
+        except Exception:
+            continue
+    return None
+
+
+def _is_task_assignee_followup(message: str) -> bool:
+    """粗略检测“哪几台/哪两台参与了”类追问。"""
+    text = message.strip()
+    if not text:
+        return False
+    keywords = ["哪几台", "哪两台", "哪俩", "哪两个", "哪几辆", "哪两辆"]
+    return any(kw in text for kw in keywords)
 
 
 def _encode_intent_for_mem0(intent_type: str | None) -> str:
@@ -147,7 +173,7 @@ async def _handle_robotdog_control(
     slots_payload: Dict[str, Any],
     voice_control_graph: Any | None,
     thread_id: str,
-    router_state: IntentOrchestratorState,
+    router_state: Dict[str, Any], # Changed from IntentOrchestratorState to Dict
     persist_message: Callable[[str, Optional[str]], "MessageRecord"],
     history_records: List["MessageRecord"],
     build_history: Callable[[List["MessageRecord"]], List[Dict[str, Any]]],
@@ -353,7 +379,7 @@ async def process_intent_core(
     metadata: Mapping[str, Any] | None,
     manager: ConversationManager,
     registry: IntentHandlerRegistry,
-    orchestrator_graph: Any,
+    # orchestrator_graph: Any, # Removed
     voice_control_graph: Any | None,
     dialogue_graph: Any | None,
     mem: MemoryFacade | DisabledMemoryFacade,
@@ -476,7 +502,7 @@ async def process_intent_core(
         if summary_lines:
             messages_for_graph.append({"role": "system", "content": "历史记忆:\n" + "\n".join(summary_lines)})
 
-    initial_state: IntentOrchestratorState = {
+    initial_state: Dict[str, Any] = {
         "thread_id": thread_id,
         "user_id": user_id,
         "channel": channel,
@@ -486,67 +512,61 @@ async def process_intent_core(
         "messages": messages_for_graph,
         "memory_hits": memory_hits,
         "conversation_context": conversation_context,
+        "history": messages_for_graph # Pass history to pipeline
     }
 
-    logger.warning(
-        "intent_graph_checkpointer_type",
-        checkpointer_type=type(getattr(orchestrator_graph, "checkpointer", None)).__name__,
-    )
+    # logger.warning(
+    #     "intent_graph_checkpointer_type",
+    #     checkpointer_type=type(getattr(orchestrator_graph, "checkpointer", None)).__name__,
+    # )
 
     # 添加精确的计时日志
     start_time = time.perf_counter()
-    logger.warning(
-        "langgraph_ainvoke_starting",
-        thread_id=thread_id,
-        initial_state_keys=list(initial_state.keys()),
-        start_time=start_time,
-    )
+    # logger.warning(
+    #     "langgraph_ainvoke_starting",
+    #     thread_id=thread_id,
+    #     initial_state_keys=list(initial_state.keys()),
+    #     start_time=start_time,
+    # )
 
     # 性能优化：根据消息内容判断是否需要checkpoint
     # 只有复杂的救援和侦察任务需要checkpoint，简单查询不需要
-    needs_checkpoint = (
-        "救援" in cleaned_message or "rescue" in cleaned_message.lower() or
-        "侦察" in cleaned_message or "scout" in cleaned_message.lower() or
-        "任务" in cleaned_message or "task" in cleaned_message.lower()
-    )
+    # needs_checkpoint = (
+    #     "救援" in cleaned_message or "rescue" in cleaned_message.lower() or
+    #     "侦察" in cleaned_message or "scout" in cleaned_message.lower() or
+    #     "任务" in cleaned_message or "task" in cleaned_message.lower()
+    # )
 
+    graph_state: Dict[str, Any] = {}
     try:
-        if needs_checkpoint:
-            # 复杂任务：使用完整的checkpoint进行状态持久化
-            logger.info(
-                "langgraph_with_checkpoint",
-                thread_id=thread_id,
-                reason="complex_task",
-            )
-            graph_state: IntentOrchestratorState = await orchestrator_graph.ainvoke(
-                initial_state,
-                config={"configurable": {"thread_id": thread_id}},
-                # 异步checkpoint，减少阻塞
-                durability="async",
-            )
-        else:
-            # 简单查询：使用exit模式，只在最后保存，跳过中间checkpoint
-            logger.info(
-                "langgraph_minimal_checkpoint",
-                thread_id=thread_id,
-                reason="simple_query",
-            )
-            # 必须提供thread_id（checkpointer要求），但使用exit模式最小化开销
-            graph_state: IntentOrchestratorState = await orchestrator_graph.ainvoke(
-                initial_state,
-                config={"configurable": {"thread_id": thread_id}},
-                # exit模式：只在图执行结束时保存一次，跳过所有中间checkpoint
-                durability="exit",
-            )
+        # REFACTORED: Use IntentPipeline instead of Graph
+        pipeline_result = await intent_pipeline.process(cleaned_message, context=initial_state)
+        
+        # Map pipeline result to expected state format
+        graph_state = pipeline_result.get("state") or {}
+        
+        # Backfill critical fields if missing
+        if "intent" not in graph_state:
+            graph_state["intent"] = pipeline_result.get("intent")
+        if "router_next" not in graph_state:
+            graph_state["router_next"] = pipeline_result.get("router_next")
+        if "validation_status" not in graph_state:
+             status = pipeline_result.get("status")
+             graph_state["validation_status"] = "valid" if status == "complete" else "invalid"
+        
+        # Inject audit log placeholder
+        if "audit_log" not in graph_state:
+            graph_state["audit_log"] = []
+
     finally:
         end_time = time.perf_counter()
         elapsed_ms = int((end_time - start_time) * 1000)
-        logger.warning(
-            "langgraph_ainvoke_completed",
-            thread_id=thread_id,
-            elapsed_ms=elapsed_ms,
-            elapsed_seconds=f"{end_time - start_time:.2f}",
-        )
+        # logger.warning(
+        #     "langgraph_ainvoke_completed",
+        #     thread_id=thread_id,
+        #     elapsed_ms=elapsed_ms,
+        #     elapsed_seconds=f"{end_time - start_time:.2f}",
+        # )
 
     intent = graph_state.get("intent") or {}
     validation_status = graph_state.get("validation_status", "valid")
@@ -741,6 +761,31 @@ async def process_intent_core(
             memory_hits=memory_hits,
             audit_log=graph_state.get("audit_log") or [],
         )
+
+    if router_next in {"unknown", "error"}:
+        # 处理“哪几台/哪两台”指代上一任务的追问，避免掉入闲聊
+        try:
+            if _is_task_assignee_followup(cleaned_message):
+                last_task_id = _extract_latest_task_id_from_history(history_records)
+                if last_task_id:
+                    router_next = "system-data-query"
+                    canonical = router_next
+                    intent = {
+                        "intent_type": router_next,
+                        "canonical_intent_type": canonical,
+                        "slots": {
+                            "query_type": "task_assignees",
+                            "query_params": {"task_id": last_task_id},
+                        },
+                    }
+                    logger.info(
+                        "intent_auto_reroute_task_assignees",
+                        task_id=last_task_id,
+                        thread_id=thread_id,
+                        user_id=user_id,
+                    )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("intent_auto_reroute_failed", error=str(exc))
 
     if router_next in {"unknown", "error"}:
         logger.info(

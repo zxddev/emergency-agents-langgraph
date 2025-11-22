@@ -37,6 +37,8 @@ from emergency_agents.db.models import (
     TaskRoutePlanCreateInput,
     TaskRoutePlanRecord,
     TaskSummary,
+    TaskStatusWithCount,
+    TaskAssigneeSummary,
     VideoDevice,
 )
 
@@ -140,6 +142,49 @@ class LocationDAO:
             duration_ms=duration * 1000,
             has_team_id=bool(team_id),
             has_team_name=bool(team_name),
+            found=record is not None,
+        )
+        return record
+
+    async def fetch_vehicle_location(self, params: QueryParams) -> EntityLocation | None:
+        """查询车辆位置（指挥/作战车辆）。"""
+        start = time.perf_counter()
+        conditions: list[str] = ["ent.type IN ('command_vehicle')"]
+        sql_params: dict[str, Any] = {}
+
+        vehicle_id = params.get("vehicle_id")
+        vehicle_name = params.get("vehicle_name")
+
+        if vehicle_id:
+            conditions.append("ent.id = %(vehicle_id)s::uuid")
+            sql_params["vehicle_id"] = vehicle_id
+        if vehicle_name:
+            conditions.append("ent.properties->>'name' ILIKE %(vehicle_name)s")
+            sql_params["vehicle_name"] = f"%{vehicle_name}%"
+
+        query = (
+            "SELECT ent.properties->>'name' AS name, "
+            "       ST_X((ent.geometry)::geometry) AS lng, "
+            "       ST_Y((ent.geometry)::geometry) AS lat "
+            "  FROM operational.entities ent "
+            f" WHERE {' AND '.join(conditions)} "
+            " ORDER BY ent.updated_at DESC "
+            " LIMIT 1"
+        )
+
+        async with self._pool.connection() as conn:
+            async with conn.cursor(row_factory=class_row(EntityLocation)) as cur:
+                await cur.execute(query, sql_params)
+                record = await cur.fetchone()
+
+        duration = time.perf_counter() - start
+        DAO_CALL_LATENCY.labels("location", "fetch_vehicle").observe(duration)
+        DAO_CALL_TOTAL.labels("location", "fetch_vehicle", "found" if record else "not_found").inc()
+        logger.info(
+            "dao_location_fetch_vehicle",
+            duration_ms=duration * 1000,
+            has_vehicle_id=bool(vehicle_id),
+            has_vehicle_name=bool(vehicle_name),
             found=record is not None,
         )
         return record
@@ -248,6 +293,19 @@ class RescuerDAO:
         if team_name:
             params["team_name"] = team_name
         return await self._location.fetch_team_location(params)
+
+    async def fetch_vehicle_location(
+        self,
+        *,
+        vehicle_id: str | None = None,
+        vehicle_name: str | None = None,
+    ) -> EntityLocation | None:
+        params: QueryParams = {}
+        if vehicle_id:
+            params["vehicle_id"] = vehicle_id
+        if vehicle_name:
+            params["vehicle_name"] = vehicle_name
+        return await self._location.fetch_vehicle_location(params)
 
 
 class DeviceDAO:
@@ -847,6 +905,131 @@ class TaskDAO:
             duration_ms=duration * 1000,
             event_id=event_id,
             hours=hours,
+            count=len(result),
+        )
+        return result
+
+    async def count_tasks(self) -> int:
+        """统计未删除的任务数量。"""
+        start = time.perf_counter()
+        query = "SELECT COUNT(*) FROM operational.tasks WHERE deleted_at IS NULL"
+        async with self._pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(query)
+                row = await cur.fetchone()
+                total = int(row[0]) if row else 0
+        duration = time.perf_counter() - start
+        DAO_CALL_LATENCY.labels("task", "count_tasks").observe(duration)
+        DAO_CALL_TOTAL.labels("task", "count_tasks", "success").inc()
+        logger.info("dao_task_count", duration_ms=duration * 1000, total=total)
+        return total
+
+    async def fetch_task_by_name(self, task_name: str) -> TaskStatusWithCount | None:
+        """按描述/编号模糊匹配任务，并统计指派实体数量。"""
+        if not task_name:
+            raise ValueError("task_name 不能为空")
+        start = time.perf_counter()
+        query = """
+            WITH assignees AS (
+                SELECT task_id, COUNT(DISTINCT entity_id) AS device_count
+                  FROM operational.task_assignees
+                 GROUP BY task_id
+            )
+            SELECT t.id::text        AS id,
+                   t.code            AS code,
+                   t.description     AS description,
+                   t.status::text    AS status,
+                   t.progress        AS progress,
+                   t.updated_at      AS updated_at,
+                   COALESCE(a.device_count, 0) AS device_count
+              FROM operational.tasks t
+              LEFT JOIN assignees a ON a.task_id = t.id
+             WHERE (t.description ILIKE %(name)s OR t.code ILIKE %(name)s)
+               AND t.deleted_at IS NULL
+             ORDER BY t.updated_at DESC
+             LIMIT 1
+        """
+        pattern = f"%{task_name}%"
+        async with self._pool.connection() as conn:
+            async with conn.cursor(row_factory=class_row(TaskStatusWithCount)) as cur:
+                await cur.execute(query, {"name": pattern})
+                record = await cur.fetchone()
+
+        duration = time.perf_counter() - start
+        DAO_CALL_LATENCY.labels("task", "fetch_task_by_name").observe(duration)
+        DAO_CALL_TOTAL.labels("task", "fetch_task_by_name", "found" if record else "not_found").inc()
+        logger.info(
+            "dao_task_fetch_by_name",
+            duration_ms=duration * 1000,
+            task_name=task_name,
+            found=record is not None,
+        )
+        return record
+
+    async def fetch_latest_task_with_assignees(self) -> TaskStatusWithCount | None:
+        """获取最近更新且有指派实体的任务。"""
+        start = time.perf_counter()
+        query = """
+            WITH assignees AS (
+                SELECT task_id, COUNT(DISTINCT entity_id) AS device_count
+                  FROM operational.task_assignees
+                 GROUP BY task_id
+            )
+            SELECT t.id::text        AS id,
+                   t.code            AS code,
+                   t.description     AS description,
+                   t.status::text    AS status,
+                   t.progress        AS progress,
+                   t.updated_at      AS updated_at,
+                   COALESCE(a.device_count, 0) AS device_count
+              FROM operational.tasks t
+              JOIN assignees a ON a.task_id = t.id
+             WHERE t.deleted_at IS NULL
+             ORDER BY t.updated_at DESC
+             LIMIT 1
+        """
+        async with self._pool.connection() as conn:
+            async with conn.cursor(row_factory=class_row(TaskStatusWithCount)) as cur:
+                await cur.execute(query)
+                record = await cur.fetchone()
+
+        duration = time.perf_counter() - start
+        DAO_CALL_LATENCY.labels("task", "fetch_latest_with_assignees").observe(duration)
+        DAO_CALL_TOTAL.labels("task", "fetch_latest_with_assignees", "found" if record else "not_found").inc()
+        logger.info(
+            "dao_task_fetch_latest_with_assignees",
+            duration_ms=duration * 1000,
+            found=record is not None,
+        )
+        return record
+
+    async def fetch_task_assignees(self, task_id: str) -> list[TaskAssigneeSummary]:
+        """查询任务的被指派实体列表。"""
+        if not task_id:
+            raise ValueError("task_id 不能为空")
+        start = time.perf_counter()
+        query = """
+            SELECT ent.id::text     AS entity_id,
+                   ent.type::text   AS entity_type,
+                   ent.properties->>'name' AS name
+              FROM operational.task_assignees ta
+              JOIN operational.entities ent ON ent.id = ta.entity_id
+             WHERE ta.task_id = %(task_id)s::uuid
+             ORDER BY ent.updated_at DESC
+        """
+        async with self._pool.connection() as conn:
+            async with conn.cursor(row_factory=class_row(TaskAssigneeSummary)) as cur:
+                await cur.execute(query, {"task_id": task_id})
+                rows = await cur.fetchall()
+                result = list(rows)
+
+        duration = time.perf_counter() - start
+        DAO_CALL_LATENCY.labels("task", "fetch_task_assignees").observe(duration)
+        DAO_CALL_TOTAL.labels("task", "fetch_task_assignees", "success").inc()
+        logger.info(
+            "dao_task_fetch_assignees",
+            duration_ms=duration * 1000,
+            task_id=task_id,
             count=len(result),
         )
         return result
