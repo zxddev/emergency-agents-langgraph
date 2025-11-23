@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Any, Dict, Callable, Awaitable, Optional
 
 import structlog
 
@@ -59,7 +59,7 @@ GENERAL_CHAT_SYSTEM_PROMPT = """你是应急救援指挥车的智能助手，代
 例如，您可以说"到东经103.8度、北纬31.6度侦察"或"制定XX地震救援方案"。"
 
 用户："你是什么大模型"
-助手："我基于智谱GLM-4大模型构建，采用LangGraph多智能体编排架构，专门针对应急救援场景优化。我的核心是多个专业智能体的协作：态势感知、风险预测、方案生成、装备推荐等，确保救援决策的准确性和时效性。"
+助手："我基于超越空间开发的猛士大模型构建，采用 LangGraph 多智能体编排架构，专门针对应急救援场景优化。我的核心是多个专业智能体的协作：态势感知、风险预测、方案生成、设备调度等，确保救援决策的准确性和时效性。"
 
 【重要提醒】
 - 不要编造未实现的功能
@@ -83,6 +83,7 @@ class GeneralChatHandler(IntentHandler[GeneralChatSlots]):
 
     llm_client: Any
     llm_model: str
+    async_llm_client: Any | None = None
 
     def __post_init__(self):
         """初始化后日志记录。"""
@@ -122,25 +123,57 @@ class GeneralChatHandler(IntentHandler[GeneralChatSlots]):
         history.append({"role": "user", "content": raw_text})
 
         try:
-            # 调用LLM生成回答
-            response = self.llm_client.chat.completions.create(
-                model=self.llm_model,
-                messages=[
-                    {"role": "system", "content": GENERAL_CHAT_SYSTEM_PROMPT},
-                    *history,
-                ],
-                temperature=0.7,  # 对话可以稍微灵活一些
-                max_tokens=500,   # 限制回答长度，保持简洁
-            )
+            messages_payload = [
+                {"role": "system", "content": GENERAL_CHAT_SYSTEM_PROMPT},
+                *history,
+            ]
 
-            answer = response.choices[0].message.content.strip()
+            stream_sink: Optional[Callable[[str], Awaitable[None]]] = state.get("stream_sink")  # type: ignore[assignment]
+            answer: str = ""
+
+            input_tokens = 0
+            output_tokens = 0
+
+            # 语音通道可选流式：仅在提供 async_llm_client 和 stream_sink 时启用
+            if stream_sink is not None and self.async_llm_client is not None:
+                chunks: list[str] = []
+                stream = await self.async_llm_client.chat.completions.create(
+                    model=self.llm_model,
+                    messages=messages_payload,
+                    temperature=0.7,
+                    max_tokens=500,
+                    stream=True,
+                )
+                async for chunk in stream:
+                    try:
+                        delta = chunk.choices[0].delta.content or ""
+                    except Exception:
+                        delta = ""
+                    if not delta:
+                        continue
+                    chunks.append(delta)
+                    await stream_sink(delta)
+                answer = "".join(chunks).strip()
+            else:
+                # 非流式路径：用于文本API或未启用流式的场景
+                response = self.llm_client.chat.completions.create(
+                    model=self.llm_model,
+                    messages=messages_payload,
+                    temperature=0.7,  # 对话可以稍微灵活一些
+                    max_tokens=500,   # 限制回答长度，保持简洁
+                )
+
+                content = getattr(response.choices[0].message, "content", "") or ""
+                answer = str(content).strip()
+                input_tokens = getattr(getattr(response, "usage", None), "prompt_tokens", 0)
+                output_tokens = getattr(getattr(response, "usage", None), "completion_tokens", 0)
 
             logger.info(
                 "general_chat_success",
                 thread_id=thread_id,
                 answer_preview=answer[:100],
-                input_tokens=getattr(response.usage, "prompt_tokens", 0),
-                output_tokens=getattr(response.usage, "completion_tokens", 0),
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
             )
 
             # 返回标准格式（必须使用response_text字段）

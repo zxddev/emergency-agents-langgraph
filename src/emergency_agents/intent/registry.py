@@ -36,7 +36,7 @@ from emergency_agents.video.stream_catalog import VideoStreamCatalog
 DEFAULT_VIDEO_STREAMS: Dict[str, object] = {
     "scout-robotdog": {
         "display_name": "侦察巡逻机器狗",
-        "stream_url": "rtsp://8.147.130.215:8554/live/02",
+        "stream_url": "rtsp://47.109.17.68/live/11?secret=035c73f7-bb6b-4889-a715-d9eb2d1925cc",
         "aliases": ("侦察巡逻机器狗", "巡逻机器狗", "侦察机器狗", "机器狗"),
         "device_type": "robotdog",
     }
@@ -66,6 +66,7 @@ class IntentHandlerRegistry:
         vllm_api_key: str | None,
         vllm_model: str,
         simple_rescue_graph: Any | None = None,
+        llm_async_client: Any | None = None,
     ) -> "IntentHandlerRegistry":
         if not postgres_dsn:
             raise RuntimeError("POSTGRES_DSN 未配置，无法初始化意图处理器注册表。")
@@ -119,7 +120,7 @@ class IntentHandlerRegistry:
             rescuer_dao=rescuer_dao
         )
         disaster_overview_handler = DisasterOverviewHandler()
-        general_chat_handler = GeneralChatHandler(llm_client, llm_model)
+        general_chat_handler = GeneralChatHandler(llm_client, llm_model, async_llm_client=llm_async_client)
 
         # if simple_rescue_graph is not None:
         #     rescue_generation.attach_simple_graph(simple_rescue_graph)

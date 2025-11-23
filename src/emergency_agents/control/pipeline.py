@@ -36,7 +36,7 @@ _ACTION_KEYWORDS: Dict[str, tuple[str, ...]] = {
     "back": ("后退", "向后", "back", "倒退"),
     "turnLeft": ("左转", "向左", "左拐", "turn left"),
     "turnRight": ("右转", "向右", "右拐", "turn right"),
-    "up": ("起立", "站立", "抬起", "上升", "stand up"),
+    "up": ("起立", "站立", "站起", "站起来", "抬起", "上升", "stand up"),
     "down": ("趴下", "坐下", "下降", "蹲下", "sit down"),
     "stop": ("停止", "停下", "stop"),
     "forceStop": ("急停", "紧急停止", "force stop", "forceStop"),
@@ -136,7 +136,7 @@ class VoiceControlPipeline:
         raise VoiceControlError("缺少设备 ID")
 
     def _detect_action(self, command_text: str) -> str:
-        lowered = command_text.lower()
+        lowered = command_text.lower().replace("_", " ")
         for action, keywords in _ACTION_KEYWORDS.items():
             for keyword in keywords:
                 pattern = keyword.lower()

@@ -5,7 +5,8 @@ LLM智能侦察方案生成模块
 """
 
 import json
-from typing import List, Dict, Any, TypedDict, Optional, Union
+from typing import List, Dict, Any, Optional, Union
+from typing_extensions import TypedDict
 from uuid import UUID
 from datetime import datetime, timedelta
 from openai import OpenAI

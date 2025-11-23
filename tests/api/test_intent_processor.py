@@ -292,6 +292,7 @@ async def test_process_intent_core_passes_raw_text_and_messages() -> None:
         channel="voice",
         context_service=None,
         enable_mem0=False,
+        stream_sink=None,
     )
 
     assert result.status == "success"

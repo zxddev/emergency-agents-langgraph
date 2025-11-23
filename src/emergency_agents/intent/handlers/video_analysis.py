@@ -274,18 +274,23 @@ class VideoAnalysisHandler(IntentHandler[VideoAnalysisSlots]):
         # 构建回复文本
         parts = []
 
-        # 1. 开场和危险等级
+        # 1. 开场和场景概述
         parts.append(f"已完成设备 {device_name} 的视频分析。")
+        scene_summary = getattr(result, "scene_summary", None)
+        if scene_summary:
+            parts.append(f"**场景概述**: {scene_summary}")
+
+        # 2. 危险等级
         parts.append(f"**危险等级**: {result.danger_level.value} - {danger_desc}")
 
-        # 2. 人员情况
+        # 3. 人员情况（优先详细描述）
         if result.persons.count > 0:
             activities_str = "、".join(result.persons.activities[:3]) if result.persons.activities else "正常活动"
-            parts.append(f"**人员情况**: 检测到 {result.persons.count} 人，主要活动：{activities_str}")
+            parts.append(f"**人员情况**: 检测到 {result.persons.count} 人，主要活动/姿态：{activities_str}")
         else:
             parts.append("**人员情况**: 未检测到人员")
 
-        # 3. 车辆情况
+        # 4. 车辆情况
         if result.vehicles.total_count > 0:
             vehicle_types = "、".join(
                 [f"{vtype} {count}辆" for vtype, count in result.vehicles.by_type.items()]
@@ -294,7 +299,7 @@ class VideoAnalysisHandler(IntentHandler[VideoAnalysisSlots]):
         else:
             parts.append("**车辆情况**: 未检测到车辆")
 
-        # 4. 建筑物状况
+        # 5. 建筑物状况
         if result.buildings.total_buildings > 0:
             damaged_ratio = (
                 f"{result.buildings.damaged_count}/{result.buildings.total_buildings}"
@@ -304,24 +309,24 @@ class VideoAnalysisHandler(IntentHandler[VideoAnalysisSlots]):
         else:
             parts.append("**建筑物状况**: 未检测到建筑物")
 
-        # 5. 道路状态
+        # 6. 道路状态
         if result.roads.passable:
             parts.append("**道路状态**: 可通行")
         else:
             blocked = "、".join(result.roads.blocked_sections)
             parts.append(f"**道路状态**: 部分阻塞（{blocked}）")
 
-        # 6. 危险因素
+        # 7. 危险因素
         if result.hazards:
             hazards_str = "、".join(result.hazards[:5])
             parts.append(f"**危险因素**: {hazards_str}")
 
-        # 7. 建议行动
+        # 8. 建议行动
         if result.recommendations:
             recommendations_str = "、".join(result.recommendations[:3])
             parts.append(f"**建议行动**: {recommendations_str}")
 
-        # 8. 分析目标回应（如果用户有指定）
+        # 9. 分析目标回应（如果用户有指定）
         if analysis_goal:
             parts.append(f"\n针对您的分析目标「{analysis_goal}」，以上是当前现场情况。")
 

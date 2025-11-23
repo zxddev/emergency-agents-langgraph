@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
@@ -8,10 +9,11 @@ from typing import Any, Awaitable, Callable, Dict, Iterable, List, Mapping, Opti
 import re
 from urllib.parse import quote
 
+import httpx
 import structlog
+import websockets
 
 from emergency_agents.constants import RESCUE_DEMO_INCIDENT_ID
-# from emergency_agents.graph.intent_orchestrator_app import IntentOrchestratorState # Removed
 from emergency_agents.intent.pipeline import intent_pipeline
 from emergency_agents.intent.registry import IntentHandlerRegistry
 from emergency_agents.intent.handlers.device_control import DeviceControlHandler, RobotDogControlHandler
@@ -167,6 +169,46 @@ def _normalize_memory_hits(raw: Any) -> List[Dict[str, Any]]:
     return []
 
 
+def _is_robotdog_talk_message(message: str) -> bool:
+    """检测是否为机器狗侦察/识别类对话指令（走对话业务逻辑，而非本地识别/控制）。
+
+    规则：包含“机器狗”或 robotdog，
+    且包含侦察/识别/观察/前方/目标等"对话/识别"关键词之一，
+    同时不包含典型的控制动作（起立/前进/后退/左转/停止 等），
+    以避免把明确动作类指令误判为对话识别。
+    """
+    text = (message or "").strip()
+    if not text:
+        return False
+    lowered = text.lower()
+    has_robotdog = ("机器狗" in text) or ("robotdog" in lowered)
+    if not has_robotdog:
+        return False
+    # 对话/识别类关键词
+    talk_keywords = ["识别", "侦察", "侦查", "观察", "查看", "看看", "看一下", "前方", "前面", "目标"]
+    if not any(kw in text for kw in talk_keywords):
+        return False
+    # 典型控制动作关键词：如果同时出现，则优先认为是控制意图而非对话识别
+    control_keywords_cn = ["前进", "向前", "后退", "向后", "起立", "站立", "趴下", "坐下", "左转", "右转", "停止", "急停"]
+    control_keywords_en = [
+        "forward",
+        "back",
+        "backward",
+        "up",
+        "down",
+        "turnleft",
+        "turn_right",
+        "turnright",
+        "stop",
+        "forcestop",
+    ]
+    if any(kw in text for kw in control_keywords_cn):
+        return False
+    if any(kw in lowered for kw in control_keywords_en):
+        return False
+    return True
+
+
 async def _handle_robotdog_control(
     *,
     intent: Dict[str, Any],
@@ -186,6 +228,15 @@ async def _handle_robotdog_control(
 ) -> IntentProcessResult:
     audit_log = list(router_state.get("audit_log") or [])
     intent_type = intent.get("intent_type")
+
+    logger.info(
+        "robotdog_control_intent_received",
+        thread_id=thread_id,
+        user_id=user_id,
+        intent_type=intent_type,
+        slots=slots_payload,
+        channel=channel,
+    )
 
     if voice_control_graph is None:
         response_text = "语音控制子图未启用，无法执行机器狗控制。"
@@ -249,6 +300,17 @@ async def _handle_robotdog_control(
         "audit_trail": audit_trail,
     }
     if command_dict:
+        logger.info(
+            "robotdog_control_command_built",
+            thread_id=thread_id,
+            user_id=user_id,
+            device_id=command_dict.get("device_id"),
+            device_vendor=command_dict.get("device_vendor"),
+            command_type=command_dict.get("command_type"),
+            action=(command_dict.get("params") or {}).get("action") if isinstance(command_dict.get("params"), dict) else None,
+            status=status,
+        )
+    if command_dict:
         robotdog_payload["command"] = command_dict
         robotdog_payload.setdefault("device_id", command_dict.get("device_id"))
     elif slot_device_id:
@@ -305,6 +367,162 @@ async def _handle_robotdog_control(
         history=build_history(history_records),
         memory_hits=memory_hits,
         audit_log=audit_log,
+    )
+
+
+async def _handle_robotdog_talk(
+    *,
+    user_message: str,
+    thread_id: str,
+    user_id: str,
+    persist_message: Callable[[str, Optional[str]], Awaitable[MessageRecord]],
+    history_records: List[MessageRecord],
+    build_history: Callable[[List[MessageRecord]], List[Dict[str, Any]]],
+    stream_sink: Callable[[str], Awaitable[None]] | None,
+) -> IntentProcessResult:
+    """新业务逻辑：机器狗对话/侦察指令，改为调用 adapter-hub 的 talk 通道。
+
+    - HTTP 固定调用 /adapter-hub/api/v3/device-access/control 下发 text
+    - 然后连接 ws://.../adapter-hub/api/v3/ws/talk 流式读取回复
+    - 将流式文本通过 stream_sink 推送到前端，并在结束后写入会话历史
+    """
+    http_url = "http://192.168.31.40:8082/adapter-hub/api/v3/device-access/control"
+    ws_url = "ws://192.168.31.40:8082/adapter-hub/api/v3/ws/talk"
+
+    # 通过 WebSocket 流式读取机器狗返回。
+    # 为避免丢帧，先建立 WS 连接，再下发 HTTP 指令。
+    chunks: list[str] = []
+    ws_error: str | None = None
+
+    async def _read_ws() -> None:
+        nonlocal chunks, ws_error
+        try:
+            async with websockets.connect(ws_url) as ws:  # type: ignore[arg-type]
+                # 1) 在 WS 建立成功后下发对话指令（HTTP）
+                payload = {
+                    "deviceId": "11",
+                    "deviceVendor": "dqDog",
+                    "commandType": "talk",
+                    "params": {"text": user_message},
+                }
+                try:
+                    async with httpx.AsyncClient(timeout=5.0, trust_env=False) as client:
+                        resp = await client.post(http_url, json=payload)
+                        resp.raise_for_status()
+                except Exception as exc:  # noqa: BLE001
+                    ws_error = str(exc)
+                    logger.error(
+                        "robotdog_talk_http_failed",
+                        error=str(exc),
+                        thread_id=thread_id,
+                        user_id=user_id,
+                    )
+                    return
+
+                # 2) 监听 WS，按 JSON 协议增量读取 {text, is_end}
+                async for msg in ws:
+                    if isinstance(msg, bytes):
+                        raw = msg.decode("utf-8", errors="ignore")
+                    else:
+                        raw = str(msg)
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        data = json.loads(raw)
+                    except json.JSONDecodeError:
+                        # 非JSON时直接当作纯文本
+                        text_part = raw
+                        is_end = False
+                    else:
+                        if isinstance(data, dict):
+                            # 优先使用标准字段 text，否则原样透传整个JSON字符串
+                            text_value = data.get("text")
+                            if text_value is None:
+                                text_part = raw
+                            else:
+                                text_part = str(text_value).strip()
+                            is_end = bool(data.get("is_end"))
+                        else:
+                            # 对于 list / 其他JSON类型，直接把原始内容当作文本返回给前端
+                            text_part = raw
+                            is_end = False
+
+                    logger.info(
+                        "robotdog_talk_ws_message",
+                        thread_id=thread_id,
+                        user_id=user_id,
+                        raw_preview=raw[:200],
+                        text=text_part,
+                        is_end=is_end,
+                    )
+
+                    if text_part:
+                        chunks.append(text_part)
+                        if stream_sink is not None:
+                            try:
+                                await stream_sink(text_part)
+                            except Exception as sink_err:  # noqa: BLE001
+                                logger.error(
+                                    "robotdog_talk_stream_sink_failed",
+                                    error=str(sink_err),
+                                    thread_id=thread_id,
+                                    user_id=user_id,
+                                )
+                    if is_end:
+                        break
+        except Exception as exc:  # noqa: BLE001
+            ws_error = str(exc)
+            logger.error(
+                "robotdog_talk_ws_failed",
+                error=ws_error,
+                thread_id=thread_id,
+                user_id=user_id,
+            )
+
+    # 给WS一段合理时间收完整对话，避免无限等待
+    try:
+        await asyncio.wait_for(_read_ws(), timeout=30.0)
+    except asyncio.TimeoutError:
+        ws_error = ws_error or "ws_timeout"
+        logger.warning(
+            "robotdog_talk_ws_timeout",
+            thread_id=thread_id,
+            user_id=user_id,
+        )
+
+    full_text = "".join(chunks).strip()
+    if not full_text:
+        if ws_error:
+            response_text = f"机器狗识别通道异常：{ws_error}"
+        else:
+            response_text = "机器狗已接收指令，但未返回可读文本。"
+    else:
+        response_text = full_text
+
+    saved = await persist_message(response_text, "device_control_robotdog")
+    history_records.append(saved)
+
+    result_payload: Dict[str, Any] = {
+        "response_text": response_text,
+        "robotdog_talk": {
+            "status": "success" if full_text else "no_text",
+            "text": full_text,
+        },
+    }
+    if ws_error:
+        result_payload["robotdog_talk"]["ws_error"] = ws_error  # type: ignore[index]
+
+    return IntentProcessResult(
+        status="success" if full_text else "error",
+        intent={
+            "intent_type": "device_control_robotdog",
+            "slots": {"text": user_message},
+        },
+        result=result_payload,
+        history=build_history(history_records),
+        memory_hits=[],
+        audit_log=[{"event": "robotdog_talk_completed", "has_text": bool(full_text)}],
     )
 
 
@@ -388,6 +606,7 @@ async def process_intent_core(
     channel: str = "text",
     context_service: ContextService | None = None,
     enable_mem0: bool = True,
+    stream_sink: Callable[[str], Awaitable[None]] | None = None,
 ) -> IntentProcessResult:
     """统一意图处理核心逻辑。"""
     if not message or not message.strip():
@@ -515,10 +734,35 @@ async def process_intent_core(
         "history": messages_for_graph # Pass history to pipeline
     }
 
-    # logger.warning(
-    #     "intent_graph_checkpointer_type",
-    #     checkpointer_type=type(getattr(orchestrator_graph, "checkpointer", None)).__name__,
-    # )
+    # 在进入统一意图管线前，拦截机器狗侦察/识别类对话，改走新的对话业务逻辑
+    if channel == "voice" and _is_robotdog_talk_message(cleaned_message):
+        logger.info(
+            "robotdog_talk_reroute",
+            thread_id=thread_id,
+            user_id=user_id,
+            text_preview=cleaned_message[:50],
+        )
+
+        async def _persist_assistant_message(content: str, intent_type: Optional[str]) -> MessageRecord:
+            return await manager.save_message(
+                user_id=user_id,
+                thread_id=thread_id,
+                role="assistant",
+                content=content,
+                intent_type=intent_type,
+                metadata={"incident_id": incident_id, "channel": channel},
+                conversation_metadata=conversation_metadata,
+            )
+
+        return await _handle_robotdog_talk(
+            user_message=cleaned_message,
+            thread_id=thread_id,
+            user_id=user_id,
+            persist_message=_persist_assistant_message,
+            history_records=history_records,
+            build_history=build_history,
+            stream_sink=stream_sink,
+        )
 
     # 添加精确的计时日志
     start_time = time.perf_counter()
@@ -572,6 +816,46 @@ async def process_intent_core(
     validation_status = graph_state.get("validation_status", "valid")
     router_next = graph_state.get("router_next", "unknown")
     prompt_text = graph_state.get("prompt")
+
+    # 预处理：机器狗前方侦察类指令 → 固定视频分析链路
+    try:
+        itype_raw0 = str((intent.get("intent_type") or "").strip()).lower()
+        itype_norm0 = itype_raw0.replace(" ", "").replace("_", "-")
+        text_lower = cleaned_message.lower()
+        is_robotdog_phrase = ("机器狗" in cleaned_message) or ("robotdog" in text_lower)
+        is_forward_scout = ("前方" in cleaned_message and ("侦察" in cleaned_message or "识别" in cleaned_message))
+
+        if itype_norm0 in ("video-analysis", "video-analyze") and (is_robotdog_phrase or is_forward_scout):
+            raw_slots: Dict[str, Any] = dict(intent.get("slots") or {})
+
+            device_name = raw_slots.get("device_name") or "侦察巡逻机器狗"
+            device_type = raw_slots.get("device_type") or "robotdog"
+            analysis_goal = raw_slots.get("analysis_goal")
+            if not analysis_goal:
+                if "识别" in cleaned_message:
+                    analysis_goal = "识别前方目标"
+                elif "侦察" in cleaned_message:
+                    analysis_goal = "侦察前方目标"
+                else:
+                    analysis_goal = "识别前方目标"
+
+            # 仅保留 VideoAnalysisSlots 支持的字段，避免多余字段导致槽位构造失败
+            new_slots: Dict[str, Any] = {
+                "device_name": device_name,
+                "device_type": device_type,
+                "analysis_goal": analysis_goal,
+            }
+            if "analysis_params" in raw_slots and isinstance(raw_slots["analysis_params"], dict):
+                new_slots["analysis_params"] = raw_slots["analysis_params"]
+
+            intent = dict(intent or {})
+            intent["slots"] = new_slots
+            graph_state["intent"] = intent
+            validation_status = "valid"
+            graph_state["validation_status"] = "valid"
+            router_next = "video-analysis"
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("robotdog_video_autofill_failed", error=str(exc))
 
     async def _persist_assistant_message(content: str, intent_type: Optional[str]) -> MessageRecord:
         return await manager.save_message(
@@ -956,6 +1240,8 @@ async def process_intent_core(
         "raw_text": raw_text_for_handler,  # 让Handler拿到最新用户输入
         "messages": normalized_messages,  # 让Handler复用最近会话上下文
     }
+    if stream_sink is not None:
+        handler_state["stream_sink"] = stream_sink
 
     handler_result = await handler.handle(slots_instance or slots_payload, handler_state)
 

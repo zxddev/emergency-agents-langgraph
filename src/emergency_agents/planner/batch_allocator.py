@@ -11,7 +11,8 @@
 - 优先级保证：目标列表必须已排序（高优先级优先）
 """
 
-from typing import List, TypedDict, Union
+from typing import List, Union
+from typing_extensions import TypedDict
 from uuid import UUID
 import structlog
 

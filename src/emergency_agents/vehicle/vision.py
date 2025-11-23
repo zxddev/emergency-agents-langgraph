@@ -88,6 +88,7 @@ class VisionAnalysisResult:
     confidence_score: float
 
     # 元数据
+    scene_summary: Optional[str] = None
     image_size: Optional[tuple] = None
     analysis_time: Optional[str] = None
 
@@ -203,10 +204,15 @@ class VisionAnalyzer:
         """构建应急救援场景的分析提示词"""
         return """作为应急救援专家，请分析这张无人机航拍图，识别以下信息：
 
+0. **场景理解**
+   - 判断是室内还是室外，并给出场景类型（例如：会议室、办公室、走廊、操场、街道、十字路口等）
+   - 描述与救援相关的关键物体和布局（例如：桌椅排布、门窗位置、楼梯、电梯、通道是否畅通、明显障碍物）
+   - 只根据图像中实际可见内容判断，禁止猜测画面外或建筑物内部看不见的情况
+
 1. **人员情况**
    - 统计人员数量
    - 标注大致位置（归一化坐标0-1）
-   - 识别活动状态（站立/行走/躺卧/求救）
+   - 细致描述活动状态和姿态（例如：坐在椅子上、站在门口、趴在地上、围在桌边讨论、靠在墙边等）
 
 2. **车辆情况**
    - 统计各类型车辆数量（小汽车/卡车/救护车/消防车）
@@ -236,6 +242,7 @@ class VisionAnalyzer:
 
 ```json
 {
+  "scene_summary": "室内会议室，画面中多排椅子，中间留有通道，前方有投影幕布。",
   "danger_level": "L0/L1/L2/L3",
   "persons": {
     "count": 0,
@@ -263,6 +270,11 @@ class VisionAnalyzer:
   "confidence_score": 0.85
 }
 ```
+
+补充要求：
+- 只能根据图像中**实际可见的内容**进行判断，禁止根据常识臆测画面之外或建筑物内部（室内）的情况；
+- 不要虚构不存在的房间、室内人员、室内火情等，只能描述图像中明确可见的区域和目标；
+- 优先描述与灾害救援相关的现场情况和风险（如受困人员、受损建筑、受阻道路等），不要输出与画面无关的内容。
 
 如果某些信息无法确定，使用null或空数组。"""
 
@@ -378,6 +390,7 @@ class VisionAnalyzer:
             latency_ms=latency_ms,
             model_name=self.model_name,
             confidence_score=structured.get("confidence_score", 0.0),
+            scene_summary=structured.get("scene_summary") or None,
         )
 
     async def close(self):

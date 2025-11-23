@@ -356,10 +356,13 @@ class VoiceChatHandler:
             try:
                 asr_result = await self.asr_service.recognize(audio_data)
             except Exception as asr_error:
+                root_cause = getattr(asr_error, "__cause__", None) or getattr(asr_error, "__context__", None)
                 logger.error(
                     "asr_call_failed",
                     session_id=session_id,
                     error=str(asr_error),
+                     error_type=asr_error.__class__.__name__,
+                     root_error=str(root_cause) if root_cause else "",
                     provider_status=self.asr_service.provider_status,
                     voice_asr_url=os.getenv("VOICE_ASR_WS_URL", ""),
                 )
@@ -428,6 +431,18 @@ class VoiceChatHandler:
         thread_id = session.thread_id or f"voice-{session.session_id}"
 
         try:
+            async def _stream_sink(delta: str) -> None:
+                if not delta:
+                    return
+                try:
+                    await session.send_json({"type": "llm_stream", "delta": delta})
+                except Exception as send_err:  # noqa: BLE001
+                    logger.error(
+                        "voice_stream_send_failed",
+                        error=str(send_err),
+                        session_id=session.session_id,
+                    )
+
             result = await process_intent_core(
                 user_id=user_id,
                 thread_id=thread_id,
@@ -444,6 +459,7 @@ class VoiceChatHandler:
                 channel="voice",
                 context_service=self._context_service,
                 enable_mem0=self._enable_mem0,
+                 stream_sink=_stream_sink,
             )
 
             # 兼容现有前端协议：返还 llm 文本 + intent 类型

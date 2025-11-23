@@ -305,6 +305,12 @@ _llm_clients = {
     "intent": _llm_factory.get_sync("intent"),
     "strategic": _llm_factory.get_sync("strategic"),
 }
+_llm_async_clients = {
+    "default": _llm_factory.get_async("default"),
+    "rescue": _llm_factory.get_async("rescue"),
+    "intent": _llm_factory.get_async("intent"),
+    "strategic": _llm_factory.get_async("strategic"),
+}
 app.state.llm_clients = _llm_clients
 app.state.rescue_draft_service = _rescue_draft_service
 _llm_client_default = _llm_clients["default"]
@@ -593,6 +599,7 @@ async def startup_event():
         rag_pipeline=_rag,
         llm_client=_llm_client_rescue,
         llm_model=_cfg.llm_model,
+        llm_async_client=_llm_async_clients["rescue"],
         adapter_client=_adapter_client,
         default_robotdog_id=_cfg.default_robotdog_id,
         orchestrator_client=_orchestrator_client,

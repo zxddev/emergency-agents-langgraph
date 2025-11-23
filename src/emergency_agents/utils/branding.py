@@ -10,8 +10,8 @@ _MODEL_PATTERNS = [
     re.compile(r"(?i)智谱\s*GLM4(?:\.5)?"),
     re.compile(r"(?i)智谱"),
     re.compile(r"(?i)智普"),
-    re.compile(r"(?i)\bGLM[-\s]?4(?:\.5)?\b"),
-    re.compile(r"(?i)\bGLM4(?:\.5)?\b"),
+    re.compile(r"(?i)\bGLM[-\s]?4(?:\.\d+)?\b"),
+    re.compile(r"(?i)\bGLM4(?:\.\d+)?\b"),
     re.compile(r"(?i)\bGLM\b"),
 ]
 
@@ -24,7 +24,7 @@ def mask_model_aliases(text: str | None) -> str | None:
 
     masked = text
     for pattern in _MODEL_PATTERNS:
-        masked = pattern.sub("猛士MS-1", masked)
+        masked = pattern.sub("猛士大模型", masked)
     return masked
 
 

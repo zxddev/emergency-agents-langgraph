@@ -12,7 +12,8 @@
 """
 
 import json
-from typing import List, Dict, Any, TypedDict, Optional
+from typing import List, Dict, Any, Optional
+from typing_extensions import TypedDict
 from openai import OpenAI
 import structlog
 

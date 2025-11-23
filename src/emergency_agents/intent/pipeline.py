@@ -8,7 +8,6 @@ from typing import Any, Dict, Literal, Optional
 from emergency_agents.container import container
 from emergency_agents.intent.classifier import intent_classifier_node
 from emergency_agents.intent.validator import validate_and_prompt_node
-from emergency_agents.intent.prompt_missing import prompt_missing_slots_node
 
 logger = logging.getLogger(__name__)
 
@@ -47,23 +46,19 @@ class IntentPipeline:
         
         # 2. Validate
         state = validate_and_prompt_node(
-            state, 
-            llm_client=container.llm_client, 
-            llm_model=container.config.llm_model
+            state,
+            llm_client=container.llm_client,
+            llm_model=container.config.llm_model,
         )
 
+        # 对于线性管道，不再调用基于 LangGraph interrupt 的 prompt_missing_slots_node，
+        # 仅返回校验结果和提示文案，由上层 process_intent_core 负责追问与会话交互。
         if state.get("validation_status") == "invalid":
-             # 3. Prompt Missing (if invalid)
-             state = prompt_missing_slots_node(
-                 state, 
-                 llm_client=container.llm_client, 
-                 llm_model=container.config.llm_model
-             )
-             return {
-                 "status": "incomplete",
-                 "prompt": state.get("prompt"),
-                 "state": state
-             }
+            return {
+                "status": "incomplete",
+                "prompt": state.get("prompt"),
+                "state": state,
+            }
         
         # 4. Route (简单映射)
         router_next = self._route(state.get("intent", {}))
@@ -83,6 +78,10 @@ class IntentPipeline:
         route_map = {
             "rescue-task-generate": "rescue-task-generate",
             "scout-task-simple": "scout-task-simple",
+            "video-analysis": "video-analysis",
+            "video-analyze": "video-analysis",
+            "device-control-robotdog": "device_control_robotdog",
+            "device_control_robotdog": "device_control_robotdog",
             "general-chat": "general-chat",
             # ... 其他映射 ...
         }

@@ -28,6 +28,9 @@ set -a
 source config/env.internal
 set +a
 
+# 明确指定APP_ENV=internal，确保AppConfig加载config/env.internal而不是dev.env
+export APP_ENV=internal
+
 # 2. 检查Python环境
 echo -e "${YELLOW}[2/5] 检查Python虚拟环境...${NC}"
 if [ ! -d ".venv" ]; then
